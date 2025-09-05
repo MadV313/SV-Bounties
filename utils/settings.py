@@ -10,12 +10,13 @@ SETTINGS_DIR = Path("data/settings")
 SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Default settings for a guild
-DEFAULT_SETTINGS: Dict[str, Any] = {
-    "bounty_channel_id": None,   # public bounties channel
-    "admin_channel_id": None,    # private admin channel for trace/logs
+DEFAULT_SETTINGS = {
+    "bounty_channel_id": None,
+    "admin_channel_id": None,
     "active_map": "livonia",
-    # Optional external links file (SV13 style), set via /setexternallinks
     "external_links_path": None,
+    "prefer_external_links": False,   # 👈 NEW
+    "disable_local_link": False,      # 👈 NEW
 }
 
 def _path_for_guild(guild_id: int) -> Path:
