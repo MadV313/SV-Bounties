@@ -11,7 +11,8 @@ def admin_check():
     return app_commands.check(lambda i: pred(i))
 
 class AdminFTP(commands.Cog):
-    def __init__(self, bot): self.bot = bot
+    def __init__(self, bot):
+        self.bot = bot
 
     @app_commands.command(name="setftp", description="Configure FTP credentials for ADM scanning (per guild)")
     @admin_check()
@@ -27,6 +28,8 @@ class AdminFTP(commands.Cog):
                      host: str, username: str, password: str,
                      port: int = 21, adm_dir: str = "/", interval_sec: int = 10):
         set_ftp_config(interaction.guild_id, host, username, password, port, adm_dir, interval_sec)
+        # Let the core bot know it can restart this guild's poller (optional handler in bot.py)
+        interaction.client.dispatch("ftp_config_updated", interaction.guild_id)
         await interaction.response.send_message("✅ FTP credentials saved (per-guild).", ephemeral=True)
 
     @app_commands.command(name="showftp", description="Show the current FTP config (password redacted)")
@@ -42,6 +45,8 @@ class AdminFTP(commands.Cog):
     @admin_check()
     async def clearftp(self, interaction: discord.Interaction):
         clear_ftp_config(interaction.guild_id)
+        # Notify core to stop the poller if running (optional handler in bot.py)
+        interaction.client.dispatch("ftp_config_updated", interaction.guild_id)
         await interaction.response.send_message("🧹 FTP config cleared.", ephemeral=True)
 
 async def setup(bot: commands.Bot):
