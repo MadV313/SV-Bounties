@@ -25,8 +25,9 @@ MAPS = {
     },
 }
 
-# Default settings used on first run
+# tracer/config.py (append to DEFAULT_SETTINGS)
 DEFAULT_SETTINGS = {
-    "bounty_channel_id": None,
+    "bounty_channel_id": None,   # public bounties channel
+    "admin_channel_id": None,    # private admin ops (trace, internals)
     "active_map": "livonia",
 }
