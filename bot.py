@@ -28,7 +28,12 @@ async def start_polls():
 @BOT.event
 async def on_ready():
     print(f"Logged in as {BOT.user} ({BOT.user.id})")
-    BOT.loop.create_task(start_polls())
+    try:
+        synced = await BOT.tree.sync()
+        print(f"Synced {len(synced)} command(s).")
+    except Exception as e:
+        print(f"Slash sync failed: {e}")
+    BOT.loop.create_task(start_polls())  # keep your poll starter here if you had it
 
 async def main():
     async with BOT:
