@@ -62,31 +62,27 @@ def save_local_links(guild_id: int, obj: dict):
     except Exception as e:
         logger.error(f"Failed to save local links for guild {guild_id}: {e}", exc_info=True)
 
-def resolve_from_any(
-    guild_id: int,
-    discord_id: Optional[str] = None,
-    gamertag: Optional[str] = None
-) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns (discord_id, gamertag) if found by either key, searching local first then external.
-    """
+def resolve_from_any(guild_id: int, discord_id: Optional[str] = None, gamertag: Optional[str] = None):
+    s = load_settings(guild_id)
+    prefer_ext = bool(s.get("prefer_external_links"))
+
     local = load_local_links(guild_id)
     ext = load_external_links(guild_id) or {}
 
+    sources = (ext, local) if prefer_ext else (local, ext)
     # by discord id
     if discord_id:
-        rec = local.get(discord_id) or ext.get(discord_id)
-        if rec and isinstance(rec, dict):
-            return discord_id, rec.get("gamertag")
-
-    # by gamertag (case-insensitive)
+        for src in sources:
+            rec = src.get(discord_id)
+            if isinstance(rec, dict):
+                return discord_id, rec.get("gamertag")
+    # by gamertag
     if gamertag:
         g_lower = gamertag.lower()
-        for source in (local, ext):
-            for did, rec in source.items():
-                if isinstance(rec, dict) and str(rec.get("gamertag", "")).lower() == g_lower:
+        for src in sources:
+            for did, rec in src.items():
+                if isinstance(rec, dict) and str(rec.get("gamertag","")).lower() == g_lower:
                     return did, rec.get("gamertag")
-
     return None, None
 
 def link_locally(guild_id: int, discord_id: str, gamertag: str, platform: str = "xbox"):
