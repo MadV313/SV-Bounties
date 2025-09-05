@@ -11,15 +11,18 @@ def admin_check():
     return app_commands.check(lambda i: pred(i))
 
 class AdminLinks(commands.Cog):
-    def __init__(self, bot): self.bot = bot
+    def __init__(self, bot):
+        self.bot = bot
 
-    @app_commands.command(name="setexternallinks", description="Set path/URL to external linked_players.json (SV13 persistent repo)")
+    @app_commands.command(
+        name="setexternallinks",
+        description="Set path/URL to external linked_players.json (per guild, e.g., SV13 persistent repo)"
+    )
     @admin_check()
     @app_commands.describe(path="Local path or URL to linked_players.json (leave blank to disable)")
     async def setexternallinks(self, interaction: discord.Interaction, path: str | None = None):
-        s = load_settings()
-        s["external_links_path"] = path or None
-        save_settings(s)
+        gid = interaction.guild_id
+        s = save_settings(gid, {"external_links_path": (path or None)})
         await interaction.response.send_message(
             f"✅ External links source {'set' if path else 'cleared'}."
             + (f"\n`{path}`" if path else ""),
