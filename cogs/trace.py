@@ -41,11 +41,13 @@ class TraceCog(commands.Cog):
     ):
         await interaction.response.defer(thinking=True, ephemeral=True)
 
-        # Resolve identity
+        guild_id = interaction.guild_id
+
+        # Resolve identity (per-guild)
         did = str(user.id) if user else None
         if not (did or gamertag):
             did = str(interaction.user.id)
-        resolved_did, resolved_tag = resolve_from_any(discord_id=did, gamertag=gamertag)
+        resolved_did, resolved_tag = resolve_from_any(guild_id, discord_id=did, gamertag=gamertag)
         if not resolved_tag:
             return await interaction.followup.send("❌ Couldn’t resolve that player. Use `/link` first or provide a gamertag.")
 
@@ -88,8 +90,8 @@ class TraceCog(commands.Cog):
         else:
             caption += f"\nRange: last {window_hours}h"
 
-        # Post to admin channel if configured
-        settings = load_settings()
+        # Post to admin channel if configured (per-guild)
+        settings = load_settings(guild_id)
         admin_ch_id = settings.get("admin_channel_id")
         if admin_ch_id:
             ch = interaction.client.get_channel(int(admin_ch_id))
