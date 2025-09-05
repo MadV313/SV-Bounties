@@ -4,9 +4,10 @@ from discord.ext import commands
 from utils.ftp_config import get_ftp_config
 from tracer.log_fetcher import poll_guild
 from tracer.scanner import scan_adm_line
+from utils import live_pulse
 
 INTENTS = discord.Intents.default()
-BOT = commands.Bot(command_prefix="!", intents=INTENTS)
+BOT = commands.Bot(command_prefix="!", intents=discord.Intents.default())
 
 # Keep per-guild stop events so we can restart polls if needed
 poll_stops: dict[int, asyncio.Event] = {}
@@ -31,6 +32,7 @@ async def on_ready():
 
 async def main():
     async with BOT:
+        live_pulse.init(BOT)  # <-- allow pulse manager to edit messages & subscribe
         await BOT.load_extension("cogs.admin_assign")
         await BOT.load_extension("cogs.admin_ftp")
         await BOT.load_extension("cogs.admin_links")
