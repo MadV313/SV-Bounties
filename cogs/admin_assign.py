@@ -27,7 +27,8 @@ class AdminAssign(commands.Cog):
     async def setchannels(self, interaction: discord.Interaction,
                           admin_channel: discord.TextChannel,
                           bounty_channel: discord.TextChannel):
-        s = save_settings({
+        gid = interaction.guild_id
+        save_settings(gid, {
             "admin_channel_id": admin_channel.id,
             "bounty_channel_id": bounty_channel.id
         })
@@ -43,7 +44,8 @@ class AdminAssign(commands.Cog):
     )
     @admin_check()
     async def setmap(self, interaction: discord.Interaction, map_choice: app_commands.Choice[str]):
-        s = save_settings({"active_map": map_choice.value.lower()})
+        gid = interaction.guild_id
+        s = save_settings(gid, {"active_map": map_choice.value.lower()})
         await interaction.response.send_message(
             f"🗺️ Active map set to **{MAPS[s['active_map']]['name']}**.",
             ephemeral=True
@@ -52,7 +54,8 @@ class AdminAssign(commands.Cog):
     @app_commands.command(name="settings", description="Show current bot settings")
     @admin_check()
     async def settings(self, interaction: discord.Interaction):
-        s = load_settings()
+        gid = interaction.guild_id
+        s = load_settings(gid)
         admin_ch = f"<#{s['admin_channel_id']}>" if s.get("admin_channel_id") else "*not set*"
         bounty_ch = f"<#{s['bounty_channel_id']}>" if s.get("bounty_channel_id") else "*not set*"
         mp = MAPS.get(s.get("active_map") or "", {}).get("name", "*unknown*")
