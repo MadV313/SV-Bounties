@@ -90,6 +90,16 @@ async def on_guild_remove(guild: discord.Guild):
     logger.info(f"Removed from guild {guild.name} ({guild.id})")
     await stop_poll_for_guild(guild.id)
 
+# --- NEW: Hot reload on FTP config changes ---
+@BOT.listen("on_ftp_config_updated")
+async def _hot_reload_ftp(guild_id: int):
+    logger.info(f"[Guild {guild_id}] FTP config updated; restarting poller.")
+    try:
+        await stop_poll_for_guild(guild_id)
+    except Exception:
+        pass
+    await start_poll_for_guild(guild_id)
+
 async def main():
     async with BOT:
         # Allow live pulse to edit messages & subscribe to tracker events
