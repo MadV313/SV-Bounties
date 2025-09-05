@@ -22,10 +22,38 @@ class AdminLinks(commands.Cog):
     @app_commands.describe(path="Local path or URL to linked_players.json (leave blank to disable)")
     async def setexternallinks(self, interaction: discord.Interaction, path: str | None = None):
         gid = interaction.guild_id
-        s = save_settings(gid, {"external_links_path": (path or None)})
+        save_settings(gid, {"external_links_path": (path or None)})
         await interaction.response.send_message(
             f"✅ External links source {'set' if path else 'cleared'}."
             + (f"\n`{path}`" if path else ""),
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="preferexternallinks",
+        description="Prefer external linked_players over local (this guild)"
+    )
+    @admin_check()
+    @app_commands.describe(enabled="true/false")
+    async def preferexternallinks(self, interaction: discord.Interaction, enabled: bool):
+        gid = interaction.guild_id
+        save_settings(gid, {"prefer_external_links": bool(enabled)})
+        await interaction.response.send_message(
+            f"✅ `prefer_external_links` set to **{enabled}**.",
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="disablelocallink",
+        description="Disable this bot's /link in this guild (use Rewards bot instead)"
+    )
+    @admin_check()
+    @app_commands.describe(enabled="true/false")
+    async def disablelocallink(self, interaction: discord.Interaction, enabled: bool):
+        gid = interaction.guild_id
+        save_settings(gid, {"disable_local_link": bool(enabled)})
+        await interaction.response.send_message(
+            f"✅ `disable_local_link` set to **{enabled}**.",
             ephemeral=True
         )
 
