@@ -4,6 +4,7 @@ from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timedelta, timezone
 
+from utils.settings import load_settings
 from utils.linking import resolve_from_any
 from tracer.tracker import load_track
 from tracer.map_renderer import render_track_png
@@ -11,12 +12,10 @@ from tracer.map_renderer import render_track_png
 def _parse_dt(s: str) -> datetime | None:
     if not s: return None
     s = s.strip()
-    # Try several common formats
     fmts = ["%Y-%m-%d %H:%M", "%Y-%m-%d", "%m/%d/%Y %H:%M", "%m/%d/%Y"]
     for f in fmts:
         try:
-            dt = datetime.strptime(s, f).replace(tzinfo=timezone.utc)
-            return dt
+            return datetime.strptime(s, f).replace(tzinfo=timezone.utc)
         except Exception:
             continue
     return None
@@ -40,12 +39,11 @@ class TraceCog(commands.Cog):
         end: str | None = None,
         window_hours: int | None = 24
     ):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(thinking=True, ephemeral=True)
 
         # Resolve identity
         did = str(user.id) if user else None
         if not (did or gamertag):
-            # try self
             did = str(interaction.user.id)
         resolved_did, resolved_tag = resolve_from_any(discord_id=did, gamertag=gamertag)
         if not resolved_tag:
@@ -55,13 +53,11 @@ class TraceCog(commands.Cog):
         dt_start = _parse_dt(start) if start else None
         dt_end = _parse_dt(end) if end else datetime.now(timezone.utc)
 
-        # If explicit start/end provided, ignore window_hours, otherwise use window_hours from now
         if dt_start:
             if not dt_end or dt_end <= dt_start:
-                dt_end = dt_start + timedelta(hours=1)  # 1h default window if only start given
+                dt_end = dt_start + timedelta(hours=1)
             window_hours = None
         else:
-            # last N hours
             if not window_hours:
                 window_hours = 24
 
@@ -70,7 +66,7 @@ class TraceCog(commands.Cog):
         if not doc or not doc.get("points"):
             return await interaction.followup.send(f"ℹ️ No track points found for `{resolved_tag}` in that window.")
 
-        # Filter by explicit range if provided
+        # Filter explicit range
         if dt_start:
             pts = []
             for p in doc["points"]:
@@ -78,11 +74,11 @@ class TraceCog(commands.Cog):
                     ts = datetime.fromisoformat(p["ts"].replace("Z","+00:00"))
                 except Exception:
                     continue
-                if ts >= dt_start and ts <= dt_end:
+                if dt_start <= ts <= dt_end:
                     pts.append(p)
-            doc = {**doc, "points": pts}
             if not pts:
                 return await interaction.followup.send(f"ℹ️ No points for `{resolved_tag}` in that time range.")
+            doc = {**doc, "points": pts}
 
         img = render_track_png(doc)
         file = discord.File(img, filename=f"trace_{doc['gamertag']}.png")
@@ -91,6 +87,17 @@ class TraceCog(commands.Cog):
             caption += f"\nRange: `{dt_start.isoformat()}` to `{dt_end.isoformat()}`"
         else:
             caption += f"\nRange: last {window_hours}h"
+
+        # Post to admin channel if configured
+        settings = load_settings()
+        admin_ch_id = settings.get("admin_channel_id")
+        if admin_ch_id:
+            ch = interaction.client.get_channel(int(admin_ch_id))
+            if isinstance(ch, discord.TextChannel):
+                await ch.send(content=caption, file=file)
+                return await interaction.followup.send(f"📡 Posted trace in {ch.mention}.", ephemeral=True)
+
+        # Fallback to replying in-channel
         await interaction.followup.send(caption, file=file)
 
 async def setup(bot: commands.Bot):
