@@ -16,4 +16,5 @@ async def scan_adm_line(guild_id: int, line: str, source_ref: str, ts: datetime)
         return
     gamertag = m.group(1) or m.group(2)
     x, y, z = float(m.group(3)), float(m.group(4)), float(m.group(5))
-    append_point(gamertag=gamertag, x=x, y=y, z=z, ts=ts, source=source_ref)
+    # tracer/scanner.py (change the call)
+    append_point(gamertag=gamertag, x=x, y=y, z=z, ts=ts, source=source_ref, guild_id=guild_id)
