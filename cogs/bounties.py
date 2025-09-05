@@ -1,51 +1,61 @@
-# utils/bounties.py
-import json
-from pathlib import Path
-from datetime import datetime, timezone
-from typing import Optional
+# cogs/bounty.py
+import discord
+from discord import app_commands
+from discord.ext import commands
 
-BOUNTY_PATH = "data/bounties.json"
+from utils.linking import resolve_from_any
+from utils.bounties import create_bounty, list_open
+from utils.settings import load_settings
+from tracer.config import MAPS
+from tracer.map_renderer import render_track_png
+from tracer.tracker import load_track
 
-def _load() -> dict:
-    p = Path(BOUNTY_PATH)
-    if not p.exists(): return {"open": [], "closed": []}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {"open": [], "closed": []}
+def admin_or_staff():
+    def pred(i: discord.Interaction):
+        perms = getattr(i.user, "guild_permissions", None)
+        return bool(perms and (perms.administrator or perms.manage_guild))
+    return app_commands.check(lambda i: pred(i))
 
-def _save(obj: dict):
-    p = Path(BOUNTY_PATH)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+class BountyCog(commands.Cog):
+    def __init__(self, bot): self.bot = bot
 
-def create_bounty(creator_id: str, target_discord_id: str | None, target_gamertag: str, amount: int, note: str | None=None):
-    data = _load()
-    bounty = {
-        "id": f"bnty-{int(datetime.now(timezone.utc).timestamp())}",
-        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
-        "creator_id": creator_id,
-        "target_discord_id": target_discord_id,
-        "target_gamertag": target_gamertag,
-        "amount": amount,
-        "note": note,
-        "status": "open",
-        "kills": []
-    }
-    data["open"].append(bounty)
-    _save(data)
-    return bounty
+    @app_commands.command(name="bounty_add", description="Place a bounty (SV tickets integration pending)")
+    @app_commands.describe(
+        user="Discord user (preferred if linked)",
+        gamertag="Gamertag (use if not linked)",
+        amount="SV ticket amount to place",
+        note="Optional note"
+    )
+    @admin_or_staff()
+    async def bounty_add(self, interaction: discord.Interaction,
+                         user: discord.User | None=None,
+                         gamertag: str | None=None,
+                         amount: int=100,
+                         note: str | None=None):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        if amount <= 0:
+            return await interaction.followup.send("❌ Amount must be positive.", ephemeral=True)
 
-def close_bounty(bounty_id: str, killer_discord_id: str | None, killer_gamertag: str | None):
-    data = _load()
-    bounty = next((b for b in data["open"] if b["id"] == bounty_id), None)
-    if not bounty: return None
-    bounty["status"] = "closed"
-    bounty["closed_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
-    bounty["kills"].append({"killer_discord_id": killer_discord_id, "killer_gamertag": killer_gamertag})
-    data["open"] = [b for b in data["open"] if b["id"] != bounty_id]
-    data["closed"].append(bounty)
-    _save(data)
-    return bounty
+        did = str(user.id) if user else None
+        resolved_did, resolved_tag = resolve_from_any(discord_id=did, gamertag=gamertag)
+        if not resolved_tag:
+            return await interaction.followup.send("❌ Couldn’t resolve target. Provide a gamertag or ensure they ran `/link`.", ephemeral=True)
 
-def list_open(): return _load()["open"]
+        # TODO: integrate wallet debit here (SV tickets). For now, just record the bounty.
+        b = create_bounty(str(interaction.user.id), resolved_did, resolved_tag, amount, note)
+        await interaction.followup.send(
+            f"🎯 Bounty created on **{resolved_tag}** for **{amount} SV tickets**.\nID: `{b['id']}`",
+            ephemeral=True
+        )
+
+    @app_commands.command(name="bounty_list", description="List open bounties")
+    async def bounty_list(self, interaction: discord.Interaction):
+        opens = list_open()
+        if not opens:
+            return await interaction.response.send_message("No open bounties.")
+        # simple list for now
+        lines = [f"• `{b['id']}` — {b['target_gamertag']} — {b['amount']} SVt" for b in opens]
+        await interaction.response.send_message("\n".join(lines))
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(BountyCog(bot))
