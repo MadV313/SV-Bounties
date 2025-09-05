@@ -2,10 +2,44 @@
 import os, time, asyncio
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
+
 from utils.storageClient import load_file, save_file  # your existing helpers
 from tracer.config import INDEX_PATH, TRACKS_DIR, MAX_POINTS_PER_PLAYER
 
 logger = logging.getLogger(__name__)
+
+# Normalize TRACKS_DIR as a Path
+_TRACKS_DIR_PATH = Path(TRACKS_DIR)
+
+# --- Ensure track directory is valid -----------------------------------------
+def _ensure_tracks_dir() -> None:
+    """
+    Make sure TRACKS_DIR exists and is a directory.
+    If a file exists at that path (common repo mistake), rename it to .bak and create the dir.
+    """
+    try:
+        if _TRACKS_DIR_PATH.exists():
+            if _TRACKS_DIR_PATH.is_file():
+                backup = _TRACKS_DIR_PATH.with_suffix(_TRACKS_DIR_PATH.suffix + ".bak")
+                try:
+                    _TRACKS_DIR_PATH.rename(backup)
+                    logger.warning(
+                        f"TRACKS_DIR path existed as a file; moved it to {backup} and will create a directory."
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to move file { _TRACKS_DIR_PATH } -> { backup }: {e}", exc_info=True)
+                    raise
+        # Create directory if missing
+        _TRACKS_DIR_PATH.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.error(f"Unable to ensure track directory at { _TRACKS_DIR_PATH }: {e}", exc_info=True)
+        raise
+
+# Call once at import so we fail fast (and self-heal if needed)
+_ensure_tracks_dir()
+# -----------------------------------------------------------------------------
+
 
 # --- NEW: simple subscription bus for "point appended" events ---
 _point_subscribers: list = []  # list[Callable[[int|None,str,dict], Awaitable[None]]]
@@ -25,9 +59,12 @@ async def _notify_point(guild_id, gamertag, point):
             logger.error(f"Point subscriber error for [{gamertag}]: {e}", exc_info=True)
 # ----------------------------------------------------------------
 
-def _sanitize_id(name:str)->str: return name.lower()
 
-def _resolve_player_id(gamertag:str):
+def _sanitize_id(name: str) -> str:
+    return name.lower()
+
+
+def _resolve_player_id(gamertag: str):
     index = load_file(INDEX_PATH) or {}
     pid = index.get(gamertag) or index.get(gamertag.lower())
     if not pid:
@@ -38,12 +75,22 @@ def _resolve_player_id(gamertag:str):
         logger.info(f"Indexed new player: {gamertag} -> {pid}")
     return pid, gamertag
 
-def _track_path(pid:str)->str:
-    os.makedirs(TRACKS_DIR, exist_ok=True)
-    return f"{TRACKS_DIR}/{pid}.json"
 
-def append_point(gamertag:str, x:float, y:float, z:float,
-                 ts:datetime|None=None, source:str="", guild_id:int|None=None):
+def _track_path(pid: str) -> str:
+    # Defensive: ensure again before each write/read in case runtime state changed
+    _ensure_tracks_dir()
+    return str(_TRACKS_DIR_PATH / f"{pid}.json")
+
+
+def append_point(
+    gamertag: str,
+    x: float,
+    y: float,
+    z: float,
+    ts: datetime | None = None,
+    source: str = "",
+    guild_id: int | None = None,
+):
     """Append a point to the player's track and notify subscribers."""
     pid, canonical = _resolve_player_id(gamertag)
     path = _track_path(pid)
@@ -58,8 +105,11 @@ def append_point(gamertag:str, x:float, y:float, z:float,
         return
 
     point = {
-        "ts": ts.isoformat().replace("+00:00","Z"),
-        "x": x, "y": y, "z": z, "source": source
+        "ts": ts.isoformat().replace("+00:00", "Z"),
+        "x": x,
+        "y": y,
+        "z": z,
+        "source": source,
     }
     doc["points"].append(point)
     if len(doc["points"]) > MAX_POINTS_PER_PLAYER:
@@ -73,39 +123,46 @@ def append_point(gamertag:str, x:float, y:float, z:float,
         logger.error(f"Failed to save track for {canonical} at {path}: {e}", exc_info=True)
         return
 
-    # NEW: notify listeners (live pulse etc.)
+    # Notify listeners (live pulse etc.)
     try:
         asyncio.get_running_loop().create_task(_notify_point(guild_id, canonical, point))
         logger.debug(f"Notified subscribers for [{canonical}] @ ({x},{z})")
     except RuntimeError:
-        # no loop (rare); best-effort call without scheduling
+        # No running loop: best-effort synchronous call
         logger.warning("No running event loop; notifying subscribers synchronously.")
         try:
             asyncio.run(_notify_point(guild_id, canonical, point))
         except Exception as e:
             logger.error(f"Synchronous notify failed for {canonical}: {e}", exc_info=True)
 
-def load_track(player_query:str, window_hours:int|None=None, max_points:int|None=None):
-    from datetime import datetime
+
+def load_track(player_query: str, window_hours: int | None = None, max_points: int | None = None):
+    from datetime import datetime as _dt
     import time as _time
+
     index = load_file(INDEX_PATH) or {}
     pid = index.get(player_query) or index.get(player_query.lower())
     if not pid:
         for k, v in index.items():
             if k.lower().startswith(player_query.lower()):
-                pid = v; break
+                pid = v
+                break
     if not pid:
         logger.debug(f"load_track: no index match for query '{player_query}'")
         return None, None
+
     doc = load_file(_track_path(pid)) or {"player_id": pid, "gamertag": player_query, "points": []}
     pts = doc["points"]
+
     if window_hours:
-        cutoff = _time.time() - window_hours*3600
+        cutoff = _time.time() - window_hours * 3600
         before = len(pts)
-        pts = [p for p in pts if datetime.fromisoformat(p["ts"].replace("Z","+00:00")).timestamp() >= cutoff]
+        pts = [p for p in pts if _dt.fromisoformat(p["ts"].replace("Z", "+00:00")).timestamp() >= cutoff]
         logger.debug(f"load_track: window={window_hours}h reduced {before}->{len(pts)} for {doc.get('gamertag')}")
+
     if max_points and len(pts) > max_points:
         pts = pts[-max_points:]
         logger.debug(f"load_track: limited to last {max_points} points for {doc.get('gamertag')}")
+
     logger.info(f"Loaded track for {doc.get('gamertag')} with {len(pts)} point(s)")
     return pid, {**doc, "points": pts}
