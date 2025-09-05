@@ -8,6 +8,9 @@ Path("data").mkdir(parents=True, exist_ok=True)
 # Local and external link storage
 LOCAL_LINKS_PATH = "data/linked_players.json"
 EXTERNAL_LINKS_PATH = None  # optional: default external repo path, override with /setexternallinks
+INDEX_PATH = "data/players_index.json"
+TRACKS_DIR = "data/player_tracks"
+MAX_POINTS_PER_PLAYER = 5000
 
 # Map catalog
 MAPS = {
