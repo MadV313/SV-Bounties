@@ -1,15 +1,34 @@
-# bot.py (snippet)
-import os, asyncio, discord
+# bot.py (additions)
+import asyncio, discord, os
 from discord.ext import commands
+from utils.ftp_config import get_ftp_config
+from tracer.log_fetcher import poll_guild
+from tracer.scanner import scan_adm_line
 
 INTENTS = discord.Intents.default()
 BOT = commands.Bot(command_prefix="!", intents=INTENTS)
 
+# Keep per-guild stop events so we can restart polls if needed
+poll_stops: dict[int, asyncio.Event] = {}
+
+async def line_callback(guild_id: int, line: str, source_ref: str, ts):
+    await scan_adm_line(guild_id, line, source_ref, ts)
+
+async def start_polls():
+    await BOT.wait_until_ready()
+    for guild in BOT.guilds:
+        cfg = get_ftp_config(guild.id)
+        if not cfg or guild.id in poll_stops:
+            continue
+        stop_event = asyncio.Event()
+        poll_stops[guild.id] = stop_event
+        BOT.loop.create_task(poll_guild(guild.id, line_callback, stop_event))
+
 @BOT.event
 async def on_ready():
     print(f"Logged in as {BOT.user} ({BOT.user.id})")
+    BOT.loop.create_task(start_polls())
 
-# bot.py (additions)
 async def main():
     async with BOT:
         await BOT.load_extension("cogs.admin_assign")
@@ -18,7 +37,6 @@ async def main():
         await BOT.load_extension("cogs.link")
         await BOT.load_extension("cogs.trace")
         await BOT.load_extension("cogs.bounty")
-        # (and any other cogs like cogs.track)
         await BOT.start(os.environ["DISCORD_TOKEN"])
 
 if __name__ == "__main__":
