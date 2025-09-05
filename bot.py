@@ -1,6 +1,10 @@
 # bot.py (additions)
 import asyncio, discord, os
 from discord.ext import commands
+
+import logging
+logging.basicConfig(level=logging.INFO)
+
 from utils.ftp_config import get_ftp_config
 from tracer.log_fetcher import poll_guild
 from tracer.scanner import scan_adm_line
@@ -44,6 +48,7 @@ async def main():
         await BOT.load_extension("cogs.link")
         await BOT.load_extension("cogs.trace")
         await BOT.load_extension("cogs.bounty")
+        await BOT.load_extension("cogs.admin_misc")
         await BOT.start(os.environ["DISCORD_TOKEN"])
 
 if __name__ == "__main__":
