@@ -6,9 +6,8 @@ from utils.settings import load_settings, save_settings
 from tracer.config import MAPS
 
 def admin_check():
-    # allow server admins or anyone with Manage Guild; customize if you prefer role IDs
     def pred(i: discord.Interaction):
-        perms = i.user.guild_permissions if hasattr(i.user, "guild_permissions") else None
+        perms = getattr(i.user, "guild_permissions", None)
         return bool(perms and (perms.administrator or perms.manage_guild))
     return app_commands.check(lambda i: pred(i))
 
@@ -16,21 +15,24 @@ class AdminAssign(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="assignchannel", description="Set the SV Bounties channel and pick the active map")
-    @app_commands.describe(channel="Channel to use for SV bounties", map_choice="Which map should be active?")
-    @app_commands.choices(
-        map_choice=[app_commands.Choice(name=cfg["name"], value=key) for key, cfg in MAPS.items()]
+    @app_commands.command(
+        name="setchannels",
+        description="Set the PRIVATE admin channel (trace output) and PUBLIC bounty channel."
     )
     @admin_check()
-    async def assignchannel(self, interaction: discord.Interaction,
-                            channel: discord.TextChannel,
-                            map_choice: app_commands.Choice[str]):
-        settings = save_settings({
-            "bounty_channel_id": channel.id,
-            "active_map": map_choice.value.lower()
+    @app_commands.describe(
+        admin_channel="Private admin channel (trace output, internal logs)",
+        bounty_channel="Public channel for bounty posts"
+    )
+    async def setchannels(self, interaction: discord.Interaction,
+                          admin_channel: discord.TextChannel,
+                          bounty_channel: discord.TextChannel):
+        s = save_settings({
+            "admin_channel_id": admin_channel.id,
+            "bounty_channel_id": bounty_channel.id
         })
         await interaction.response.send_message(
-            f"✅ Saved.\n• Bounty channel: {channel.mention}\n• Active map: **{MAPS[settings['active_map']]['name']}**",
+            f"✅ Saved.\n• Admin channel: {admin_channel.mention}\n• Bounty channel: {bounty_channel.mention}",
             ephemeral=True
         )
 
@@ -41,9 +43,9 @@ class AdminAssign(commands.Cog):
     )
     @admin_check()
     async def setmap(self, interaction: discord.Interaction, map_choice: app_commands.Choice[str]):
-        settings = save_settings({"active_map": map_choice.value.lower()})
+        s = save_settings({"active_map": map_choice.value.lower()})
         await interaction.response.send_message(
-            f"🗺️ Active map set to **{MAPS[settings['active_map']]['name']}**.",
+            f"🗺️ Active map set to **{MAPS[s['active_map']]['name']}**.",
             ephemeral=True
         )
 
@@ -51,10 +53,11 @@ class AdminAssign(commands.Cog):
     @admin_check()
     async def settings(self, interaction: discord.Interaction):
         s = load_settings()
-        ch = f"<#{s['bounty_channel_id']}>" if s.get("bounty_channel_id") else "*not set*"
+        admin_ch = f"<#{s['admin_channel_id']}>" if s.get("admin_channel_id") else "*not set*"
+        bounty_ch = f"<#{s['bounty_channel_id']}>" if s.get("bounty_channel_id") else "*not set*"
         mp = MAPS.get(s.get("active_map") or "", {}).get("name", "*unknown*")
         await interaction.response.send_message(
-            f"**Current Settings**\n• Bounty channel: {ch}\n• Active map: **{mp}**",
+            f"**Current Settings**\n• Admin channel: {admin_ch}\n• Bounty channel: {bounty_ch}\n• Active map: **{mp}**",
             ephemeral=True
         )
 
