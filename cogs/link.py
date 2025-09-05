@@ -8,6 +8,7 @@ from utils.linking import (
     load_external_links,
     load_local_links,
 )
+from utils.settings import load_settings  # NEW
 
 class LinkCog(commands.Cog):
     def __init__(self, bot):
@@ -18,6 +19,15 @@ class LinkCog(commands.Cog):
     async def link(self, interaction: discord.Interaction, gamertag: str):
         guild_id = interaction.guild_id
         user_id = str(interaction.user.id)
+
+        # NEW: allow guilds (like your server) to disable local linking and defer to Rewards bot
+        s = load_settings(guild_id)
+        if s.get("disable_local_link"):
+            return await interaction.response.send_message(
+                "ℹ️ Linking on this server is handled by the **Rewards bot**. "
+                "Please use that bot’s `/link` command instead.",
+                ephemeral=True
+            )
 
         # If external has a different tag for this user, show it (FYI), but we still link locally (per guild).
         ext = load_external_links(guild_id) or {}
