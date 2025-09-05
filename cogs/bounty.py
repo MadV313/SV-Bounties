@@ -12,9 +12,10 @@ from utils.bounties import (
     clear_all_bounties,
 )
 from utils.settings import load_settings
+from utils import live_pulse  # NEW
 from tracer.config import MAPS  # kept (may be used later)
-from tracer.map_renderer import render_track_png  # kept (may be used later)
-from tracer.tracker import load_track  # kept (may be used later)
+from tracer.map_renderer import render_track_png  # kept
+from tracer.tracker import load_track  # kept
 
 
 def admin_or_staff():
@@ -25,10 +26,12 @@ def admin_or_staff():
 
 
 class BountyCog(commands.Cog):
-    def __init__(self, bot): 
+    def __init__(self, bot):
         self.bot = bot
+        # ensure live pulse is initialized (safe to call multiple times)
+        live_pulse.init(bot)
 
-    @app_commands.command(name="bounty_add", description="Place a bounty (SV tickets integration pending)")
+    @app_commands.command(name="bounty_add", description="Place a bounty and start live tracking")
     @app_commands.describe(
         user="Discord user (preferred if linked)",
         gamertag="Gamertag (use if not linked)",
@@ -59,9 +62,10 @@ class BountyCog(commands.Cog):
         # TODO: integrate wallet debit here (SV tickets). For now, just record the bounty.
         b = create_bounty(str(interaction.user.id), resolved_did, resolved_tag, amount, note)
 
-        # Try to post a public announcement in the configured bounty channel (if set)
+        # Public announcement & live pulse start
         settings = load_settings()
         bounty_channel_id = settings.get("bounty_channel_id")
+        posted = False
         if bounty_channel_id:
             ch = interaction.client.get_channel(int(bounty_channel_id))
             if isinstance(ch, discord.TextChannel):
@@ -75,12 +79,17 @@ class BountyCog(commands.Cog):
                 embed.set_footer(text=f"Bounty ID: {b['id']}")
                 try:
                     await ch.send(embed=embed)
+                    posted = True
                 except Exception:
-                    # If posting fails, we still proceed silently
                     pass
 
+        # Begin LIVE pulse: one message in the bounty channel updated on each ADM point
+        if interaction.guild_id:
+            live_pulse.start_for(interaction.guild_id, resolved_tag)
+
         await interaction.followup.send(
-            f"🎯 Bounty created on **{resolved_tag}** for **{amount} SV tickets**.\nID: `{b['id']}`",
+            ("✅ Bounty created and live tracking started." if posted else "✅ Bounty created. Live tracking will start on next location update.")
+            + f"\nTarget: **{resolved_tag}** — **{amount} SV tickets**\nID: `{b['id']}`",
             ephemeral=True
         )
 
@@ -89,7 +98,6 @@ class BountyCog(commands.Cog):
         opens = list_open()
         if not opens:
             return await interaction.response.send_message("No open bounties.")
-        # simple list for now
         lines = [
             f"• `{b['id']}` — {b['target_gamertag']} — {b['amount']} SVt"
             for b in opens
@@ -113,25 +121,23 @@ class BountyCog(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         if remove_all:
+            # stop all pulses for this guild
+            if interaction.guild_id:
+                live_pulse.stop_all_for_guild(interaction.guild_id)
             n = clear_all_bounties()
-            return await interaction.followup.send(
-                f"🧹 Cleared **{n}** open bounties.",
-                ephemeral=True
-            )
+            return await interaction.followup.send(f"🧹 Cleared **{n}** open bounties.", ephemeral=True)
 
         if user:
+            if interaction.guild_id:
+                live_pulse.stop_for(interaction.guild_id, user.display_name)  # best-effort
             n = remove_bounty_by_discord_id(str(user.id))
-            return await interaction.followup.send(
-                f"Removed **{n}** bounty(ies) for {user.mention}.",
-                ephemeral=True
-            )
+            return await interaction.followup.send(f"Removed **{n}** bounty(ies) for {user.mention}.", ephemeral=True)
 
         if gamertag:
+            if interaction.guild_id:
+                live_pulse.stop_for(interaction.guild_id, gamertag)
             n = remove_bounty_by_gamertag(gamertag)
-            return await interaction.followup.send(
-                f"Removed **{n}** bounty(ies) for `{gamertag}`.",
-                ephemeral=True
-            )
+            return await interaction.followup.send(f"Removed **{n}** bounty(ies) for `{gamertag}`.", ephemeral=True)
 
         await interaction.followup.send(
             "❌ Provide a target via `user` or `gamertag`, or set `remove_all: true`.",
