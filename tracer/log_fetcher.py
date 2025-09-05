@@ -106,8 +106,11 @@ def _pick_latest_by_name(names: list[str]) -> str | None:
 def _ftp_read_range_in_cwd(ftp: FTP, filename: str, start: int) -> bytes:
     """
     Read bytes of `filename` in the CURRENT directory from offset `start` to EOF.
+    Force binary mode first so REST is allowed (avoids '501 REST: Resuming transfers not allowed in ASCII mode').
     """
     bio = io.BytesIO()
+    # Ensure binary mode for ranged reads
+    ftp.sendcmd("TYPE I")
     if start > 0:
         ftp.sendcmd(f"REST {start}")
     ftp.retrbinary(f"RETR {filename}", bio.write)
