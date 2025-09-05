@@ -3,11 +3,33 @@ import os, time, asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict
 
 from utils.storageClient import load_file, save_file  # your existing helpers
 from tracer.config import INDEX_PATH, TRACKS_DIR, MAX_POINTS_PER_PLAYER
 
 logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------------
+# Logging throttling (reduce spam without losing data)
+# -----------------------------------------------------------------------------
+# How often (in seconds) we allow an INFO "append" log per player
+THROTTLE_APPEND_SECS = 5.0
+# How often we allow an INFO "indexed new player" log for the same tag
+THROTTLE_INDEX_SECS = 30.0
+
+_last_log_ts: Dict[str, float] = {}
+
+def _should_log(key: str, interval: float) -> bool:
+    """Return True if enough time has passed since last log for this key."""
+    now = time.monotonic()
+    last = _last_log_ts.get(key, 0.0)
+    if now - last >= interval:
+        _last_log_ts[key] = now
+        return True
+    return False
+# -----------------------------------------------------------------------------
+
 
 # Normalize TRACKS_DIR as a Path
 _TRACKS_DIR_PATH = Path(TRACKS_DIR)
@@ -41,7 +63,7 @@ _ensure_tracks_dir()
 # -----------------------------------------------------------------------------
 
 
-# --- NEW: simple subscription bus for "point appended" events ---
+# --- Simple subscription bus for "point appended" events ---------------------
 _point_subscribers: list = []  # list[Callable[[int|None,str,dict], Awaitable[None]]]
 
 def subscribe_to_points(callback):
@@ -57,7 +79,7 @@ async def _notify_point(guild_id, gamertag, point):
                 await coro
         except Exception as e:
             logger.error(f"Point subscriber error for [{gamertag}]: {e}", exc_info=True)
-# ----------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 
 def _sanitize_id(name: str) -> str:
@@ -72,7 +94,11 @@ def _resolve_player_id(gamertag: str):
         index[gamertag] = pid
         index[gamertag.lower()] = pid
         save_file(INDEX_PATH, index)
-        logger.info(f"Indexed new player: {gamertag} -> {pid}")
+        # Throttle this INFO so repeated reconnects don’t spam
+        if _should_log(f"index:{pid}", THROTTLE_INDEX_SECS):
+            logger.info(f"Indexed new player: {gamertag} -> {pid}")
+        else:
+            logger.debug(f"Indexed new player (throttled): {gamertag} -> {pid}")
     return pid, gamertag
 
 
@@ -118,7 +144,11 @@ def append_point(
 
     try:
         save_file(path, doc)
-        logger.info(f"Track append [{canonical}] ({x},{z}) total={len(doc['points'])}")
+        # Throttle the very chatty success log
+        if _should_log(f"append:{pid}", THROTTLE_APPEND_SECS):
+            logger.info(f"Track append [{canonical}] ({x},{z}) total={len(doc['points'])}")
+        else:
+            logger.debug(f"Track append (throttled) [{canonical}] ({x},{z}) total={len(doc['points'])}")
     except Exception as e:
         logger.error(f"Failed to save track for {canonical} at {path}: {e}", exc_info=True)
         return
