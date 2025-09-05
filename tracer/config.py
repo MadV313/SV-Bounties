@@ -5,11 +5,15 @@ from pathlib import Path
 SETTINGS_PATH = "data/settings.json"
 Path("data").mkdir(parents=True, exist_ok=True)
 
-# Map catalog: add/replace your real PNGs here
+# Local and external link storage
+LOCAL_LINKS_PATH = "data/linked_players.json"
+EXTERNAL_LINKS_PATH = None  # optional: default external repo path, override with /setexternallinks
+
+# Map catalog
 MAPS = {
     "livonia": {
         "name": "Livonia",
-        "image": "assets/maps/livonia_base.PNG",
+        "image": "assets/maps/livonia_base.PNG",  # watch case!
         "world_min_x": 0.0, "world_max_x": 12800.0,
         "world_min_z": 0.0, "world_max_z": 12800.0,
     },
@@ -21,8 +25,8 @@ MAPS = {
     },
 }
 
-# Default settings used on first run (until /assignchannel is used)
+# Default settings used on first run
 DEFAULT_SETTINGS = {
-    "bounty_channel_id": None,   # filled by /assignchannel
-    "active_map": "livonia",     # "livonia" | "chernarus"
+    "bounty_channel_id": None,
+    "active_map": "livonia",
 }
