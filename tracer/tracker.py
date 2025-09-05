@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict
+from collections import defaultdict, deque
 
 from utils.storageClient import load_file, save_file  # your existing helpers
 from tracer.config import INDEX_PATH, TRACKS_DIR, MAX_POINTS_PER_PLAYER
@@ -108,6 +109,57 @@ def _track_path(pid: str) -> str:
     return str(_TRACKS_DIR_PATH / f"{pid}.json")
 
 
+# =============================================================================
+# Buffered writes to avoid rate limits / excessive FS churn
+# =============================================================================
+# Per-player in-memory queues of new points (dicts)
+_buffers: Dict[str, deque] = defaultdict(deque)
+# Last time we flushed any buffer (epoch seconds)
+_last_flush_ts: float = 0.0
+# Flush policy
+_FLUSH_INTERVAL = 15        # seconds: flush all buffers at least this often
+_MAX_BUFFER_POINTS = 10     # flush a player's buffer if it reaches this size
+
+
+def _flush_pid(pid: str, doc_gamertag_fallback: str | None = None) -> None:
+    """Flush the buffer for a single player ID, if any."""
+    q = _buffers.get(pid)
+    if not q:
+        return
+
+    path = _track_path(pid)
+    doc = load_file(path) or {"player_id": pid,
+                              "gamertag": doc_gamertag_fallback or "unknown",
+                              "points": []}
+    # extend with queued points, but drop the helper field "gamertag" on write
+    new_pts = list(q)
+    for p in new_pts:
+        p.pop("gamertag", None)
+    doc["points"].extend(new_pts)
+
+    if len(doc["points"]) > MAX_POINTS_PER_PLAYER:
+        doc["points"] = doc["points"][-MAX_POINTS_PER_PLAYER:]
+
+    try:
+        save_file(path, doc)
+        logger.debug(f"Flushed {len(new_pts)} pts for {doc.get('gamertag')} (total={len(doc['points'])})")
+    except Exception as e:
+        logger.error(f"Failed to flush track for {pid}: {e}", exc_info=True)
+
+    q.clear()
+
+
+def _flush_maybe(force: bool = False) -> None:
+    """Flush all player buffers if interval passed or force=True."""
+    global _last_flush_ts
+    now = time.time()
+    if force or (now - _last_flush_ts) >= _FLUSH_INTERVAL:
+        for pid in list(_buffers.keys()):
+            _flush_pid(pid)
+        _last_flush_ts = now
+# =============================================================================
+
+
 def append_point(
     gamertag: str,
     x: float,
@@ -117,51 +169,62 @@ def append_point(
     source: str = "",
     guild_id: int | None = None,
 ):
-    """Append a point to the player's track and notify subscribers."""
+    """Append a point to the player's track and notify subscribers (buffered)."""
     pid, canonical = _resolve_player_id(gamertag)
-    path = _track_path(pid)
-    doc = load_file(path) or {"player_id": pid, "gamertag": canonical, "points": []}
     if not ts:
         ts = datetime.now(timezone.utc)
-    doc["gamertag"] = canonical
 
-    # de-dupe adjacent identical X/Z
-    if doc["points"] and (doc["points"][-1]["x"], doc["points"][-1]["z"]) == (x, z):
-        logger.debug(f"[{canonical}] Duplicate adjacent point ignored at ({x},{z}) from {source}")
-        return
-
+    # Build queued point (we keep gamertag only for logging/flush default)
     point = {
         "ts": ts.isoformat().replace("+00:00", "Z"),
         "x": x,
         "y": y,
         "z": z,
         "source": source,
+        "gamertag": canonical,
     }
-    doc["points"].append(point)
-    if len(doc["points"]) > MAX_POINTS_PER_PLAYER:
-        doc["points"] = doc["points"][-MAX_POINTS_PER_PLAYER:]
-        logger.debug(f"[{canonical}] Track truncated to last {MAX_POINTS_PER_PLAYER} points")
 
-    try:
-        save_file(path, doc)
-        # Throttle the very chatty success log
-        if _should_log(f"append:{pid}", THROTTLE_APPEND_SECS):
-            logger.info(f"Track append [{canonical}] ({x},{z}) total={len(doc['points'])}")
-        else:
-            logger.debug(f"Track append (throttled) [{canonical}] ({x},{z}) total={len(doc['points'])}")
-    except Exception as e:
-        logger.error(f"Failed to save track for {canonical} at {path}: {e}", exc_info=True)
-        return
+    q = _buffers[pid]
+
+    # De-dupe adjacent identical X/Z (check buffer last if present,
+    # else peek last saved point once when buffer is empty)
+    if q:
+        if (q[-1]["x"], q[-1]["z"]) == (x, z):
+            logger.debug(f"[{canonical}] Duplicate adjacent point ignored at ({x},{z}) from {source}")
+            return
+    else:
+        # Buffer empty: peek last saved point to avoid immediate duplicates
+        path = _track_path(pid)
+        doc = load_file(path)
+        if doc and doc.get("points"):
+            last = doc["points"][-1]
+            if (last.get("x"), last.get("z")) == (x, z):
+                logger.debug(f"[{canonical}] Duplicate (vs saved) point ignored at ({x},{z}) from {source}")
+                return
+
+    # Queue and maybe flush
+    q.append(point)
+
+    # Throttled "append" log (buffered)
+    if _should_log(f"append:{pid}", THROTTLE_APPEND_SECS):
+        logger.info(f"Track append [{canonical}] ({x},{z}) (buffered size={len(q)})")
+    else:
+        logger.debug(f"Track append (throttled) [{canonical}] ({x},{z}) buf={len(q)}")
+
+    # Flush rules: per-player size threshold OR global interval
+    if len(q) >= _MAX_BUFFER_POINTS:
+        _flush_pid(pid, doc_gamertag_fallback=canonical)
+    _flush_maybe(force=False)
 
     # Notify listeners (live pulse etc.)
     try:
-        asyncio.get_running_loop().create_task(_notify_point(guild_id, canonical, point))
+        asyncio.get_running_loop().create_task(_notify_point(guild_id, canonical, dict(point)))
         logger.debug(f"Notified subscribers for [{canonical}] @ ({x},{z})")
     except RuntimeError:
         # No running loop: best-effort synchronous call
         logger.warning("No running event loop; notifying subscribers synchronously.")
         try:
-            asyncio.run(_notify_point(guild_id, canonical, point))
+            asyncio.run(_notify_point(guild_id, canonical, dict(point)))
         except Exception as e:
             logger.error(f"Synchronous notify failed for {canonical}: {e}", exc_info=True)
 
@@ -180,6 +243,9 @@ def load_track(player_query: str, window_hours: int | None = None, max_points: i
     if not pid:
         logger.debug(f"load_track: no index match for query '{player_query}'")
         return None, None
+
+    # Ensure any buffered points for this player are flushed before read
+    _flush_pid(pid)
 
     doc = load_file(_track_path(pid)) or {"player_id": pid, "gamertag": player_query, "points": []}
     pts = doc["points"]
