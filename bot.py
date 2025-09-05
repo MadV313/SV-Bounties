@@ -13,6 +13,7 @@ async def on_ready():
 async def main():
     async with BOT:
         await BOT.load_extension("cogs.admin_assign")
+        await BOT.load_extension("cogs.admin_ftp")
         await BOT.load_extension("cogs.admin_links")
         await BOT.load_extension("cogs.link")
         await BOT.load_extension("cogs.trace")
