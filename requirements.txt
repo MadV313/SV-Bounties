@@ -1,0 +1,13 @@
+# requirements.txt
+
+# Discord bot framework
+discord.py>=2.3.2
+
+# Image rendering (for map pins/paths)
+Pillow>=10.0.0
+
+# Date/time parsing and utilities
+python-dateutil>=2.8.2
+
+# Optional: if you plan to fetch external JSON via HTTP
+requests>=2.31.0
