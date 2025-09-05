@@ -1,6 +1,7 @@
 # tracer/log_fetcher.py
 import asyncio
 import io
+import logging
 from ftplib import FTP
 from datetime import datetime, timezone
 from typing import Callable, Awaitable, Optional
@@ -8,6 +9,8 @@ from typing import Callable, Awaitable, Optional
 from utils.ftp_config import get_ftp_config
 from tracer.adm_state import get_guild_state, set_guild_state
 from tracer.adm_buffer import AdmBuffer
+
+logger = logging.getLogger(__name__)
 
 LineCallback = Callable[[int, str, str, datetime], Awaitable[None]]
 # signature: (guild_id, line, source_ref, timestamp)
@@ -37,14 +40,18 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
     """
     cfg = get_ftp_config(guild_id)
     if not cfg:
+        logger.warning(f"[Guild {guild_id}] No FTP config set; skipping poller.")
         return  # not configured for this guild
 
     interval = max(5, int(cfg.get("interval_sec", 10)))
     directory = cfg.get("adm_dir", "/")
 
     buffer = AdmBuffer(max_remember=200)
-    latest_file = get_guild_state(guild_id).get("latest_file")
-    offset = int(get_guild_state(guild_id).get("offset") or 0)
+    state = get_guild_state(guild_id)
+    latest_file = state.get("latest_file")
+    offset = int(state.get("offset") or 0)
+
+    logger.info(f"[Guild {guild_id}] Starting ADM poller (dir={directory}, every {interval}s).")
 
     while not stop_event.is_set():
         try:
@@ -55,6 +62,7 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
             # Filter to likely ADM files
             files = [f for f in files if f.lower().endswith((".adm", ".log", ".txt"))]
             if not files:
+                logger.debug(f"[Guild {guild_id}] No ADM files in {directory}")
                 await _to_thread(ftp.quit)
                 await asyncio.sleep(interval)
                 continue
@@ -64,6 +72,7 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
 
             if latest_file != candidate:
                 # new file rolled over
+                logger.info(f"[Guild {guild_id}] Switching to new ADM file {candidate}")
                 latest_file = candidate
                 offset = 0
                 set_guild_state(guild_id, latest_file=latest_file, offset=offset)
@@ -75,16 +84,17 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 text = blob.decode("utf-8", errors="ignore")
                 now = datetime.now(timezone.utc)
                 # Update offset first so even if downstream crashes we won't repeat
+                prev_offset = offset
                 offset += len(blob)
                 set_guild_state(guild_id, latest_file=latest_file, offset=offset)
 
                 # Feed new lines to callback
                 for idx, line in enumerate(text.splitlines()):
                     if buffer.accept(line):
-                        source = f"ftp:{candidate}#~{offset - len(blob)}+{idx}"
+                        source = f"ftp:{candidate}#~{prev_offset}+{idx}"
                         await cb(guild_id, line, source, now)
-        except Exception:
-            # swallow exceptions and keep polling; you can add logging here
-            pass
+        except Exception as e:
+            # log and keep polling
+            logger.error(f"[Guild {guild_id}] FTP poll error: {e}", exc_info=True)
 
         await asyncio.sleep(interval)
