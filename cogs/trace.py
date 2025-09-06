@@ -1,9 +1,8 @@
-# cogs/trace.py
 import discord
 from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 from utils.settings import load_settings
 from utils.linking import resolve_from_any
@@ -43,14 +42,12 @@ def _parse_dt(s: str) -> datetime | None:
 
 
 # ---- iZurvive helper ---------------------------------------------------------
-# Use correct slugs; iZurvive expects semicolon between x and z.
 _MAP_SLUG = {
-    "chernarus+": "chernarusplusedition",
-    "chernarus": "chernarusplusedition",
+    "chernarus+": "chernarus",
+    "chernarus": "chernarus",
     "livonia": "livonia",
     "namalsk": "namalsk",
 }
-
 def _active_map_name(guild_id: int | None) -> str:
     st = load_settings(guild_id) if guild_id else {}
     return (st.get("active_map") or "Livonia").strip()
@@ -129,7 +126,6 @@ class TraceCog(commands.Cog):
         dt_start = _parse_dt(start) if start else None
         dt_end = _parse_dt(end) if end else datetime.now(timezone.utc)
 
-        # If explicit start provided, compute a sane end if missing/invalid and ignore window_hours
         if dt_start:
             if not dt_end or dt_end <= dt_start:
                 dt_end = dt_start + timedelta(hours=1)
@@ -197,14 +193,31 @@ class TraceCog(commands.Cog):
             count = len(points)
 
         # ------------------- render image --------------------
+        # Always include guild_id in the doc as a hint for renderers
+        doc_for_render = {**doc, "guild_id": guild_id}
+
+        def _render_any() -> io.BytesIO:
+            # Try multiple call signatures to match whichever renderer you have deployed
+            last_err: Exception | None = None
+            for f in (
+                lambda: render_track_png(guild_id, doc_for_render),          # (guild_id, doc)
+                lambda: render_track_png(doc_for_render, guild_id),          # (doc, guild_id)
+                lambda: render_track_png(doc_for_render),                    # (doc)
+            ):
+                try:
+                    return f()
+                except TypeError as e:
+                    last_err = e
+                    continue
+            raise last_err if last_err else RuntimeError("No compatible render_track_png signature")
+
         try:
-            # Some versions expect guild_id; support both.
-            try:
-                img = render_track_png(doc, guild_id=guild_id)  # newer signature
-            except TypeError:
-                img = render_track_png(doc)  # older signature
+            img = _render_any()
         except Exception as e:
-            _log(guild_id, "render_track_png failed", {"error": repr(e), "doc_keys": list(doc.keys())})
+            _log(guild_id, "render_track_png failed", {
+                "error": repr(e),
+                "doc_keys": list(doc_for_render.keys())
+            })
             return await interaction.followup.send(
                 "❌ Failed to render map image. See logs for details.",
                 ephemeral=True
@@ -228,8 +241,7 @@ class TraceCog(commands.Cog):
         try:
             ts_raw = last.get("ts")
             if ts_raw:
-                when = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
-                    .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+                when = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")).astimezone(timezone.utc).strftime("%H:%M:%S UTC")
         except Exception:
             pass
 
