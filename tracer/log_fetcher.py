@@ -5,7 +5,7 @@ import logging
 import re
 from ftplib import FTP, error_perm
 from datetime import datetime, timezone
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, Optional
 
 from utils.ftp_config import get_ftp_config
 from tracer.adm_state import get_guild_state, set_guild_state
@@ -22,7 +22,7 @@ ADM_NAME_TS = re.compile(
     re.IGNORECASE,
 )
 
-def _parse_name_ts(name: str) -> datetime | None:
+def _parse_name_ts(name: str) -> Optional[datetime]:
     m = ADM_NAME_TS.search(name)
     if not m:
         return None
@@ -32,20 +32,17 @@ def _parse_name_ts(name: str) -> datetime | None:
     except Exception:
         return None
 
-def _ftp_latest_adm_with_mlsd(ftp: FTP, directory: str) -> str | None:
-    """
-    Try to use MLSD to find the newest .adm in `directory` by modify timestamp.
-    Returns just the filename (not the full path), or None on failure / not found.
-    Leaves CWD at `directory`.
-    """
+def _ftp_mlsd_lines(ftp: FTP) -> list[str]:
+    lines: list[str] = []
+    ftp.retrlines("MLSD", lines.append)
+    return lines
+
+def _ftp_latest_adm_with_mlsd(ftp: FTP, directory: str) -> Optional[str]:
+    """Use MLSD to find newest .adm by 'modify' fact. Leaves CWD at directory."""
     try:
         ftp.cwd(directory)
-        lines: list[str] = []
-        ftp.retrlines("MLSD", lines.append)
-
-        best_name: str | None = None
-        best_modify: str | None = None  # YYYYMMDDHHMMSS
-
+        lines = _ftp_mlsd_lines(ftp)
+        best_name, best_modify = None, None  # type: Optional[str], Optional[str]
         for ln in lines:
             if " " not in ln:
                 continue
@@ -53,21 +50,17 @@ def _ftp_latest_adm_with_mlsd(ftp: FTP, directory: str) -> str | None:
             name = name.strip()
             if not name.lower().endswith(".adm"):
                 continue
-
             facts = {}
             for kv in facts_part.split(";"):
                 if "=" in kv:
                     k, v = kv.split("=", 1)
                     facts[k.lower()] = v
-
             if facts.get("type", "").lower() != "file":
                 continue
-
-            modify = facts.get("modify")
+            modify = facts.get("modify")  # YYYYMMDDHHMMSS
             if modify and (best_modify is None or modify > best_modify):
                 best_modify = modify
                 best_name = name
-
         return best_name
     except error_perm as e:
         logger.debug(f"MLSD not available in {directory}: {e}")
@@ -77,44 +70,53 @@ def _ftp_latest_adm_with_mlsd(ftp: FTP, directory: str) -> str | None:
         return None
 
 def _ftp_list_names(ftp: FTP, directory: str) -> list[str]:
-    """
-    NLST of `directory`, returns just names. Leaves CWD at `directory`.
-    """
     ftp.cwd(directory)
     names: list[str] = []
     ftp.retrlines("NLST", names.append)
     return names
 
-def _pick_latest_by_name(names: list[str]) -> str | None:
-    """
-    Prefer newest by parsed timestamp; if none parse, fall back to lexicographic.
-    """
+def _pick_latest_by_name(names: list[str]) -> Optional[str]:
     adms = [n for n in names if n.lower().endswith(".adm")]
     if not adms:
         return None
-
     parsed = [(n, _parse_name_ts(n)) for n in adms]
-    if any(ts is not None for _, ts in parsed):
-        parsed = [(n, ts) for n, ts in parsed if ts is not None]
-        parsed.sort(key=lambda x: x[1])  # ascending by timestamp
-        return parsed[-1][0] if parsed else None
-
-    # fallback: lexicographic usually matches the timestamped naming
+    parsed = [(n, ts) for n, ts in parsed if ts is not None]
+    if parsed:
+        parsed.sort(key=lambda x: x[1])
+        return parsed[-1][0]
     adms.sort()
     return adms[-1]
 
 def _ftp_read_range_in_cwd(ftp: FTP, filename: str, start: int) -> bytes:
-    """
-    Read bytes of `filename` in the CURRENT directory from offset `start` to EOF.
-    Force binary mode first so REST is allowed (avoids '501 REST: Resuming transfers not allowed in ASCII mode').
-    """
+    """Read bytes of `filename` in CURRENT dir from offset `start` to EOF."""
     bio = io.BytesIO()
-    # Ensure binary mode for ranged reads
-    ftp.sendcmd("TYPE I")
     if start > 0:
+        # REST requires binary mode on some servers; we set TYPE I after login.
         ftp.sendcmd(f"REST {start}")
     ftp.retrbinary(f"RETR {filename}", bio.write)
     return bio.getvalue()
+
+def _ftp_size(ftp: FTP, filename: str) -> Optional[int]:
+    try:
+        # SIZE works reliably in binary; TYPE I already set after login.
+        resp = ftp.sendcmd(f"SIZE {filename}")
+        # Expected like: "213 12345"
+        parts = resp.split()
+        if len(parts) >= 2 and parts[0] == "213":
+            return int(parts[1])
+    except Exception:
+        pass
+    return None
+
+def _ftp_mdtm(ftp: FTP, filename: str) -> Optional[str]:
+    try:
+        resp = ftp.sendcmd(f"MDTM {filename}")  # "213 YYYYMMDDHHMMSS"
+        parts = resp.split()
+        if len(parts) >= 2 and parts[0] == "213":
+            return parts[1]
+    except Exception:
+        pass
+    return None
 
 async def _to_thread(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
@@ -123,7 +125,7 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
     """
     Poll FTP for a single guild. Reads only new bytes since last offset;
     if a newer ADM file appears, automatically switches to it.
-    Robust to `adm_dir` being absolute (/games/…/dayzxb/config) or relative (dayzxb/config).
+    Includes verbose heartbeat diagnostics so we can see exactly what's happening.
     """
     cfg = get_ftp_config(guild_id)
     if not cfg:
@@ -142,15 +144,23 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
 
     while not stop_event.is_set():
         try:
-            # Connect each cycle (resilient to idle timeouts)
-            ftp = await _to_thread(FTP, cfg["host"], timeout=20)
+            ftp = await _to_thread(FTP, cfg["host"], timeout=25)
+            # Passive + binary mode improves compatibility with REST/SIZE
             await _to_thread(ftp.login, cfg["username"], cfg["password"])
+            try:
+                await _to_thread(ftp.set_pasv, True)
+            except Exception:
+                pass
+            try:
+                await _to_thread(ftp.voidcmd, "TYPE I")
+            except Exception:
+                pass
 
-            # Always ensure we are in the configured directory before listing/reading
+            # Always try to enter the configured directory
             try:
                 await _to_thread(ftp.cwd, directory)
             except Exception as e:
-                # Helpful diagnostics: show PWD and a root listing
+                # Heartbeat when CWD fails: show root PWD + a root NLST
                 try:
                     pwd = await _to_thread(ftp.pwd)
                 except Exception:
@@ -159,20 +169,18 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                     f"[Guild {guild_id}] CWD to '{directory}' failed from PWD={pwd}: {e}",
                     exc_info=True,
                 )
-                # Try listing root to help the operator see what exists
                 try:
-                    root_names = await _to_thread(_ftp_list_names, ftp, "/")
-                    logger.info(f"[Guild {guild_id}] FTP root entries: {root_names[:25]}")
+                    root_ls = await _to_thread(_ftp_list_names, ftp, "/")
+                    logger.info(f"[Guild {guild_id}] FTP root entries: {root_ls[:40]}")
                 except Exception:
                     pass
                 await _to_thread(ftp.quit)
                 await asyncio.sleep(interval)
                 continue
 
-            # Prefer MLSD for freshest .ADM by mtime
+            # Choose latest ADM
             candidate = await _to_thread(_ftp_latest_adm_with_mlsd, ftp, ".")
             if not candidate:
-                # Fallback to NLST + pick latest by parsed timestamp or lexicographic
                 names = await _to_thread(_ftp_list_names, ftp, ".")
                 candidate = _pick_latest_by_name(names)
 
@@ -182,23 +190,52 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 await asyncio.sleep(interval)
                 continue
 
+            # If we switched files or current offset is past end, reset offset
             if latest_file != candidate:
                 logger.info(f"[Guild {guild_id}] Switching to new ADM file {candidate}")
                 latest_file = candidate
                 offset = 0
                 set_guild_state(guild_id, latest_file=latest_file, offset=offset)
 
-            # Ensure we are still in the directory, then read only the filename
-            await _to_thread(ftp.cwd, directory)
+            # Gather some heartbeat stats
+            size = await _to_thread(_ftp_size, ftp, latest_file)
+            mdtm = await _to_thread(_ftp_mdtm, ftp, latest_file)
+            try:
+                pwd_now = await _to_thread(ftp.pwd)
+            except Exception:
+                pwd_now = "(unknown)"
+
+            # If saved offset > current file size, the file rolled/shrank -> reset
+            if size is not None and offset > size:
+                logger.info(
+                    f"[Guild {guild_id}] Offset {offset} > size {size} for {latest_file}; resetting to 0 (rollover)."
+                )
+                offset = 0
+                set_guild_state(guild_id, latest_file=latest_file, offset=offset)
+
+            logger.debug(
+                f"[Guild {guild_id}] HEARTBEAT: PWD={pwd_now} file={latest_file} size={size} mdtm={mdtm} offset={offset}"
+            )
+
+            # Read new bytes (if any)
             blob: bytes = await _to_thread(_ftp_read_range_in_cwd, ftp, latest_file, offset)
             await _to_thread(ftp.quit)
 
-            if blob:
+            if not blob:
+                # No new data this tick; heartbeat at INFO so we can see it happening
+                logger.info(
+                    f"[Guild {guild_id}] No new bytes (file={latest_file} size={size} offset={offset}); waiting {interval}s."
+                )
+            else:
                 text = blob.decode("utf-8", errors="ignore")
                 now = datetime.now(timezone.utc)
                 prev_offset = offset
                 offset += len(blob)
                 set_guild_state(guild_id, latest_file=latest_file, offset=offset)
+
+                logger.info(
+                    f"[Guild {guild_id}] Read {len(blob)} bytes from {latest_file} (prev_offset={prev_offset} -> {offset})."
+                )
 
                 for idx, line in enumerate(text.splitlines()):
                     if buffer.accept(line):
