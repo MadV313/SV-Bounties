@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import io
-import math
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple
 
@@ -16,7 +15,7 @@ from PIL import Image, ImageDraw, ImageFont  # Pillow
 # This function should be provided by your tracker module.
 # Expected shape:
 # get_guild_snapshot(guild_id) -> list of dicts with keys:
-#   short_id, name, x, z, ts (datetime with tzinfo), map (optional)
+#   short_id, name, x, z, ts (datetime or ISO string), map (optional)
 try:
     from tracer.tracker import get_guild_snapshot  # type: ignore
 except Exception:  # pragma: no cover
@@ -73,6 +72,7 @@ def _active_map_for_guild(gid: int) -> str:
 
 
 def _world_size_for(map_name: str) -> int:
+    # Default to 15360 if unknown.
     return WORLD_SIZE.get(map_name, 15360)
 
 
@@ -102,7 +102,7 @@ def _load_map_image(map_name: str, size_px: int = 1400) -> Image.Image:
     img = Image.new("RGB", (side, side), (18, 18, 22))
     drw = ImageDraw.Draw(img)
     # draw a simple 10x10 grid
-    step = side // 10
+    step = max(1, side // 10)
     for k in range(0, side + 1, step):
         drw.line([(k, 0), (k, side)], fill=(40, 40, 46), width=1)
         drw.line([(0, k), (side, k)], fill=(40, 40, 46), width=1)
@@ -118,6 +118,9 @@ def _world_to_image(x: float, z: float, world_size: int, img_size: int) -> Tuple
     so we flip the vertical axis.
     """
     try:
+        # Clamp to [0, world_size]
+        x = max(0.0, min(float(world_size), float(x)))
+        z = max(0.0, min(float(world_size), float(z)))
         px = max(0, min(img_size - 1, int((x / world_size) * img_size)))
         py = max(0, min(img_size - 1, int(((world_size - z) / world_size) * img_size)))
         return px, py
@@ -130,7 +133,36 @@ def _draw_pin(drw: ImageDraw.ImageDraw, p: Tuple[int, int], color=(255, 64, 64))
     r = 8
     drw.ellipse([x - r, y - r, x + r, y + r], fill=color, outline=(0, 0, 0))
     drw.ellipse([x - 2, y - 2, x + 2, y + 2], fill=(0, 0, 0))
+
+
+def _load_font() -> ImageFont.ImageFont:
+    # Try common fonts inside many Linux containers; fall back to Pillow default.
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "arial.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, 18)
+        except Exception:
+            continue
+    return ImageFont.load_default()
 # -----------------------------------------------------------
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    """Accept datetime or ISO string; return aware UTC datetime or None."""
+    try:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, str):
+            # tolerate trailing "Z"
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+            return datetime.fromisoformat(value).astimezone(timezone.utc)
+    except Exception:
+        pass
+    return None
 
 
 class ShowTracked(commands.Cog):
@@ -161,7 +193,6 @@ class ShowTracked(commands.Cog):
                 ephemeral=True,
             )
 
-        # Not ephemeral by default; keep your prior behavior
         await interaction.response.defer(thinking=True, ephemeral=False)
 
         # Pull snapshot from tracker
@@ -171,7 +202,7 @@ class ShowTracked(commands.Cog):
             _log(gid, "get_guild_snapshot raised", {"error": repr(e)})
             return await interaction.followup.send(
                 "❌ Failed to read tracker snapshot. See logs for details.",
-                ephemeral=True,
+                ephemeral=False,
             )
 
         active_map = _active_map_for_guild(gid)
@@ -195,7 +226,7 @@ class ShowTracked(commands.Cog):
             "sample": sample,
         })
 
-        # Filter to current map if items include map info
+        # Filter to current map if items include map info (case-insensitive)
         def _same_map(row: Dict[str, Any]) -> bool:
             m = (row.get("map") or active_map).strip()
             return m.lower() == active_map.lower()
@@ -211,25 +242,19 @@ class ShowTracked(commands.Cog):
             relaxed_used = True
             _log(gid, "relaxed map filter engaged (using all rows)")
 
-        # Build text summary
         if not rows:
             msg = f"**No tracked players** for `{active_map}`."
             _log(gid, "no rows to display", {"active_map": active_map})
             return await interaction.followup.send(msg, ephemeral=False)
 
         # Sort by name for stable output
-        rows.sort(key=lambda r: (str(r.get("name") or r.get("short_id")), r.get("short_id", "")))
+        rows.sort(key=lambda r: (str(r.get("name") or r.get("short_id") or ""), r.get("short_id", "")))
 
         # Create image
         base = _load_map_image(active_map, size_px=1400)
         drw = ImageDraw.Draw(base)
         W, H = base.size
-
-        # Try to load a default font (Pillow’s internal will be used if Truetype fails)
-        try:
-            font = ImageFont.truetype("arial.ttf", 18)
-        except Exception:
-            font = ImageFont.load_default()
+        font = _load_font()
 
         # Draw each pin + label
         pins = []
@@ -242,7 +267,6 @@ class ShowTracked(commands.Cog):
             name = str(r.get("name") or r.get("short_id") or "?")
             px, py = _world_to_image(x, z, world_size, W)
             _draw_pin(drw, (px, py))
-            # slight offset for text
             drw.text((px + 10, py - 4), f"{name}", fill=(235, 235, 235), font=font)
             pins.append({"name": name, "x": x, "z": z, "px": px, "py": py})
 
@@ -258,13 +282,8 @@ class ShowTracked(commands.Cog):
                 z = float(r.get("z") or 0.0)
             except Exception:
                 x, z = 0.0, 0.0
-            ts = r.get("ts")
-            when = ""
-            try:
-                if ts and getattr(ts, "tzinfo", None):
-                    when = ts.astimezone(timezone.utc).strftime("%H:%M:%S UTC")
-            except Exception:
-                pass
+            ts = _parse_ts(r.get("ts"))
+            when = f"{ts.astimezone(timezone.utc).strftime('%H:%M:%S UTC')}" if ts else ""
             lines.append(f"• **{name}** ({short_id}) — ({x:.1f}, {z:.1f}) {when}")
 
         header = f"**Tracked players — {active_map}**"
