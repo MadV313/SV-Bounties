@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from hashlib import blake2b
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
@@ -11,7 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from utils.settings import load_settings, save_settings
-from utils.storageClient import load_file  # used to peek local json if needed
+from utils.storageClient import load_file  # used for local JSON if present
 
 
 def admin_check():
@@ -21,41 +22,73 @@ def admin_check():
     return app_commands.check(lambda i: pred(i))
 
 
-# ---- helpers ----------------------------------------------------------------
-def _read_http_json(url: str, timeout: float = 8.0) -> dict:
-    """Fetch JSON from HTTP(S) with a small timeout; raises on error."""
+# ----------------------------- helpers ---------------------------------------
+def _read_http_json_and_text(url: str, timeout: float = 8.0) -> tuple[dict, str]:
+    """Fetch JSON from HTTP(S). Returns (parsed_dict, raw_text)."""
     req = Request(url, headers={"User-Agent": "SV-Bounties/links-check"})
     with urlopen(req, timeout=timeout) as resp:  # nosec - admin-provided URL
         charset = resp.headers.get_content_charset() or "utf-8"
-        raw = resp.read()
-    return json.loads(raw.decode(charset, errors="replace"))
+        raw = resp.read().decode(charset, errors="replace")
+    return json.loads(raw), raw
 
 
-def _try_local_json(path: str) -> tuple[bool, str, dict | None]:
+def _try_local_json_and_text(path: str) -> tuple[bool, str, dict | None, str | None]:
     """
-    Attempt to read a local JSON using storageClient first, then filesystem.
-    Returns (ok, detail, data_or_none)
+    Try reading a local JSON via storageClient first, then direct FS.
+    Returns (ok, detail, data_or_none, raw_text_or_none).
     """
     try:
         data = load_file(path)
-        if data is None:
-            if os.path.isfile(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-        if isinstance(data, dict):
-            return True, "ok", data
-        return False, "file found but not a JSON object", None
+    except Exception:
+        data = None
+
+    if isinstance(data, dict):
+        try:
+            raw = json.dumps(data, ensure_ascii=False, indent=2)
+        except Exception:
+            raw = None
+        return True, "ok", data, raw
+
+    # Fallback to filesystem
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read()
+            doc = json.loads(raw)
+            if isinstance(doc, dict):
+                return True, "ok", doc, raw
+            return False, "file found but not a JSON object", None, None
+        return False, "file not found", None, None
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}", None
+        return False, f"{type(e).__name__}: {e}", None, None
 
 
 def _size_hint(doc: dict) -> int:
-    """Crude count of entries; looks for common containers first."""
+    """Rough size based on common containers."""
     for k in ("links", "players", "mapping", "map", "by_id", "by_name"):
         v = doc.get(k)
         if isinstance(v, (list, dict)):
             return len(v)
     return len(doc)
+
+
+def _content_hash(raw_text: str | None) -> str:
+    if not raw_text:
+        return "n/a"
+    h = blake2b(raw_text.encode("utf-8", "ignore"), digest_size=8).hexdigest()
+    return f"#{h}"
+
+
+def _preview_json(doc: dict, raw_text: str | None, max_chars: int = 900) -> str:
+    """Short snippet suitable for an embed field."""
+    try:
+        text = raw_text if raw_text else json.dumps(doc, ensure_ascii=False, indent=2)
+    except Exception:
+        text = json.dumps(doc, ensure_ascii=False)
+
+    if len(text) > max_chars:
+        return text[: max_chars - 1] + "…"
+    return text
 # -----------------------------------------------------------------------------
 
 
@@ -106,10 +139,10 @@ class AdminLinks(commands.Cog):
             ephemeral=True
         )
 
-    # --- NEW: quick status/diagnostics ---------------------------------------
+    # ------------------- diagnostics: show current source & snapshot ----------
     @app_commands.command(
         name="showlinks",
-        description="Show which source will be used for linked_players and verify it loads."
+        description="Show which linked_players source is used, verify it loads, and include a snapshot."
     )
     @admin_check()
     async def showlinks(self, interaction: discord.Interaction):
@@ -121,52 +154,65 @@ class AdminLinks(commands.Cog):
 
         external_is_url = external_path.lower().startswith(("http://", "https://"))
         external_present = bool(external_path)
-
-        # Decide which source would be chosen by the bot
         use_external_first = prefer_external or disable_local
         chosen = "external" if (use_external_first and external_present) else ("local" if not disable_local else "none")
 
-        # Test load
         src_used = "none"
         load_ok = False
+        detail = ""
         size_hint = 0
         top_keys = "—"
-        detail = ""
+        content_hash = "n/a"
+        snapshot = None
 
-        # 1) Try external if it's the chosen or if local is disabled
         data = None
+        raw_text = None
+
+        # Try external if chosen
         if chosen == "external" and external_present:
             src_used = f"external:{external_path}"
             try:
-                data = _read_http_json(external_path) if external_is_url else _try_local_json(external_path)[2]
+                if external_is_url:
+                    data, raw_text = _read_http_json_and_text(external_path)
+                else:
+                    ok, det, doc, raw = _try_local_json_and_text(external_path)
+                    if not ok or not isinstance(doc, dict):
+                        raise ValueError(det or "failed to read local external path")
+                    data, raw_text = doc, raw or json.dumps(doc, ensure_ascii=False)
+
                 if not isinstance(data, dict):
                     raise ValueError("top-level JSON is not an object")
+
                 load_ok = True
                 size_hint = _size_hint(data)
                 top_keys = ", ".join(list(data.keys())[:10]) or "—"
+                content_hash = _content_hash(raw_text)
+                snapshot = _preview_json(data, raw_text)
                 detail = "ok"
-            except (HTTPError, URLError, TimeoutError, ValueError) as e:
+            except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as e:
                 detail = f"external load failed: {e}"
 
-        # 2) Fallback to local if allowed and external wasn’t chosen/failed
+        # Fallback to local if allowed or if external failed
         if not load_ok and not disable_local:
-            # common local paths: project usually stores in settings/linked_players.json
-            local_candidates = []
+            candidates = []
             if external_present and not external_is_url:
-                local_candidates.append(external_path)  # allow explicit local override
-            local_candidates.extend([
+                candidates.append(external_path)
+            candidates.extend([
                 "settings/linked_players.json",
                 "data/linked_players.json",
             ])
-            for path in local_candidates:
-                ok, det, doc = _try_local_json(path)
+            for path in candidates:
+                ok, det, doc, raw = _try_local_json_and_text(path)
                 if ok and isinstance(doc, dict):
                     src_used = f"local:{path}"
                     load_ok = True
                     data = doc
+                    raw_text = raw or json.dumps(doc, ensure_ascii=False)
                     detail = det
                     size_hint = _size_hint(doc)
                     top_keys = ", ".join(list(doc.keys())[:10]) or "—"
+                    content_hash = _content_hash(raw_text)
+                    snapshot = _preview_json(doc, raw_text)
                     break
             if not load_ok and not detail:
                 detail = "no usable local file found"
@@ -181,8 +227,15 @@ class AdminLinks(commands.Cog):
         embed.add_field(name="external_links_path", value=external_path or "—", inline=False)
         embed.add_field(name="Resolved source used", value=src_used, inline=False)
         embed.add_field(name="Load result", value=("✅ ok" if load_ok else f"❌ {detail}"), inline=False)
+
         if load_ok:
             embed.add_field(name="Top-level keys", value=top_keys, inline=False)
+            embed.add_field(name="Content hash", value=content_hash)
+            embed.add_field(
+                name="Snapshot (first ~900 chars)",
+                value=f"```json\n{snapshot}\n```",
+                inline=False
+            )
             embed.set_footer(text=f"size_hint={size_hint} • type={type(data).__name__}")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
