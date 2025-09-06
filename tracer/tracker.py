@@ -3,13 +3,26 @@ import os, time, asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple, Optional
 from collections import defaultdict, deque
 
 from utils.storageClient import load_file, save_file  # your existing helpers
 from tracer.config import INDEX_PATH, TRACKS_DIR, MAX_POINTS_PER_PLAYER
 
 logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------------
+# Small helpers: normalization
+# -----------------------------------------------------------------------------
+def _norm_tag(s: str) -> str:
+    """Canonicalize a gamertag for keys/IDs. Case-insensitive & trimmed."""
+    return (s or "").strip().casefold()
+
+def _norm_map(s: Optional[str]) -> Optional[str]:
+    return (s or "").strip().lower() if s else None
+
+def _pretty_ts(dt: datetime) -> str:
+    return dt.isoformat().replace("+00:00", "Z")
 
 # -----------------------------------------------------------------------------
 # Logging throttling (reduce spam without losing data)
@@ -84,22 +97,50 @@ async def _notify_point(guild_id, gamertag, point):
 
 
 def _sanitize_id(name: str) -> str:
-    return name.lower()
+    # Keep existing style, but feed normalized tag so IDs remain stable
+    return _norm_tag(name)
 
 
-def _resolve_player_id(gamertag: str):
+def _index_set(index: Dict[str, str], display_tag: str, pid: str) -> None:
+    """
+    Store multiple keys for the same player so lookups are flexible:
+    - exact as seen (for backwards compatibility)
+    - lower()
+    - normalized (casefold)
+    """
+    index[display_tag] = pid
+    index[display_tag.lower()] = pid
+    index[_norm_tag(display_tag)] = pid
+
+
+def _resolve_player_id(gamertag: str) -> Tuple[str, str]:
+    """
+    Returns (pid, canonical_display_tag).
+    Ensures the index contains exact/lower/normalized forms for lookups.
+    """
     index = load_file(INDEX_PATH) or {}
-    pid = index.get(gamertag) or index.get(gamertag.lower())
+    t_exact = gamertag
+    t_lower = gamertag.lower()
+    t_norm  = _norm_tag(gamertag)
+
+    pid: Optional[str] = None
+    # Fast paths
+    pid = index.get(t_exact) or index.get(t_lower) or index.get(t_norm)
+
     if not pid:
         pid = f"xbox-{_sanitize_id(gamertag)}"
-        index[gamertag] = pid
-        index[gamertag.lower()] = pid
+        _index_set(index, gamertag, pid)
         save_file(INDEX_PATH, index)
-        # Throttle this INFO so repeated reconnects don’t spam
         if _should_log(f"index:{pid}", THROTTLE_INDEX_SECS):
             logger.info(f"Indexed new player: {gamertag} -> {pid}")
         else:
             logger.debug(f"Indexed new player (throttled): {gamertag} -> {pid}")
+    else:
+        # Backfill normalized key if this is an older index
+        if t_norm not in index:
+            _index_set(index, gamertag, pid)
+            save_file(INDEX_PATH, index)
+
     return pid, gamertag
 
 
@@ -128,9 +169,12 @@ def _flush_pid(pid: str, doc_gamertag_fallback: str | None = None) -> None:
         return
 
     path = _track_path(pid)
-    doc = load_file(path) or {"player_id": pid,
-                              "gamertag": doc_gamertag_fallback or "unknown",
-                              "points": []}
+    doc = load_file(path) or {
+        "player_id": pid,
+        "gamertag": doc_gamertag_fallback or "unknown",
+        "points": [],
+    }
+
     # extend with queued points, but drop the helper field "gamertag" on write
     new_pts = list(q)
     for p in new_pts:
@@ -168,20 +212,24 @@ def append_point(
     ts: datetime | None = None,
     source: str = "",
     guild_id: int | None = None,
+    map_name: str | None = None,  # NEW: optional; safe no-op if unused elsewhere
 ):
     """Append a point to the player's track and notify subscribers (buffered)."""
     pid, canonical = _resolve_player_id(gamertag)
     if not ts:
         ts = datetime.now(timezone.utc)
 
+    map_norm = _norm_map(map_name)
+
     # Build queued point (we keep gamertag only for logging/flush default)
     point = {
-        "ts": ts.isoformat().replace("+00:00", "Z"),
+        "ts": _pretty_ts(ts),
         "x": x,
         "y": y,
         "z": z,
         "source": source,
-        "gamertag": canonical,
+        "map": map_norm,        # harmless if readers ignore it
+        "gamertag": canonical,  # dropped on flush, used for logging
     }
 
     q = _buffers[pid]
@@ -189,7 +237,7 @@ def append_point(
     # De-dupe adjacent identical X/Z (check buffer last if present,
     # else peek last saved point once when buffer is empty)
     if q:
-        if (q[-1]["x"], q[-1]["z"]) == (x, z):
+        if (q[-1].get("x"), q[-1].get("z")) == (x, z):
             logger.debug(f"[{canonical}] Duplicate adjacent point ignored at ({x},{z}) from {source}")
             return
     else:
@@ -207,9 +255,9 @@ def append_point(
 
     # Throttled "append" log (buffered)
     if _should_log(f"append:{pid}", THROTTLE_APPEND_SECS):
-        logger.info(f"Track append [{canonical}] ({x},{z}) (buffered size={len(q)})")
+        logger.info(f"Track append [{canonical}] ({x},{z}) (buffered size={len(q)}) map={map_norm} src={source}")
     else:
-        logger.debug(f"Track append (throttled) [{canonical}] ({x},{z}) buf={len(q)}")
+        logger.debug(f"Track append (throttled) [{canonical}] ({x},{z}) buf={len(q)} map={map_norm}")
 
     # Flush rules: per-player size threshold OR global interval
     if len(q) >= _MAX_BUFFER_POINTS:
@@ -229,36 +277,64 @@ def append_point(
             logger.error(f"Synchronous notify failed for {canonical}: {e}", exc_info=True)
 
 
-def load_track(player_query: str, window_hours: int | None = None, max_points: int | None = None):
+def load_track(
+    player_query: str,
+    window_hours: int | None = None,
+    max_points: int | None = None
+):
+    """
+    Resolve a player's PID (case-insensitive) then return (pid, doc) limited
+    by optional window_hours and/or max_points.
+    """
     from datetime import datetime as _dt
     import time as _time
 
     index = load_file(INDEX_PATH) or {}
-    pid = index.get(player_query) or index.get(player_query.lower())
+    q_exact = player_query
+    q_lower = player_query.lower()
+    q_norm  = _norm_tag(player_query)
+
+    pid = index.get(q_exact) or index.get(q_lower) or index.get(q_norm)
+
     if not pid:
+        # Prefix search across any style (keep legacy behavior)
         for k, v in index.items():
-            if k.lower().startswith(player_query.lower()):
+            if _norm_tag(k).startswith(q_norm):
                 pid = v
                 break
+
     if not pid:
-        logger.debug(f"load_track: no index match for query '{player_query}'")
+        logger.debug(f"[tracker.load] no index match for query '{player_query}' (norm='{q_norm}')")
         return None, None
 
     # Ensure any buffered points for this player are flushed before read
     _flush_pid(pid)
 
-    doc = load_file(_track_path(pid)) or {"player_id": pid, "gamertag": player_query, "points": []}
-    pts = doc["points"]
+    # Load doc
+    path = _track_path(pid)
+    doc = load_file(path) or {"player_id": pid, "gamertag": player_query, "points": []}
+    pts = doc.get("points", [])
 
+    # Apply time window
     if window_hours:
         cutoff = _time.time() - window_hours * 3600
         before = len(pts)
-        pts = [p for p in pts if _dt.fromisoformat(p["ts"].replace("Z", "+00:00")).timestamp() >= cutoff]
-        logger.debug(f"load_track: window={window_hours}h reduced {before}->{len(pts)} for {doc.get('gamertag')}")
+        kept: list = []
+        for p in pts:
+            try:
+                ts = _dt.fromisoformat(p["ts"].replace("Z", "+00:00")).timestamp()
+            except Exception:
+                # keep malformed timestamps just in case
+                ts = 0
+            if ts >= cutoff:
+                kept.append(p)
+        pts = kept
+        logger.debug(f"[tracker.load] window={window_hours}h reduced {before}->{len(pts)} for {doc.get('gamertag')}")
 
+    # Limit max points
     if max_points and len(pts) > max_points:
         pts = pts[-max_points:]
-        logger.debug(f"load_track: limited to last {max_points} points for {doc.get('gamertag')}")
+        logger.debug(f"[tracker.load] limited to last {max_points} points for {doc.get('gamertag')}")
 
-    logger.info(f"Loaded track for {doc.get('gamertag')} with {len(pts)} point(s)")
+    logger.info(f"[tracker.load] Loaded track for {doc.get('gamertag')} with {len(pts)} point(s) (query='{player_query}', norm='{q_norm}')")
     return pid, {**doc, "points": pts}
