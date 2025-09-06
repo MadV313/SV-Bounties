@@ -1,3 +1,4 @@
+import inspect
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -56,6 +57,31 @@ def _izurvive_url(map_name: str, x: float, z: float) -> str:
     slug = _MAP_SLUG.get(map_name.lower(), "livonia")
     return f"https://www.izurvive.com/{slug}/#location={x:.2f};{z:.2f}"
 # -----------------------------------------------------------------------------
+
+
+def _render_track_image(doc: Dict[str, Any], guild_id: int | None):
+    """
+    Call the renderer in a signature-agnostic way.
+    It may be defined as either:
+        render_track_png(doc)
+        render_track_png(doc, guild_id=...)
+        render_track_png(guild_id, doc)
+    We try the sensible permutations.
+    """
+    # First, try keyword guild_id with doc first (most common)
+    try:
+        return render_track_png(doc, guild_id=guild_id)  # type: ignore[arg-type]
+    except TypeError:
+        pass
+
+    # Second, try positional (guild_id, doc)
+    try:
+        return render_track_png(guild_id, doc)  # type: ignore[misc]
+    except TypeError:
+        pass
+
+    # Finally, try plain (doc) with no guild
+    return render_track_png(doc)  # type: ignore[misc]
 
 
 class TraceCog(commands.Cog):
@@ -192,32 +218,16 @@ class TraceCog(commands.Cog):
             points = pts
             count = len(points)
 
+        # Ensure the map is present in doc for renderers that need it
+        doc_map = doc.get("map") or _active_map_name(guild_id)
+        if "map" not in doc:
+            doc = {**doc, "map": doc_map}
+
         # ------------------- render image --------------------
-        # Always include guild_id in the doc as a hint for renderers
-        doc_for_render = {**doc, "guild_id": guild_id}
-
-        def _render_any() -> io.BytesIO:
-            # Try multiple call signatures to match whichever renderer you have deployed
-            last_err: Exception | None = None
-            for f in (
-                lambda: render_track_png(guild_id, doc_for_render),          # (guild_id, doc)
-                lambda: render_track_png(doc_for_render, guild_id),          # (doc, guild_id)
-                lambda: render_track_png(doc_for_render),                    # (doc)
-            ):
-                try:
-                    return f()
-                except TypeError as e:
-                    last_err = e
-                    continue
-            raise last_err if last_err else RuntimeError("No compatible render_track_png signature")
-
         try:
-            img = _render_any()
+            img = _render_track_image(doc, guild_id)
         except Exception as e:
-            _log(guild_id, "render_track_png failed", {
-                "error": repr(e),
-                "doc_keys": list(doc_for_render.keys())
-            })
+            _log(guild_id, "render_track_png failed", {"error": repr(e), "doc_keys": list(doc.keys())})
             return await interaction.followup.send(
                 "❌ Failed to render map image. See logs for details.",
                 ephemeral=True
@@ -234,8 +244,7 @@ class TraceCog(commands.Cog):
         except Exception:
             lx, lz = 0.0, 0.0
 
-        map_name = _active_map_name(guild_id)
-        izu = _izurvive_url(map_name, lx, lz)
+        izu = _izurvive_url(doc_map, lx, lz)
 
         when = ""
         try:
