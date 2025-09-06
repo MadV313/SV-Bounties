@@ -130,6 +130,13 @@ def _try_local_json_and_text(path: str) -> tuple[bool, str, dict | None, str | N
             raw = None
         return True, "ok", data, raw
 
+    if isinstance(data, str):
+        try:
+            doc = json.loads(data)
+            return True, "ok", doc, data
+        except Exception:
+            pass
+
     # Fallback to filesystem
     try:
         if os.path.isfile(path):
@@ -261,9 +268,14 @@ class AdminLinks(commands.Cog):
         if chosen == "external" and external_present:
             src_used = f"external:{external_path}"
             try:
-                # Prefer our storageClient loader; if that returns non-dict for URL, fallback to HTTP fetch
+                # Prefer our storageClient loader; it may return dict or JSON string
                 data = load_file(external_path)
-                if not isinstance(data, dict):
+                if isinstance(data, dict):
+                    raw_text = json.dumps(data, ensure_ascii=False, indent=2)
+                elif isinstance(data, str):
+                    data = json.loads(data)
+                    raw_text = json.dumps(data, ensure_ascii=False, indent=2)
+                else:
                     if external_is_url:
                         data, raw_text = _read_http_json_and_text(external_path)
                     else:
@@ -271,8 +283,6 @@ class AdminLinks(commands.Cog):
                         if not ok or not isinstance(doc, dict):
                             raise ValueError(det or "failed to read local external path")
                         data, raw_text = doc, raw or json.dumps(doc, ensure_ascii=False)
-                else:
-                    raw_text = json.dumps(data, ensure_ascii=False, indent=2)
 
                 if not isinstance(data, dict):
                     raise ValueError("top-level JSON is not an object")
@@ -391,15 +401,26 @@ class AdminLinks(commands.Cog):
             await interaction.followup.send("❌ Could not resolve a path to normalize.", ephemeral=True)
             return
 
-        # Load current content
-        # Use storageClient first so it works for remote persistent paths as well.
-        raw_obj = load_file(chosen_path, default=None)
+        # Load current content (storageClient first; may return dict or JSON string)
+        doc = None
         raw_text = None
+        try:
+            raw_obj = load_file(chosen_path)
+        except Exception:
+            raw_obj = None
+
         if isinstance(raw_obj, dict):
-            raw_text = json.dumps(raw_obj, ensure_ascii=False, indent=2)
             doc = raw_obj
-        else:
-            # try local/http helpers
+            raw_text = json.dumps(doc, ensure_ascii=False, indent=2)
+        elif isinstance(raw_obj, str):
+            try:
+                doc = json.loads(raw_obj)
+                raw_text = raw_obj
+            except Exception:
+                doc = None
+
+        # try local/http helpers if needed
+        if not isinstance(doc, dict):
             if chosen_path.lower().startswith(("http://", "https://")):
                 doc, raw_text = _read_http_json_and_text(chosen_path)
             else:
