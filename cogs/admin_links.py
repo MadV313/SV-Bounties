@@ -181,7 +181,7 @@ def _preview_json(doc: dict, raw_text: str | None, max_chars: int = 900) -> str:
 
 class AdminLinks(commands.Cog):
     def __init__(self, bot):
-        self.bot = bot  # ← fixed: removed stray ')'
+        self.bot = bot  # fixed
 
     # ---- Settings controls ---------------------------------------------------
 
@@ -197,6 +197,20 @@ class AdminLinks(commands.Cog):
         await interaction.response.send_message(
             f"✅ External links source {'set' if path else 'cleared'}."
             + (f"\n`{path}`" if path else ""),
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="setexternallinkswriter",
+        description="Set a WRITABLE path for linked_players.json (used by /links normalize to write back)"
+    )
+    @admin_check()
+    @app_commands.describe(path="Writable path (e.g. /app/data/linked_players.json or sftp://user:pass@host/path/linked_players.json)")
+    async def setexternallinkswriter(self, interaction: discord.Interaction, path: str):
+        gid = interaction.guild_id
+        save_settings(gid, {"external_links_write_path": path})
+        await interaction.response.send_message(
+            f"✅ External links *writer* path set.\n`{path}`",
             ephemeral=True
         )
 
@@ -241,6 +255,7 @@ class AdminLinks(commands.Cog):
         prefer_external = bool(st.get("prefer_external_links", True))
         disable_local = bool(st.get("disable_local_link", False))
         external_path = (st.get("external_links_path") or "").strip()
+        external_write = (st.get("external_links_write_path") or "").strip()
 
         external_is_url = external_path.lower().startswith(("http://", "https://"))
         external_present = bool(external_path)
@@ -265,7 +280,7 @@ class AdminLinks(commands.Cog):
         if chosen == "external" and external_present:
             src_used = f"external:{external_path}"
             try:
-                # Prefer our storageClient loader; it may return dict or JSON string
+                # Prefer storageClient; may return dict or JSON string
                 data = load_file(external_path)
                 if isinstance(data, dict):
                     raw_text = json.dumps(data, ensure_ascii=False, indent=2)
@@ -343,6 +358,8 @@ class AdminLinks(commands.Cog):
         embed.add_field(name="prefer_external_links", value=str(prefer_external))
         embed.add_field(name="disable_local_link", value=str(disable_local))
         embed.add_field(name="external_links_path", value=external_path or "—", inline=False)
+        if external_write:
+            embed.add_field(name="external_links_write_path", value=external_write, inline=False)
         embed.add_field(name="Resolved source used", value=src_used, inline=False)
         embed.add_field(name="Load result", value=("✅ ok" if load_ok else f"❌ {detail}"), inline=False)
 
@@ -375,57 +392,56 @@ class AdminLinks(commands.Cog):
         st = load_settings(gid) or {}
         prefer_external = bool(st.get("prefer_external_links", True))
         disable_local = bool(st.get("disable_local_link", False))
-        external_path = (st.get("external_links_path") or "").strip()
+        read_path = (st.get("external_links_path") or "").strip()
+        write_path = (st.get("external_links_write_path") or "").strip()
 
-        # Choose path roughly the same way showlinks selects a source
-        external_present = bool(external_path)
+        # Choose READ target same as showlinks
+        external_present = bool(read_path)
         use_external_first = prefer_external or disable_local
 
-        chosen_path = None
+        chosen_read = None
         if use_external_first and external_present:
-            chosen_path = external_path
+            chosen_read = read_path
         elif not disable_local:
             # fallbacks
             for p in ("settings/linked_players.json", "data/linked_players.json"):
                 if os.path.isfile(p):
-                    chosen_path = p
+                    chosen_read = p
                     break
-            if not chosen_path:
-                # Still normalize whatever path might exist locally even if not a real file yet
-                chosen_path = "data/linked_players.json"
+            if not chosen_read:
+                chosen_read = "data/linked_players.json"
 
-        if not chosen_path:
+        if not chosen_read:
             await interaction.followup.send("❌ Could not resolve a path to normalize.", ephemeral=True)
             return
 
-        # Load current content (storageClient first; may return dict or JSON string)
-        doc = None
-        raw_text = None
+        is_read_url = chosen_read.lower().startswith(("http://", "https://"))
+        # Resolve WRITE target
+        if not write_path:
+            if is_read_url:
+                await interaction.followup.send(
+                    "❌ The read path is an HTTP URL (likely read-only). "
+                    "Set a writable path with **/setexternallinkswriter**.",
+                    ephemeral=True
+                )
+                return
+            write_path = chosen_read  # local path is writable
+
+        # Load from READ path
+        def _load_dict_from(path: str):
+            if path.lower().startswith(("http://", "https://")):
+                doc, raw = _read_http_json_and_text(path)
+                return doc, raw
+            ok, det, doc, raw = _try_local_json_and_text(path)
+            if not ok or not isinstance(doc, dict):
+                raise ValueError(det or "failed to read JSON object")
+            return doc, raw or json.dumps(doc, ensure_ascii=False)
+
         try:
-            raw_obj = load_file(chosen_path)
-        except Exception:
-            raw_obj = None
-
-        if isinstance(raw_obj, dict):
-            doc = raw_obj
-            raw_text = json.dumps(doc, ensure_ascii=False, indent=2)
-        elif isinstance(raw_obj, str):
-            try:
-                doc = json.loads(raw_obj)
-                raw_text = raw_obj
-            except Exception:
-                doc = None
-
-        # try local/http helpers if needed
-        if not isinstance(doc, dict):
-            if chosen_path.lower().startswith(("http://", "https://")):
-                doc, raw_text = _read_http_json_and_text(chosen_path)
-            else:
-                ok, det, doc0, raw0 = _try_local_json_and_text(chosen_path)
-                if not ok or not isinstance(doc0, dict):
-                    await interaction.followup.send(f"❌ Load failed: {det}", ephemeral=True)
-                    return
-                doc, raw_text = doc0, raw0 or json.dumps(doc0, ensure_ascii=False)
+            doc, raw_text = _load_dict_from(chosen_read)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Load failed from read path: {e}", ephemeral=True)
+            return
 
         # Unwrap
         fixed, changed, reason = unwrap_links_json(doc)
@@ -441,14 +457,32 @@ class AdminLinks(commands.Cog):
         before_n = _count(doc)
         after_n = _count(fixed)
 
+        # Write if changed
+        wrote = False
+        write_err = None
         if changed:
-            # Save back as plain JSON (no wrapper)
-            save_file(chosen_path, fixed)
-            title = "✅ Normalized linked_players.json"
-            color = 0x2ecc71
-        else:
-            title = "ℹ️ Nothing to change"
-            color = 0x3498db
+            try:
+                save_file(write_path, fixed)  # plain JSON, no wrapper
+                wrote = True
+            except Exception as e:
+                write_err = f"{type(e).__name__}: {e}"
+
+        # Verify by re-reading READ path (with cache-buster if URL)
+        verified = False
+        verify_note = ""
+        if changed and wrote:
+            try:
+                verify_path = chosen_read
+                if is_read_url:
+                    sep = '&' if '?' in verify_path else '?'
+                    verify_path = f"{verify_path}{sep}t={int(discord.utils.utcnow().timestamp())}"
+                ver_doc, _ = _load_dict_from(verify_path)
+                ver_plain, _, _ = unwrap_links_json(ver_doc)
+                verified = (ver_plain == fixed)
+                if not verified:
+                    verify_note = "remote content differs (cache or different read/write target)"
+            except Exception as e:
+                verify_note = f"verify failed: {type(e).__name__}: {e}"
 
         # Preview keys
         keys_preview = ""
@@ -458,12 +492,27 @@ class AdminLinks(commands.Cog):
         elif isinstance(fixed, list):
             keys_preview = f"{min(5, len(fixed))} items previewed"
 
+        if changed and wrote:
+            title = "✅ Normalized & wrote linked_players.json"
+            color = 0x2ecc71
+        elif changed and not wrote:
+            title = "❌ Normalized but failed to write"
+            color = 0xe74c3c
+        else:
+            title = "ℹ️ Nothing to change"
+            color = 0x3498db
+
         emb = discord.Embed(title=title, color=color)
-        emb.add_field(name="Resolved path", value=f"```{chosen_path}```", inline=False)
+        emb.add_field(name="Read path", value=f"```{chosen_read}```", inline=False)
+        emb.add_field(name="Write path", value=f"```{write_path}```", inline=False)
         emb.add_field(name="Result", value=reason, inline=False)
         emb.add_field(name="Counts", value=f"Before: **{before_n}** · After: **{after_n}**", inline=False)
+        if changed:
+            emb.add_field(name="Write", value=("ok" if wrote else f"error: {write_err}"), inline=False)
         if keys_preview:
             emb.add_field(name="Preview", value=f"```{keys_preview}```", inline=False)
+        if changed and wrote:
+            emb.add_field(name="Verify (re-read read path)", value=("✅ match" if verified else f"⚠️ {verify_note}"), inline=False)
 
         await interaction.followup.send(embed=emb, ephemeral=True)
 
@@ -472,7 +521,52 @@ class AdminLinks(commands.Cog):
     async def links_normalize(self, interaction: discord.Interaction):
         await self._normalize_impl(interaction)
 
-    # Alias for folks who prefer a top-level command
+    # Optional debug helpers ---------------------------------------------------
+
+    @links.command(name="raw", description="Show first ~900 chars of RAW linked_players.json (no decoding)")
+    @admin_check()
+    async def links_raw(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        st = load_settings(interaction.guild_id) or {}
+        path = (st.get("external_links_path") or "").strip()
+        if not path:
+            await interaction.followup.send("No external_links_path is set.", ephemeral=True)
+            return
+        if path.lower().startswith(("http://", "https://")):
+            _, raw_text = _read_http_json_and_text(path)
+        else:
+            ok, det, doc, raw = _try_local_json_and_text(path)
+            if not ok:
+                await interaction.followup.send(f"Load failed: {det}", ephemeral=True)
+                return
+            raw_text = raw or json.dumps(doc, ensure_ascii=False)
+        snippet = raw_text[:900] + ("…" if len(raw_text) > 900 else "")
+        h = _content_hash(raw_text)
+        await interaction.followup.send(f"**Raw content hash** {h}\n```json\n{snippet}\n```", ephemeral=True)
+
+    @links.command(name="pretty", description="Pretty-print the decoded links (unwraps if needed)")
+    @admin_check()
+    async def links_pretty(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        st = load_settings(interaction.guild_id) or {}
+        path = (st.get("external_links_path") or "").strip()
+        if not path:
+            await interaction.followup.send("No external_links_path is set.", ephemeral=True)
+            return
+        if path.lower().startswith(("http://", "https://")):
+            doc, _ = _read_http_json_and_text(path)
+        else:
+            ok, det, doc, _ = _try_local_json_and_text(path)
+            if not ok or not isinstance(doc, dict):
+                await interaction.followup.send(f"Load failed: {det}", ephemeral=True)
+                return
+        plain, _, _ = unwrap_links_json(doc)
+        pretty = json.dumps(plain, ensure_ascii=False, indent=2)
+        snippet = pretty[:1900] + ("…" if len(pretty) > 1900 else "")
+        await interaction.followup.send(f"```json\n{snippet}\n```", ephemeral=True)
+
+    # Alias for folks who prefer a top-level command ---------------------------
+
     @app_commands.command(name="linksnormalize", description="(Alias) Normalize linked_players.json to plain JSON")
     @admin_check()
     async def linksnormalize(self, interaction: discord.Interaction):
