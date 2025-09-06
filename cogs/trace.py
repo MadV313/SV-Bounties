@@ -42,6 +42,24 @@ def _parse_dt(s: str) -> datetime | None:
     return None
 
 
+# ---- iZurvive helper ---------------------------------------------------------
+_MAP_SLUG = {
+    "chernarus+": "chernarus",
+    "chernarus": "chernarus",
+    "livonia": "livonia",
+    "namalsk": "namalsk",
+}
+def _active_map_name(guild_id: int | None) -> str:
+    st = load_settings(guild_id) if guild_id else {}
+    return (st.get("active_map") or "Livonia").strip()
+
+def _izurvive_url(map_name: str, x: float, z: float) -> str:
+    slug = _MAP_SLUG.get(map_name.lower(), "livonia")
+    xi, zi = int(round(x)), int(round(z))
+    return f"https://www.izurvive.com/{slug}/#location={xi},{zi}"
+# -----------------------------------------------------------------------------
+
+
 class TraceCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -151,7 +169,7 @@ class TraceCog(commands.Cog):
                 ephemeral=True
             )
 
-        # --------------- filter by explicit range ------------
+        # --------------- filter by explicit range ------------ (keeps your behavior)
         if dt_start:
             pts: List[Dict[str, Any]] = []
             dropped = 0
@@ -179,7 +197,11 @@ class TraceCog(commands.Cog):
 
         # ------------------- render image --------------------
         try:
-            img = render_track_png(doc)
+            # Newer renderer expects guild_id; keep backward compatibility.
+            try:
+                img = render_track_png(doc, guild_id=guild_id)  # newer signature
+            except TypeError:
+                img = render_track_png(doc)  # older signature
         except Exception as e:
             _log(guild_id, "render_track_png failed", {"error": repr(e), "doc_keys": list(doc.keys())})
             return await interaction.followup.send(
@@ -190,7 +212,29 @@ class TraceCog(commands.Cog):
         _log(guild_id, "render complete", {"points_rendered": count})
 
         file = discord.File(img, filename=f"trace_{doc.get('gamertag','player')}.png")
-        caption = f"**{doc.get('gamertag','?')}** — {count} points"
+
+        # Build caption with clickable iZurvive link for last point
+        last = points[-1]
+        try:
+            lx, lz = float(last.get("x", 0.0)), float(last.get("z", 0.0))
+        except Exception:
+            lx, lz = 0.0, 0.0
+
+        map_name = _active_map_name(guild_id)
+        izu = _izurvive_url(map_name, lx, lz)
+
+        when = ""
+        try:
+            ts_raw = last.get("ts")
+            if ts_raw:
+                when = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")).astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+        except Exception:
+            pass
+
+        caption = (
+            f"**{doc.get('gamertag','?')}** — {count} points\n"
+            f"Last: [({lx:.1f}, {lz:.1f})]({izu}) {when}"
+        )
         if dt_start:
             caption += f"\nRange: `{dt_start.isoformat()}` to `{dt_end.isoformat()}`"
         else:
