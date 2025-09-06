@@ -63,10 +63,10 @@ MAP_SLUG = {  # for iZurvive URL building
 
 # Where to find background map art (optional)
 MAP_PATHS = {
-    "Chernarus+": "assets/maps/chernarus.png",
-    "Chernarus": "assets/maps/chernarus.png",
-    "Livonia": "assets/maps/livonia.png",
-    "Namalsk": "assets/maps/namalsk.png",
+    "Chernarus+": "assets/maps/chernarus_base.PNG",
+    "Chernarus": "assets/maps/chernarus_base.PNG",
+    "Livonia": "assets/maps/livonia_base.PNG",
+    "Namalsk": "assets/maps/namalsk_base.PNG",
 }
 
 
@@ -144,7 +144,7 @@ def _izurvive_url(map_name: str, x: float, z: float) -> str:
     slug = MAP_SLUG.get(map_name, "livonia")
     # iZurvive understands integer meters just fine
     xi, zi = int(round(x)), int(round(z))
-    return f"https://www.izurvive.com/{slug}/#location={xi},{zi}"
+    return f"https://www.izurvive.com/livonia/#location={x:.2f};{z:.2f}"
 
 
 class ShowTracked(commands.Cog):
