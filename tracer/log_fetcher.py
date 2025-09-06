@@ -88,19 +88,41 @@ def _pick_latest_by_name(names: list[str]) -> Optional[str]:
     return adms[-1]
 
 def _ftp_read_range_in_cwd(ftp: FTP, filename: str, start: int) -> bytes:
-    """Read bytes of `filename` in CURRENT dir from offset `start` to EOF."""
+    """
+    Read bytes of `filename` in CURRENT dir from offset `start` to EOF.
+    Ensures binary mode (TYPE I) so REST works on Nitrado.
+    Retries once if the server rejects REST due to ASCII mode.
+    """
     bio = io.BytesIO()
+
+    # Force binary (Nitrado requires TYPE I for REST)
+    try:
+        ftp.voidcmd("TYPE I")
+    except Exception:
+        pass
+
     if start > 0:
-        # REST requires binary mode on some servers; we set TYPE I after login.
-        ftp.sendcmd(f"REST {start}")
+        try:
+            ftp.sendcmd(f"REST {start}")
+        except error_perm as e:
+            # Typical message: "501 REST: Resuming transfers not allowed in ASCII mode"
+            msg = str(e)
+            if "501" in msg or "ascii" in msg.lower():
+                try:
+                    ftp.voidcmd("TYPE I")
+                    ftp.sendcmd(f"REST {start}")
+                except Exception:
+                    # Give up and fall back to full read (caller handles offset update)
+                    return b""
+            else:
+                raise
+
     ftp.retrbinary(f"RETR {filename}", bio.write)
     return bio.getvalue()
 
 def _ftp_size(ftp: FTP, filename: str) -> Optional[int]:
     try:
-        # SIZE works reliably in binary; TYPE I already set after login.
-        resp = ftp.sendcmd(f"SIZE {filename}")
-        # Expected like: "213 12345"
+        resp = ftp.sendcmd(f"SIZE {filename}")  # "213 12345"
         parts = resp.split()
         if len(parts) >= 2 and parts[0] == "213":
             return int(parts[1])
@@ -145,7 +167,7 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
     while not stop_event.is_set():
         try:
             ftp = await _to_thread(FTP, cfg["host"], timeout=25)
-            # Passive + binary mode improves compatibility with REST/SIZE
+            # Login, passive, and **binary** mode for REST/SIZE
             await _to_thread(ftp.login, cfg["username"], cfg["password"])
             try:
                 await _to_thread(ftp.set_pasv, True)
