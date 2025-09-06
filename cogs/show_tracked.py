@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple
 
@@ -10,7 +11,6 @@ from discord.ext import commands
 
 from utils.settings import load_settings
 from PIL import Image, ImageDraw, ImageFont  # Pillow
-
 
 # Optional import from tracker (safe fallback if not present during reloads)
 try:
@@ -46,7 +46,6 @@ def _log(gid: int, msg: str, extra: Dict[str, Any] | None = None):
 
 
 # ----------------------- map helpers -----------------------
-# World sizes (meters) for common DayZ maps (x/z range).
 WORLD_SIZE = {
     "Chernarus+": 15360,
     "Chernarus": 15360,
@@ -54,14 +53,15 @@ WORLD_SIZE = {
     "Namalsk": 20480,
 }
 
-MAP_SLUG = {  # for iZurvive URL building
-    "Chernarus+": "chernarus",
-    "Chernarus": "chernarus",
+# iZurvive slugs
+MAP_SLUG = {
+    "Chernarus+": "chernarusplusedition",
+    "Chernarus": "chernarusplusedition",
     "Livonia": "livonia",
     "Namalsk": "namalsk",
 }
 
-# Where to find background map art (optional)
+# Preferred background paths
 MAP_PATHS = {
     "Chernarus+": "assets/maps/chernarus_base.PNG",
     "Chernarus": "assets/maps/chernarus_base.PNG",
@@ -79,24 +79,40 @@ def _world_size_for(map_name: str) -> int:
     return WORLD_SIZE.get(map_name, 15360)
 
 
+def _candidate_paths(map_name: str) -> List[str]:
+    # Try configured path plus a few sensible fallbacks
+    slug = MAP_SLUG.get(map_name, "livonia")
+    configured = MAP_PATHS.get(map_name)
+    base = "assets/maps"
+    names = [
+        configured,
+        f"{base}/{slug}.png",
+        f"{base}/{slug}_base.png",
+        f"{base}/{map_name}.png",
+        f"{base}/{map_name}.PNG",
+        f"{base}/{map_name.lower()}.png",
+        f"{base}/{map_name.lower()}_base.png",
+    ]
+    return [p for p in names if p]
+
+
 def _load_map_image(map_name: str, size_px: int = 1400) -> Image.Image:
     """
     Try loading a map background; fall back to blank grid if missing.
     Returns an RGBA image (square) so we can draw anti-aliased labels.
     """
-    path = MAP_PATHS.get(map_name)
-    if path:
+    for path in _candidate_paths(map_name):
         try:
-            img = Image.open(path).convert("RGBA")
-            # fit to square with letterbox/pad if needed
-            if img.width != img.height:
-                side = max(img.width, img.height)
-                canvas = Image.new("RGBA", (side, side), (18, 18, 22, 255))
-                ox = (side - img.width) // 2
-                oy = (side - img.height) // 2
-                canvas.paste(img, (ox, oy))
-                img = canvas
-            return img.resize((size_px, size_px), Image.BICUBIC)
+            if os.path.exists(path):
+                img = Image.open(path).convert("RGBA")
+                if img.width != img.height:
+                    side = max(img.width, img.height)
+                    canvas = Image.new("RGBA", (side, side), (18, 18, 22, 255))
+                    ox = (side - img.width) // 2
+                    oy = (side - img.height) // 2
+                    canvas.paste(img, (ox, oy))
+                    img = canvas
+                return img.resize((size_px, size_px), Image.BICUBIC)
         except Exception:
             pass
 
@@ -104,26 +120,20 @@ def _load_map_image(map_name: str, size_px: int = 1400) -> Image.Image:
     side = size_px
     img = Image.new("RGBA", (side, side), (18, 18, 22, 255))
     drw = ImageDraw.Draw(img)
-    # draw a simple 10x10 grid
     step = side // 10
     for k in range(0, side + 1, step):
         drw.line([(k, 0), (k, side)], fill=(40, 40, 46, 255), width=1)
         drw.line([(0, k), (side, k)], fill=(40, 40, 46, 255), width=1)
-    title = f"{map_name} (fallback)"
     try:
-        font = ImageFont.truetype("arial.ttf", 24)
+        title_font = ImageFont.truetype("arial.ttf", 24)
     except Exception:
-        font = ImageFont.load_default()
-    drw.text((12, 12), title, fill=(200, 200, 200, 255), font=font)
+        title_font = ImageFont.load_default()
+    drw.text((12, 12), f"{map_name} (fallback)", fill=(200, 200, 200, 255), font=title_font)
     return img
 
 
 def _world_to_image(x: float, z: float, world_size: int, img_size: int) -> Tuple[int, int]:
-    """
-    Convert DayZ world coords (x, z) -> image pixels.
-    (0,0) world is bottom-left; image (0,0) is top-left,
-    so we flip the vertical axis.
-    """
+    """Convert DayZ world coords (x, z) -> image pixels (top-left origin)."""
     try:
         px = max(0, min(img_size - 1, int(round((x / world_size) * img_size))))
         py = max(0, min(img_size - 1, int(round(((world_size - z) / world_size) * img_size))))
@@ -142,9 +152,7 @@ def _draw_pin(drw: ImageDraw.ImageDraw, p: Tuple[int, int]):
 
 def _izurvive_url(map_name: str, x: float, z: float) -> str:
     slug = MAP_SLUG.get(map_name, "livonia")
-    # iZurvive understands integer meters just fine
-    xi, zi = int(round(x)), int(round(z))
-    return f"https://www.izurvive.com/livonia/#location={x:.2f};{z:.2f}"
+    return f"https://www.izurvive.com/{slug}/#location={x:.2f};{z:.2f}"
 
 
 class ShowTracked(commands.Cog):
@@ -167,7 +175,6 @@ class ShowTracked(commands.Cog):
             "admin_channel_id": admin_channel_id,
         })
 
-        # Require usage in the configured admin channel (if set)
         if admin_channel_id and interaction.channel_id != int(admin_channel_id):
             _log(gid, "wrong channel; refusing")
             return await interaction.response.send_message(
@@ -253,7 +260,6 @@ class ShowTracked(commands.Cog):
             name = str(r.get("name") or r.get("short_id") or "?")
             px, py = _world_to_image(x, z, world_size, W)
             _draw_pin(drw, (px, py))
-            # crisp text with stroke (outline) so it reads over the map
             drw.text(
                 (px + 12, py - 6),
                 name,
@@ -284,8 +290,8 @@ class ShowTracked(commands.Cog):
             except Exception:
                 pass
             url = _izurvive_url(active_map, x, z)
-            # clickable blue link on the coords
-            lines.append(f"• **{name}** ({short_id}) — [({x:.1f}, {z:.1f})]({url}) {when}")
+            coords_md = f"[`({x:.1f}, {z:.1f})`]({url})"
+            lines.append(f"• **{name}** ({short_id}) — {coords_md} {when}")
 
         header = f"**Tracked players — {active_map}**"
         if relaxed_used:
