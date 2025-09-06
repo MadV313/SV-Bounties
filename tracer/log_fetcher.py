@@ -10,7 +10,7 @@ from ftplib import FTP, error_perm
 from datetime import datetime, timezone
 from typing import Callable, Awaitable, Optional, List, Tuple, Dict, Any
 
-import requests  # <-- used only if Nitrado API keys are provided
+import requests  # used only if Nitrado API keys are provided
 
 from utils.ftp_config import get_ftp_config
 from tracer.adm_state import get_guild_state, set_guild_state
@@ -26,14 +26,11 @@ def _when() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 # -----------------------------------------------------------------------------
 
+
 # --- HASH DE-DUPE (Radar-style) ---------------------------------------------
-# Rolling set of recent line fingerprints so “bursty” additions are never missed
-# even if FTP size/offset behavior glitches.
-MAX_SEEN_HASHES = 4000  # ~the last few thousand lines is plenty
+MAX_SEEN_HASHES = 4000  # last few thousand lines
 
 def _line_fingerprint(s: str) -> int:
-    # Stable, fast 64-bit fingerprint; ignore trailing whitespace to be robust
-    # to \r\n vs \n and minor EOL differences.
     h = blake2b(s.rstrip().encode("utf-8", "ignore"), digest_size=8)
     return int.from_bytes(h.digest(), "big")
 # -----------------------------------------------------------------------------
@@ -55,17 +52,19 @@ def _parse_name_ts(name: str) -> Optional[datetime]:
     except Exception:
         return None
 
+
 def _ftp_mlsd_lines(ftp: FTP) -> list[str]:
     lines: list[str] = []
     ftp.retrlines("MLSD", lines.append)
     return lines
+
 
 def _ftp_latest_adm_with_mlsd(ftp: FTP, directory: str) -> Optional[str]:
     """Use MLSD to find newest .adm by 'modify' fact. Leaves CWD at directory."""
     try:
         ftp.cwd(directory)
         lines = _ftp_mlsd_lines(ftp)
-        best_name, best_modify = None, None  # type: Optional[str], Optional[str]
+        best_name, best_modify = None, None
         for ln in lines:
             if " " not in ln:
                 continue
@@ -92,11 +91,13 @@ def _ftp_latest_adm_with_mlsd(ftp: FTP, directory: str) -> Optional[str]:
         logger.debug(f"MLSD parse error in {directory}: {e}")
         return None
 
+
 def _ftp_list_names(ftp: FTP, directory: str) -> list[str]:
     ftp.cwd(directory)
     names: list[str] = []
     ftp.retrlines("NLST", names.append)
     return names
+
 
 # --- LIST fallback -----------------------------------------------------------
 def _ftp_list_via_LIST(ftp: FTP, directory: str) -> list[str]:
@@ -118,6 +119,7 @@ def _ftp_list_via_LIST(ftp: FTP, directory: str) -> list[str]:
     return names
 # ---------------------------------------------------------------------------
 
+
 def _pick_latest_by_name(names: list[str]) -> Optional[str]:
     adms = [n for n in names if n.lower().endswith(".adm")]
     if not adms:
@@ -125,16 +127,18 @@ def _pick_latest_by_name(names: list[str]) -> Optional[str]:
     parsed = [(n, _parse_name_ts(n)) for n in adms]
     parsed = [(n, ts) for n, ts in parsed if ts is not None]
     if parsed:
-        parsed.sort(key=lambda x: x[1])  # ascending by timestamp
+        parsed.sort(key=lambda x: x[1])  # ascending
         return parsed[-1][0]
     adms.sort()
     return adms[-1]
+
 
 def _ensure_binary(ftp: FTP) -> None:
     try:
         ftp.voidcmd("TYPE I")
     except Exception:
         pass
+
 
 def _ftp_read_range_in_cwd(ftp: FTP, filename: str, start: int) -> bytes:
     """
@@ -149,14 +153,12 @@ def _ftp_read_range_in_cwd(ftp: FTP, filename: str, start: int) -> bytes:
         try:
             ftp.sendcmd(f"REST {start}")
         except error_perm as e:
-            # Typical message: "501 REST: Resuming transfers not allowed in ASCII mode"
-            msg = str(e)
+            msg = str(e)  # often "501 REST: Resuming transfers not allowed in ASCII mode"
             if "501" in msg or "ascii" in msg.lower():
                 try:
                     _ensure_binary(ftp)
                     ftp.sendcmd(f"REST {start}")
                 except Exception:
-                    # Signal caller; they may try bounded full-file fallback
                     return b""
             else:
                 raise
@@ -164,12 +166,13 @@ def _ftp_read_range_in_cwd(ftp: FTP, filename: str, start: int) -> bytes:
     ftp.retrbinary(f"RETR {filename}", bio.write)
     return bio.getvalue()
 
+
 def _ftp_read_all_in_cwd(ftp: FTP, filename: str) -> bytes:
-    """Fetch entire file (binary). Use sparingly as fallback."""
     bio = io.BytesIO()
     _ensure_binary(ftp)
     ftp.retrbinary(f"RETR {filename}", bio.write)
     return bio.getvalue()
+
 
 def _ftp_size(ftp: FTP, filename: str) -> Optional[int]:
     try:
@@ -180,6 +183,7 @@ def _ftp_size(ftp: FTP, filename: str) -> Optional[int]:
     except Exception:
         pass
     return None
+
 
 def _ftp_mdtm(ftp: FTP, filename: str) -> Optional[str]:
     try:
@@ -237,7 +241,7 @@ def _list_adm_files(ftp: FTP) -> List[Tuple[str, int, Optional[datetime]]]:
     except Exception:
         pass
 
-    # LIST pass (last resort for hidden newest)
+    # LIST pass
     try:
         raw: List[str] = []
         ftp.retrlines("LIST", raw.append)
@@ -261,9 +265,6 @@ def _list_adm_files(ftp: FTP) -> List[Tuple[str, int, Optional[datetime]]]:
 
 
 def _choose_latest_adm(files: List[Tuple[str, int, Optional[datetime]]]) -> Tuple[str, int, Optional[datetime]]:
-    """
-    Choose the newest file by mtime (or filename timestamp), returning (name, size, mtime).
-    """
     if not files:
         raise ValueError("No ADM files")
     def key(row):
@@ -274,62 +275,59 @@ def _choose_latest_adm(files: List[Tuple[str, int, Optional[datetime]]]) -> Tupl
     return name, size, mtime
 # ===================================================================
 
+
 # =================== Nitrado API discovery (optional) ===================
-def _nitrado_api_get_latest(cfg: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+def _nitrado_api_get_latest(cfg: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], str]:
     """
-    Returns (filename, download_url) for the newest ADM via Nitrado HTTP API.
+    Returns (filename, download_url, diag_reason) for the newest ADM via Nitrado HTTP API.
     Uses either cfg[...] or environment variables:
       - nitrado_api_token / NITRADO_API_TOKEN
       - nitrado_service_id / NITRADO_SERVICE_ID
       - nitrado_log_folder_prefix / NITRADO_LOG_DIR
-    If anything is missing, returns (None, None).
+    If anything is missing, returns (None, None, reason).
     """
-    token = (cfg.get("nitrado_api_token")
-             or os.getenv("NITRADO_API_TOKEN"))
-    service_id = (cfg.get("nitrado_service_id")
-                  or os.getenv("NITRADO_SERVICE_ID"))
-    dir_path = (cfg.get("nitrado_log_folder_prefix")
-                or os.getenv("NITRADO_LOG_DIR"))
+    token = (cfg.get("nitrado_api_token") or os.getenv("NITRADO_API_TOKEN"))
+    service_id = (cfg.get("nitrado_service_id") or os.getenv("NITRADO_SERVICE_ID"))
+    dir_path = (cfg.get("nitrado_log_folder_prefix") or os.getenv("NITRADO_LOG_DIR"))
 
     if not token or not service_id or not dir_path:
-        return (None, None)
+        missing = []
+        if not token: missing.append("token")
+        if not service_id: missing.append("service_id")
+        if not dir_path: missing.append("dir")
+        return (None, None, f"disabled (missing {', '.join(missing)})")
 
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     try:
         list_url = f"https://api.nitrado.net/services/{service_id}/gameservers/file_server/list"
         r = requests.get(list_url, headers=headers, params={"dir": dir_path}, timeout=10)
         if r.status_code != 200:
-            logger.info(f"[NitradoAPI] list failed HTTP {r.status_code}")
-            return (None, None)
+            return (None, None, f"list HTTP {r.status_code}")
         entries = r.json().get("data", {}).get("entries", []) or []
         adm = [e for e in entries if str(e.get("name","")).lower().endswith(".adm")]
         if not adm:
-            logger.info("[NitradoAPI] no ADM entries in listing")
-            return (None, None)
-        # newest by filename timestamp
+            return (None, None, "no ADM entries")
         def _dt(e):
             return _parse_name_ts(e.get("name","")) or datetime.min.replace(tzinfo=timezone.utc)
         latest = max(adm, key=_dt)
         fname = latest.get("name")
-        # fetch download token
         down_url = f"https://api.nitrado.net/services/{service_id}/gameservers/file_server/download"
         r2 = requests.get(down_url, headers=headers,
                           params={"file": f"{dir_path.rstrip('/')}/{fname}"}, timeout=10)
         if r2.status_code != 200:
-            logger.info(f"[NitradoAPI] download token failed HTTP {r2.status_code}")
-            return (None, None)
+            return (None, None, f"download token HTTP {r2.status_code}")
         url = r2.json().get("data", {}).get("token", {}).get("url")
         if not url:
-            return (None, None)
-        return (fname, url)
+            return (None, None, "missing token url")
+        return (fname, url, "ok")
     except Exception as e:
-        logger.info(f"[NitradoAPI] error: {e}")
-        return (None, None)
+        return (None, None, f"exception: {e}")
 # =====================================================================
 
 
 async def _to_thread(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
+
 
 async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event):
     """
@@ -337,13 +335,11 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
     ADM file appears, automatically switches to it.
 
     Improvements:
-    - Radar-style line-hash de-dupe (never miss short bursts; skip replays)
+    - Radar-style recent-hash de-dupe
     - Bounded full-file fallback when REST fails (<= 512 KiB)
-    - Heartbeat diagnostics (size/mdtm/offset)
-    - Last-line hashed print every tick
+    - Heartbeat diagnostics
     - Unified FTP listing (MLSD ∪ NLST ∪ LIST) + candidate logging
-    - **NEW**: Nitrado API discovery of the newest ADM (active file), with HTTP
-               download fallback when FTP cannot read it.
+    - Nitrado API discovery of the newest ADM (active file) with HTTP fallback.
     """
     cfg = get_ftp_config(guild_id)
     if not cfg:
@@ -358,16 +354,13 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
     latest_file = state.get("latest_file")
     offset = int(state.get("offset") or 0)
 
-    # De-dupe cache (rolling) for this poller
     seen_set: set[int] = set()
     seen_queue: deque[int] = deque()
 
-    # Last accepted line (for the hash print each tick)
     last_seen_line: Optional[str] = None
     last_seen_hash: Optional[int] = None
 
     def _remember_line(line: str) -> bool:
-        """Returns True if this line is new (not seen recently), and updates last-line state."""
         nonlocal last_seen_line, last_seen_hash
         fp = _line_fingerprint(line)
         if fp in seen_set:
@@ -386,7 +379,6 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
     while not stop_event.is_set():
         try:
             ftp = await _to_thread(FTP, cfg["host"], timeout=25)
-            # Login, passive, and binary mode for REST/SIZE
             await _to_thread(ftp.login, cfg["username"], cfg["password"])
             try:
                 await _to_thread(ftp.set_pasv, True)
@@ -401,22 +393,17 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
             try:
                 await _to_thread(ftp.cwd, directory)
             except Exception as e:
-                # Diagnostics when CWD fails
                 try:
                     pwd = await _to_thread(ftp.pwd)
                 except Exception:
                     pwd = "(unknown)"
-                logger.error(
-                    f"[Guild {guild_id}] CWD to '{directory}' failed from PWD={pwd}: {e}",
-                    exc_info=True,
-                )
+                logger.error(f"[Guild {guild_id}] CWD to '{directory}' failed from PWD={pwd}: {e}", exc_info=True)
                 try:
                     root_ls = await _to_thread(_ftp_list_names, ftp, "/")
                     logger.info(f"[Guild {guild_id}] FTP root entries: {root_ls[:40]}")
                 except Exception:
                     pass
                 await _to_thread(ftp.quit)
-                # --- Last-line hash print (tick) ---
                 if last_seen_hash is not None:
                     logger.info(f"[Guild {guild_id}] Last line hash #{last_seen_hash}: {last_seen_line[:160]}")
                 await asyncio.sleep(interval)
@@ -429,7 +416,6 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
             except Exception:
                 pwd_now = "(unknown)"
 
-            # Extra diagnostics to catch omissions
             try:
                 raw_nlst = await _to_thread(_ftp_list_names, ftp, ".")
             except Exception:
@@ -439,9 +425,12 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
             except Exception:
                 raw_list = []
 
-            # ===== API discovery (optional). If available and newer, prefer it.
-            api_name, api_download_url = await _to_thread(_nitrado_api_get_latest, cfg)
-            api_dt = _parse_name_ts(api_name or "") if api_name else None
+            # ===== API discovery
+            api_name, api_download_url, api_diag = await _to_thread(_nitrado_api_get_latest, cfg)
+            if api_name:
+                logger.info(f"[Guild {guild_id}] API latest hint: {api_name} ({api_diag})")
+            else:
+                logger.info(f"[Guild {guild_id}] API latest hint unavailable: {api_diag}")
 
             if not files and not api_name:
                 logger.debug(f"[Guild {guild_id}] No .ADM files found; PWD={pwd_now}")
@@ -457,36 +446,27 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
             if files:
                 latest_name, latest_size_guess, latest_mtime = _choose_latest_adm(files)
 
-            # Compare FTP newest vs API newest
+            # Compare FTP newest vs API newest (prefer API if newer OR equal)
             chosen_name = latest_name
             chosen_mtime = latest_mtime
             chosen_api_url = None
+            api_dt = _parse_name_ts(api_name or "") if api_name else None
+            ftp_dt = latest_mtime or (_parse_name_ts(latest_name or "") if latest_name else None)
 
             if api_name:
                 if not chosen_name:
-                    chosen_name = api_name
-                    chosen_mtime = api_dt
-                    chosen_api_url = api_download_url
+                    chosen_name, chosen_mtime, chosen_api_url = api_name, api_dt, api_download_url
                 else:
-                    # pick newer by timestamp
-                    ftp_dt = chosen_mtime or _parse_name_ts(chosen_name) or datetime.min.replace(tzinfo=timezone.utc)
-                    if api_dt and api_dt > ftp_dt:
+                    if api_dt and (ftp_dt is None or api_dt >= ftp_dt):
                         logger.info(
-                            f"[Guild {guild_id}] API discovered newer ADM: {api_name} "
-                            f"(API {api_dt.isoformat()} > FTP {ftp_dt.isoformat()})"
+                            f"[Guild {guild_id}] Preferring API file (API {api_dt.isoformat()} >= FTP {ftp_dt.isoformat() if ftp_dt else 'None'})"
                         )
-                        chosen_name = api_name
-                        chosen_mtime = api_dt
-                        chosen_api_url = api_download_url
+                        chosen_name, chosen_mtime, chosen_api_url = api_name, api_dt, api_download_url
 
             # Candidate table (old→new, last few entries)
             if files:
                 pretty = [
-                    {
-                        "name": n,
-                        "size": s,
-                        "mtime": (mt.isoformat() if mt else None),
-                    }
+                    {"name": n, "size": s, "mtime": (mt.isoformat() if mt else None)}
                     for n, s, mt in sorted(files, key=lambda r: (r[2] or _parse_name_ts(r[0]) or datetime.min))
                 ]
                 logger.info(f"[Guild {guild_id}] PWD={pwd_now}")
@@ -494,25 +474,25 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 logger.debug(f"[Guild {guild_id}] NLST raw (trim): {raw_nlst[-10:]}")
                 logger.debug(f"[Guild {guild_id}] LIST raw (trim): {raw_list[-10:]}")
 
-            if api_name:
-                logger.info(f"[Guild {guild_id}] API latest hint: {api_name}")
-
-            # Nothing chosen? Bail.
             if not chosen_name:
                 await _to_thread(ftp.quit)
                 await asyncio.sleep(interval)
                 continue
 
+            logger.info(
+                f"[Guild {guild_id}] Chosen active file: {chosen_name} "
+                f"(FTP newest={latest_name} @ {ftp_dt.isoformat() if ftp_dt else 'None'}, "
+                f"API newest={api_name} @ {api_dt.isoformat() if api_dt else 'None'})"
+            )
+
             # Switch if changed
             if latest_file != chosen_name:
-                logger.info(
-                    f"[Guild {guild_id}] Switching ADM {latest_file or '<none>'} → {chosen_name}"
-                )
+                logger.info(f"[Guild {guild_id}] Switching ADM {latest_file or '<none>'} → {chosen_name}")
                 latest_file = chosen_name
                 offset = 0
                 set_guild_state(guild_id, latest_file=latest_file, offset=offset)
 
-            # Heartbeat stats for current file
+            # Heartbeat for current file (FTP probe)
             size = await _to_thread(_ftp_size, ftp, latest_file)
             mdtm = await _to_thread(_ftp_mdtm, ftp, latest_file)
 
@@ -527,29 +507,28 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 f"[Guild {guild_id}] HEARTBEAT: file={latest_file} size={size} mdtm={mdtm} offset={offset}"
             )
 
-            # Try ranged read via FTP
-            ftp_failed = False
+            # Try ranged read via FTP first (even if file wasn't listed)
+            blob: bytes = b""
             try:
-                blob: bytes = await _to_thread(_ftp_read_range_in_cwd, ftp, latest_file, offset)
+                blob = await _to_thread(_ftp_read_range_in_cwd, ftp, latest_file, offset)
             except Exception as e:
-                ftp_failed = True
                 logger.info(f"[Guild {guild_id}] FTP RETR failed for {latest_file}: {e}")
-                blob = b""
 
-            # If no data from FTP, consider HTTP download fallback (API)
+            # If no data via FTP and we have API URL for the chosen file, try HTTP
             full_fetch_used = False
             http_size = None
-            if (not blob) and chosen_api_url:
+            http_used = False
+            if (not blob) and (api_name and chosen_name == api_name) and (api_download_url):
                 try:
-                    r = await _to_thread(requests.get, chosen_api_url, )
+                    r = await _to_thread(requests.get, api_download_url)
                     if r.status_code == 200 and r.content is not None:
                         http_bytes = r.content
                         http_size = len(http_bytes)
-                        # Only process new tail (prev offset .. end)
                         data_to_process = http_bytes[offset:] if offset < http_size else b""
                         blob = data_to_process
                         full_fetch_used = True
-                        size = http_size  # for logging/offset update below
+                        http_used = True
+                        size = http_size
                         logger.info(
                             f"[Guild {guild_id}] HTTP fallback used for {latest_file} "
                             f"(downloaded {http_size} bytes, tail={len(blob)} from offset {offset})."
@@ -567,12 +546,9 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 )
             else:
                 prev_offset = offset
-
-                # If we did an HTTP full-file fetch, offset should become http_size
                 if full_fetch_used and http_size is not None:
                     offset = http_size
                 else:
-                    # Standard FTP increment (we fetched from 'offset' to EOF)
                     offset += len(blob)
 
                 set_guild_state(guild_id, latest_file=latest_file, offset=offset)
@@ -583,19 +559,18 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 text = blob.decode("utf-8", errors="ignore")
                 now = datetime.now(timezone.utc)
 
+                # Mark source as ftp: or api: so you can see which path was used
+                src_prefix = "api" if http_used else "ftp"
                 for idx, line in enumerate(text.splitlines()):
-                    # 1) radar-style recent-hash de-dupe
                     if not _remember_line(line):
                         continue
-                    # 2) your existing acceptance filter
                     if buffer.accept(line):
-                        source = f"ftp:{latest_file}#~{prev_offset}+{idx}"
+                        source = f"{src_prefix}:{latest_file}#~{prev_offset}+{idx}"
                         await cb(guild_id, line, source, now)
 
         except Exception as e:
             logger.error(f"[Guild {guild_id}] FTP poll error: {e}", exc_info=True)
 
-        # --- Last-line hash print (every tick) ---
         if last_seen_hash is not None:
             logger.info(f"[Guild {guild_id}] Last line hash #{last_seen_hash}: {last_seen_line[:160]}")
 
