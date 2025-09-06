@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import io
-from datetime import datetime, timezone
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple
 
 import discord
@@ -11,6 +11,7 @@ from discord.ext import commands
 
 from utils.settings import load_settings
 from PIL import Image, ImageDraw, ImageFont  # Pillow
+
 
 # Optional import from tracker (safe fallback if not present during reloads)
 try:
@@ -61,18 +62,48 @@ MAP_SLUG = {  # for iZurvive URL building
     "Namalsk": "namalsk",
 }
 
-# File locations are resolved relative to the project root (two dirs up from this file)
-BASE_DIR = Path(__file__).resolve().parent.parent
-ASSETS_ROOT = BASE_DIR / "assets" / "maps"
-
-# Where to find background map art (PNG)
-# NOTE: keep just the filename here; we resolve against ASSETS_ROOT to avoid CWD issues
-MAP_FILES = {
-    "Chernarus+": "chernarus_base.PNG",
-    "Chernarus": "chernarus_base.PNG",
-    "Livonia": "livonia_base.PNG",
-    "Namalsk": "namalsk_base.PNG",
+# Where to find background map art (relative to repo root)
+MAP_PATHS = {
+    "Chernarus+": "assets/maps/chernarus_base.PNG",
+    "Chernarus": "assets/maps/chernarus_base.PNG",
+    "Livonia": "assets/maps/livonia_base.PNG",
+    "Namalsk": "assets/maps/namalsk_base.PNG",
 }
+
+# Stronger path resolution (handles different working dirs / case sensitive FS)
+def _resolve_asset(rel_path: str) -> Path | None:
+    """
+    Try several locations to find the asset on disk:
+      - relative to current CWD
+      - relative to this file's directory
+      - relative to project root (parent of /cogs)
+      - /app/... (Railway)
+    Returns a Path if the file exists, else None.
+    """
+    candidates: list[Path] = []
+    rel = Path(rel_path)
+
+    # 1) current working dir
+    candidates.append(Path.cwd() / rel)
+
+    # 2) alongside this file
+    here = Path(__file__).resolve().parent
+    candidates.append(here / rel)
+
+    # 3) project root (../)
+    # cogs/<this file>  -> project root is parent of cogs
+    candidates.append(here.parent / rel)
+
+    # 4) explicit /app (Railway containers usually run from /app)
+    candidates.append(Path("/app") / rel)
+
+    for p in candidates:
+        try:
+            if p.exists() and p.is_file():
+                return p
+        except Exception:
+            continue
+    return None
 
 
 def _active_map_for_guild(gid: int) -> str:
@@ -84,37 +115,30 @@ def _world_size_for(map_name: str) -> int:
     return WORLD_SIZE.get(map_name, 15360)
 
 
-def _asset_path(map_name: str) -> Path | None:
-    fname = MAP_FILES.get(map_name)
-    if not fname:
-        return None
-    p = ASSETS_ROOT / fname
-    return p if p.exists() else None
-
-
 def _load_map_image(gid: int, map_name: str, size_px: int = 1400) -> Image.Image:
     """
     Try loading a map background; fall back to blank grid if missing.
     Returns an RGBA image (square) so we can draw anti-aliased labels.
     """
-    p = _asset_path(map_name)
-    if p:
-        try:
-            img = Image.open(p).convert("RGBA")
-            # fit to square with letterbox/pad if needed
-            if img.width != img.height:
-                side = max(img.width, img.height)
-                canvas = Image.new("RGBA", (side, side), (18, 18, 22, 255))
-                ox = (side - img.width) // 2
-                oy = (side - img.height) // 2
-                canvas.paste(img, (ox, oy))
-                img = canvas
-            _log(gid, "map image loaded", {"path": str(p), "orig": (img.width, img.height)})
-            return img.resize((size_px, size_px), Image.BICUBIC)
-        except Exception as e:
-            _log(gid, "map load failed; using fallback", {"path": str(p), "error": repr(e)})
-    else:
-        _log(gid, "map file not found; using fallback", {"expected_dir": str(ASSETS_ROOT), "map": map_name})
+    rel = MAP_PATHS.get(map_name)
+    if rel:
+        abs_path = _resolve_asset(rel)
+        if abs_path:
+            try:
+                img = Image.open(abs_path).convert("RGBA")
+                if img.width != img.height:
+                    side = max(img.width, img.height)
+                    canvas = Image.new("RGBA", (side, side), (18, 18, 22, 255))
+                    ox = (side - img.width) // 2
+                    oy = (side - img.height) // 2
+                    canvas.paste(img, (ox, oy))
+                    img = canvas
+                _log(gid, "map image loaded", {"map": map_name, "path": str(abs_path)})
+                return img.resize((size_px, size_px), Image.BICUBIC)
+            except Exception as e:
+                _log(gid, "map open failed; using fallback", {"map": map_name, "path": str(abs_path), "error": repr(e)})
+        else:
+            _log(gid, "map file not found; using fallback", {"expected_dir": "/app/assets/maps", "rel": rel})
 
     # Fallback: plain dark background with grid
     side = size_px
@@ -157,8 +181,8 @@ def _draw_pin(drw: ImageDraw.ImageDraw, p: Tuple[int, int]):
 
 
 def _izurvive_url(map_name: str, x: float, z: float) -> str:
-    slug = MAP_SLUG.get(map_name, "livonia").lower()
-    # iZurvive supports semicolon pair "x;y" (your working pattern)
+    slug = MAP_SLUG.get(map_name, "livonia")
+    # iZurvive likes decimals with a semicolon delimiter
     return f"https://www.izurvive.com/{slug}/#location={x:.2f};{z:.2f}"
 
 
@@ -246,10 +270,10 @@ class ShowTracked(commands.Cog):
         # Sort by name for stable output
         rows.sort(key=lambda r: (str(r.get("name") or r.get("short_id")), r.get("short_id", "")))
 
-        # Create image
+        # Create image (with reliable asset loading)
         base = _load_map_image(gid, active_map, size_px=1400)  # RGBA
         drw = ImageDraw.Draw(base)
-        W, H = base.size
+        W, _H = base.size
 
         # Font — larger + stroke for readability
         try:
@@ -299,7 +323,6 @@ class ShowTracked(commands.Cog):
             except Exception:
                 pass
             url = _izurvive_url(active_map, x, z)
-            # clickable blue link on the coords
             lines.append(f"• **{name}** ({short_id}) — [({x:.1f}, {z:.1f})]({url}) {when}")
 
         header = f"**Tracked players — {active_map}**"
