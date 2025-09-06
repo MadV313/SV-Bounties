@@ -114,6 +114,7 @@ async def main():
         await BOT.load_extension("cogs.bounty")
         await BOT.load_extension("cogs.admin_misc")
         await BOT.load_extension("cogs.help")
+        await BOT.load_extension("cogs.show_tracked")
 
         token = os.environ.get("DISCORD_TOKEN")
         if not token:
