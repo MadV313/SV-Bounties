@@ -7,7 +7,7 @@ from collections import deque
 from hashlib import blake2b
 from ftplib import FTP, error_perm
 from datetime import datetime, timezone
-from typing import Callable, Awaitable, Optional
+from typing import Callable, Awaitable, Optional, List, Tuple, Dict, Any
 
 from utils.ftp_config import get_ftp_config
 from tracer.adm_state import get_guild_state, set_guild_state
@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 LineCallback = Callable[[int, str, str, datetime], Awaitable[None]]
 # signature: (guild_id, line, source_ref, timestamp)
+
+# --- small time helper -------------------------------------------------------
+def _when() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+# -----------------------------------------------------------------------------
 
 # --- HASH DE-DUPE (Radar-style) ---------------------------------------------
 # Rolling set of recent line fingerprints so “bursty” additions are never missed
@@ -163,6 +168,65 @@ def _ftp_mdtm(ftp: FTP, filename: str) -> Optional[str]:
         pass
     return None
 
+
+# ==================== NEW: robust directory scan ====================
+def _list_adm_files(ftp: FTP) -> List[Tuple[str, int, Optional[datetime]]]:
+    """
+    Return (name, size, mtime) for each *.ADM in the CWD.
+    Prefer MLSD's 'modify' as mtime; fall back to parsing the timestamp in the filename.
+    """
+    out: List[Tuple[str, int, Optional[datetime]]] = []
+    # Try MLSD first
+    try:
+        for name, facts in list(ftp.mlsd()):
+            if not name.lower().endswith(".adm"):
+                continue
+            if facts.get("type", "").lower() != "file":
+                continue
+            size = int(facts.get("size", "0"))
+            mtime = None
+            mod = facts.get("modify")
+            if mod and len(mod) >= 14:
+                try:
+                    mtime = datetime.strptime(mod[:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+                except Exception:
+                    mtime = None
+            if mtime is None:
+                mtime = _parse_name_ts(name)
+            out.append((name, size, mtime))
+    except Exception:
+        # NLST fallback
+        names: List[str] = []
+        try:
+            ftp.retrlines("NLST", names.append)
+        except Exception:
+            names = []
+        for n in names:
+            if not n.lower().endswith(".adm"):
+                continue
+            try:
+                size = ftp.size(n) or 0
+            except Exception:
+                size = 0
+            out.append((n, size, _parse_name_ts(n)))
+    return out
+
+
+def _choose_latest_adm(files: List[Tuple[str, int, Optional[datetime]]]) -> Tuple[str, int, Optional[datetime]]:
+    """
+    Choose the newest file by mtime (or filename timestamp), returning (name, size, mtime).
+    """
+    if not files:
+        raise ValueError("No ADM files")
+    def key(row):
+        name, size, mtime = row
+        t = mtime or _parse_name_ts(name) or datetime.min.replace(tzinfo=timezone.utc)
+        return (t, name)
+    name, size, mtime = max(files, key=key)
+    return name, size, mtime
+# ===================================================================
+
+
 async def _to_thread(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
@@ -176,6 +240,8 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
     - Bounded full-file fallback when REST fails (<= 512 KiB)
     - Heartbeat diagnostics (size/mdtm/offset)
     - Last-line hashed print every tick
+    - NEW: robust latest-file chooser using MLSD modify and filename timestamp
+           + explicit candidate table logging + immediate rollover switching
     """
     cfg = get_ftp_config(guild_id)
     if not cfg:
@@ -197,6 +263,9 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
     # Last accepted line (for the hash print each tick)
     last_seen_line: Optional[str] = None
     last_seen_hash: Optional[int] = None
+
+    # For progress diagnostics
+    last_progress_offset = offset
 
     def _remember_line(line: str) -> bool:
         """Returns True if this line is new (not seen recently), and updates last-line state."""
@@ -254,29 +323,42 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 await asyncio.sleep(interval)
                 continue
 
-            # Choose latest ADM
-            candidate = await _to_thread(_ftp_latest_adm_with_mlsd, ftp, ".")
-            if not candidate:
-                names = await _to_thread(_ftp_list_names, ftp, ".")
-                candidate = _pick_latest_by_name(names)
-
-            if not candidate:
+            # ===== NEW: list all ADM files and choose the newest every tick
+            files = await _to_thread(_list_adm_files, ftp)
+            if not files:
                 logger.debug(f"[Guild {guild_id}] No .ADM files found in {directory}")
                 await _to_thread(ftp.quit)
-                # --- Last-line hash print (tick) ---
                 if last_seen_hash is not None:
                     logger.info(f"[Guild {guild_id}] Last line hash #{last_seen_hash}: {last_seen_line[:160]}")
                 await asyncio.sleep(interval)
                 continue
 
-            # If we switched files or current offset is past end, reset
-            if latest_file != candidate:
-                logger.info(f"[Guild {guild_id}] Switching to new ADM file {candidate}")
-                latest_file = candidate
+            latest_name, latest_size_guess, latest_mtime = _choose_latest_adm(files)
+
+            # Candidate table (first 6)
+            pretty = [
+                {
+                    "name": n,
+                    "size": s,
+                    "mtime": (mt.isoformat() if mt else None),
+                }
+                for n, s, mt in sorted(files, key=lambda r: (r[2] or _parse_name_ts(r[0]) or datetime.min))
+            ]
+            logger.info(
+                f"[Guild {guild_id}] ADM candidates (old→new): {pretty[-6:]}"
+            )
+
+            # Switch if changed
+            if latest_file != latest_name:
+                logger.info(
+                    f"[Guild {guild_id}] Switching ADM {latest_file or '<none>'} → {latest_name}"
+                )
+                latest_file = latest_name
                 offset = 0
+                last_progress_offset = 0
                 set_guild_state(guild_id, latest_file=latest_file, offset=offset)
 
-            # Heartbeat stats
+            # Heartbeat stats for current file
             size = await _to_thread(_ftp_size, ftp, latest_file)
             mdtm = await _to_thread(_ftp_mdtm, ftp, latest_file)
             try:
@@ -286,7 +368,7 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
 
             if size is not None and offset > size:
                 logger.info(
-                    f"[Guild {guild_id}] Offset {offset} > size {size} for {latest_file}; resetting to 0 (rollover)."
+                    f"[Guild {guild_id}] Offset {offset} > size {size} for {latest_file}; resetting to 0 (rollover/truncation)."
                 )
                 offset = 0
                 set_guild_state(guild_id, latest_file=latest_file, offset=offset)
@@ -294,6 +376,29 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
             logger.debug(
                 f"[Guild {guild_id}] HEARTBEAT: PWD={pwd_now} file={latest_file} size={size} mdtm={mdtm} offset={offset}"
             )
+
+            # Extra guard: if another file is strictly newer than our current MDTM, switch now
+            try:
+                current_dt = None
+                if mdtm and len(mdtm) >= 14:
+                    current_dt = datetime.strptime(mdtm[:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+                else:
+                    current_dt = _parse_name_ts(latest_file or "")
+            except Exception:
+                current_dt = _parse_name_ts(latest_file or "")
+
+            if latest_mtime and current_dt and latest_mtime > current_dt and latest_name != latest_file:
+                logger.info(
+                    f"[Guild {guild_id}] Detected newer ADM on server "
+                    f"({latest_name} @ {latest_mtime.isoformat()}) > "
+                    f"({latest_file} @ {current_dt.isoformat()}); forcing switch."
+                )
+                latest_file = latest_name
+                offset = 0
+                last_progress_offset = 0
+                set_guild_state(guild_id, latest_file=latest_file, offset=offset)
+                # refresh size for new file
+                size = await _to_thread(_ftp_size, ftp, latest_file)
 
             # Try ranged read
             blob: bytes = await _to_thread(_ftp_read_range_in_cwd, ftp, latest_file, offset)
@@ -342,6 +447,8 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                     if buffer.accept(line):
                         source = f"ftp:{latest_file}#~{prev_offset}+{idx}"
                         await cb(guild_id, line, source, now)
+
+                last_progress_offset = offset
 
         except Exception as e:
             logger.error(f"[Guild {guild_id}] FTP poll error: {e}", exc_info=True)
