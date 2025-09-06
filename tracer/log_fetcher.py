@@ -175,6 +175,7 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
     - Radar-style line-hash de-dupe (never miss short bursts; skip replays)
     - Bounded full-file fallback when REST fails (<= 512 KiB)
     - Heartbeat diagnostics (size/mdtm/offset)
+    - Last-line hashed print every tick
     """
     cfg = get_ftp_config(guild_id)
     if not cfg:
@@ -193,8 +194,13 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
     seen_set: set[int] = set()
     seen_queue: deque[int] = deque()
 
+    # Last accepted line (for the hash print each tick)
+    last_seen_line: Optional[str] = None
+    last_seen_hash: Optional[int] = None
+
     def _remember_line(line: str) -> bool:
-        """Returns True if this line is new (not seen recently)."""
+        """Returns True if this line is new (not seen recently), and updates last-line state."""
+        nonlocal last_seen_line, last_seen_hash
         fp = _line_fingerprint(line)
         if fp in seen_set:
             return False
@@ -203,6 +209,8 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
         if len(seen_queue) > MAX_SEEN_HASHES:
             old = seen_queue.popleft()
             seen_set.discard(old)
+        last_seen_line = line.rstrip()
+        last_seen_hash = fp
         return True
 
     logger.info(f"[Guild {guild_id}] Starting ADM poller (dir={directory}, every {interval}s).")
@@ -240,6 +248,9 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 except Exception:
                     pass
                 await _to_thread(ftp.quit)
+                # --- Last-line hash print (tick) ---
+                if last_seen_hash is not None:
+                    logger.info(f"[Guild {guild_id}] Last line hash #{last_seen_hash}: {last_seen_line[:160]}")
                 await asyncio.sleep(interval)
                 continue
 
@@ -252,6 +263,9 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
             if not candidate:
                 logger.debug(f"[Guild {guild_id}] No .ADM files found in {directory}")
                 await _to_thread(ftp.quit)
+                # --- Last-line hash print (tick) ---
+                if last_seen_hash is not None:
+                    logger.info(f"[Guild {guild_id}] Last line hash #{last_seen_hash}: {last_seen_line[:160]}")
                 await asyncio.sleep(interval)
                 continue
 
@@ -306,13 +320,10 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 # If we did a full-file fetch and know the size, only process the new tail
                 data_to_process = blob
                 if full_fetch_used and size is not None:
-                    # Avoid reprocessing old content; rely on offset
                     if prev_offset < size and prev_offset < len(blob):
                         data_to_process = blob[prev_offset:]
-                    # Advance offset to the known end of file
                     offset = size
                 else:
-                    # Ranged read path: advance by the bytes read
                     offset += len(blob)
 
                 set_guild_state(guild_id, latest_file=latest_file, offset=offset)
@@ -334,5 +345,9 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
 
         except Exception as e:
             logger.error(f"[Guild {guild_id}] FTP poll error: {e}", exc_info=True)
+
+        # --- Last-line hash print (every tick) ---
+        if last_seen_hash is not None:
+            logger.info(f"[Guild {guild_id}] Last line hash #{last_seen_hash}: {last_seen_line[:160]}")
 
         await asyncio.sleep(interval)
