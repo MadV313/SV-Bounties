@@ -65,7 +65,6 @@ def unwrap_links_json(obj: Any) -> Tuple[Any, bool, str]:
                 reason = "unwrapped base64→JSON"
                 continue
             except Exception:
-                # fall through to try raw JSON string
                 pass
         # Try raw JSON string
         if isinstance(d, str):
@@ -75,7 +74,6 @@ def unwrap_links_json(obj: Any) -> Tuple[Any, bool, str]:
                 reason = "unwrapped raw JSON string"
                 continue
             except Exception:
-                # not decodable; stop
                 break
         break
 
@@ -115,7 +113,7 @@ def _read_http_json_and_text(url: str, timeout: float = 8.0) -> tuple[dict, str]
 
 def _try_local_json_and_text(path: str) -> tuple[bool, str, dict | None, str | None]:
     """
-    Try reading a local JSON via storageClient first, then direct FS.
+    Try reading a JSON via storageClient first, then direct FS.
     Returns (ok, detail, data_or_none, raw_text_or_none).
     """
     try:
@@ -184,7 +182,7 @@ def _preview_json(doc: dict, raw_text: str | None, max_chars: int = 900) -> str:
 
 class AdminLinks(commands.Cog):
     def __init__(self, bot):
-        self.bot = bot
+        self.bot = bot)
 
     # ---- Settings controls ---------------------------------------------------
 
@@ -388,13 +386,11 @@ class AdminLinks(commands.Cog):
         if use_external_first and external_present:
             chosen_path = external_path
         elif not disable_local:
-            # fallbacks
             for p in ("settings/linked_players.json", "data/linked_players.json"):
                 if os.path.isfile(p):
                     chosen_path = p
                     break
             if not chosen_path:
-                # Still normalize whatever path might exist locally even if not a real file yet
                 chosen_path = "data/linked_players.json"
 
         if not chosen_path:
@@ -445,8 +441,8 @@ class AdminLinks(commands.Cog):
         after_n = _count(fixed)
 
         if changed:
-            # Save back as plain JSON (no wrapper)
-            save_file(chosen_path, fixed, indent=2)
+            # Save back as plain JSON (no wrapper) — NOTE: no 'indent' kwarg
+            save_file(chosen_path, fixed)
             title = "✅ Normalized linked_players.json"
             color = 0x2ecc71
         else:
@@ -475,7 +471,6 @@ class AdminLinks(commands.Cog):
     async def links_normalize(self, interaction: discord.Interaction):
         await self._normalize_impl(interaction)
 
-    # Alias for folks who prefer a top-level command
     @app_commands.command(name="linksnormalize", description="(Alias) Normalize linked_players.json to plain JSON")
     @admin_check()
     async def linksnormalize(self, interaction: discord.Interaction):
