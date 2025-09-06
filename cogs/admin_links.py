@@ -49,11 +49,13 @@ def unwrap_links_json(obj: Any) -> Tuple[Any, bool, str]:
     while isinstance(obj, dict) and "data" in obj and len(obj) == 1 and seen < 3:
         seen += 1
         d = obj["data"]
+        # already proper dict/list
         if isinstance(d, (dict, list)):
             obj = d
             changed_any = True
             reason = "unwrapped nested dict/list"
             continue
+        # base64 → JSON
         if isinstance(d, str) and _looks_base64(d):
             try:
                 decoded = base64.b64decode(d, validate=True).decode("utf-8", "ignore")
@@ -63,6 +65,7 @@ def unwrap_links_json(obj: Any) -> Tuple[Any, bool, str]:
                 continue
             except Exception:
                 pass
+        # raw JSON string
         if isinstance(d, str):
             try:
                 obj = json.loads(d)
@@ -77,6 +80,7 @@ def unwrap_links_json(obj: Any) -> Tuple[Any, bool, str]:
 
 
 def _maybe_decode_wrapped_base64(doc: dict) -> tuple[dict, str | None, str | None]:
+    """Kept for backwards-compat with show embed logic."""
     if isinstance(doc, dict) and "data" in doc and isinstance(doc["data"], str):
         blob = doc["data"]
         if _looks_base64(blob):
@@ -94,14 +98,20 @@ def _maybe_decode_wrapped_base64(doc: dict) -> tuple[dict, str | None, str | Non
 # ----------------------------- I/O helpers -----------------------------------
 
 def _read_http_json_and_text(url: str, timeout: float = 8.0) -> tuple[dict, str]:
+    """Fetch JSON from HTTP(S). Returns (parsed_dict, raw_text)."""
     req = Request(url, headers={"User-Agent": "SV-Bounties/links-check"})
-    with urlopen(req, timeout=timeout) as resp:  # nosec
+    with urlopen(req, timeout=timeout) as resp:  # nosec - admin-provided URL
         charset = resp.headers.get_content_charset() or "utf-8"
         raw = resp.read().decode(charset, errors="replace")
     return json.loads(raw), raw
 
 
-def _http_post_text(url: str, text: str, content_type: str = "application/json; charset=utf-8", timeout: float = 8.0) -> tuple[bool, str]:
+def _http_post_text(
+    url: str,
+    text: str,
+    content_type: str = "application/json; charset=utf-8",
+    timeout: float = 8.0
+) -> tuple[bool, str]:
     """Best-effort direct POST used when writing to http(s) JSON targets."""
     try:
         req = Request(url, data=text.encode("utf-8"), headers={"Content-Type": content_type}, method="POST")
@@ -113,6 +123,10 @@ def _http_post_text(url: str, text: str, content_type: str = "application/json; 
 
 
 def _try_local_json_and_text(path: str) -> tuple[bool, str, dict | None, str | None]:
+    """
+    Try reading JSON via storageClient first, then direct FS.
+    Returns (ok, detail, data_or_none, raw_text_or_none).
+    """
     try:
         data = load_file(path)
     except Exception:
@@ -132,6 +146,7 @@ def _try_local_json_and_text(path: str) -> tuple[bool, str, dict | None, str | N
         except Exception:
             pass
 
+    # Fallback to filesystem
     try:
         if os.path.isfile(path):
             with open(path, "r", encoding="utf-8") as f:
@@ -146,6 +161,7 @@ def _try_local_json_and_text(path: str) -> tuple[bool, str, dict | None, str | N
 
 
 def _size_hint(doc: dict) -> int:
+    """Rough size based on common containers."""
     for k in ("links", "players", "mapping", "map", "by_id", "by_name"):
         v = doc.get(k)
         if isinstance(v, (list, dict)):
@@ -165,6 +181,7 @@ def _preview_text(text: str, max_chars: int = 900) -> str:
 
 
 def _preview_json(doc: dict, raw_text: str | None, max_chars: int = 900) -> str:
+    """Short snippet suitable for an embed field."""
     try:
         text = raw_text if raw_text else json.dumps(doc, ensure_ascii=False, indent=2)
     except Exception:
@@ -419,6 +436,7 @@ class AdminLinks(commands.Cog):
 
         fixed, changed, reason = unwrap_links_json(doc)
 
+        # simple stats
         def _count(v: Any) -> int:
             if isinstance(v, dict):
                 return len(v)
@@ -429,62 +447,70 @@ class AdminLinks(commands.Cog):
         before_n = _count(doc)
         after_n = _count(fixed)
 
-        # ---- WRITE: if writing to HTTP(S), send a JSON STRING (not dict) ----
+        # ---- WRITE: for HTTP(S) send a JSON STRING; try storageClient, then direct HTTP POST ----
         wrote = False
         write_err = None
-        wrote_raw_plain = False  # did we manage to make the remote RAW become plain JSON?
+        wrote_raw_plain = False   # whether RAW now looks like plain JSON
+        write_attempt_notes: list[str] = []
+
         if changed:
             try:
                 if write_path.lower().startswith(("http://", "https://")):
                     payload = json.dumps(fixed, ensure_ascii=False, indent=2)
-                    # First, try via storageClient (some impls accept raw string and don't wrap)
-                    wrote = bool(save_file(write_path, payload))
-                    # If raw is still wrapped after this, fall back to direct HTTP POST
-                    if wrote:
-                        try:
-                            # quick raw check
-                            _, raw_after = _read_http_json_and_text(chosen_read)
-                            if raw_after.strip().startswith('{"data"'):
-                                ok2, note2 = _http_post_text(write_path, payload)
-                                wrote_raw_plain = ok2
-                                if not ok2:
-                                    write_err = f"storageClient wrote (wrapped). HTTP fallback: {note2}"
-                            else:
-                                wrote_raw_plain = True
-                        except Exception:
-                            pass
+
+                    # 1) Try storageClient (some impls accept raw string and don't wrap)
+                    try_sc = bool(save_file(write_path, payload))
+                    write_attempt_notes.append(f"storageClient-> {try_sc}")
+                    wrote = wrote or try_sc
+
+                    # 2) If storageClient didn't write, try direct HTTP POST
+                    if not wrote:
+                        ok2, note2 = _http_post_text(write_path, payload)
+                        write_attempt_notes.append(f"http_post-> {ok2} ({note2})")
+                        wrote = wrote or ok2
+
+                    # quick RAW check right away (best effort)
+                    try:
+                        _, raw_after = _read_http_json_and_text(chosen_read)
+                        wrote_raw_plain = raw_after.strip().startswith("{") and not raw_after.strip().startswith('{"data"')
+                    except Exception:
+                        pass
+
                 else:
+                    # Local/FTP/SFTP etc. via storageClient
                     wrote = bool(save_file(write_path, fixed))
-                    wrote_raw_plain = True  # local writes produce plain files
+                    wrote_raw_plain = True  # local writes yield plain files
             except Exception as e:
                 write_err = f"{type(e).__name__}: {e}"
 
-        # Verify RAW + decoded
+        # ---- VERIFY: RAW + decoded (only if we wrote) ----
         raw_match_plain = False
         decoded_match = False
         verify_note = ""
         if changed and wrote:
             try:
-                # cache-buster if URL
                 verify_path = chosen_read
                 if is_read_url:
                     sep = '&' if '?' in verify_path else '?'
                     verify_path = f"{verify_path}{sep}t={int(discord.utils.utcnow().timestamp())}"
-                # raw read
+
+                # RAW fetch (no JSON parse) to see exact bytes
                 req = Request(verify_path, headers={"User-Agent": "SV-Bounties/links-verify"})
                 with urlopen(req, timeout=8.0) as resp:
                     raw_verify = resp.read().decode(resp.headers.get_content_charset() or "utf-8", "replace")
                 raw_match_plain = raw_verify.strip().startswith("{") and not raw_verify.strip().startswith('{"data"')
-                # decoded compare
+
+                # Decoded compare (tolerates wrapper if any)
                 ver_doc, _ = _read_http_json_and_text(verify_path)
                 ver_plain, _, _ = unwrap_links_json(ver_doc)
                 decoded_match = (ver_plain == fixed)
-                if not raw_match_plain:
+
+                if not raw_match_plain and decoded_match:
                     verify_note = "remote RAW still wrapped (content decodes correctly)"
             except Exception as e:
                 verify_note = f"verify failed: {type(e).__name__}: {e}"
 
-        # Preview keys
+        # ---- Build embed ----
         keys_preview = ""
         if isinstance(fixed, dict):
             keys = list(fixed.keys())[:5]
@@ -510,10 +536,15 @@ class AdminLinks(commands.Cog):
         emb.add_field(name="Write path", value=f"```{write_path}```", inline=False)
         emb.add_field(name="Result", value=reason, inline=False)
         emb.add_field(name="Counts", value=f"Before: **{before_n}** · After: **{after_n}**", inline=False)
-        if changed:
-            emb.add_field(name="Write", value=("ok" if wrote else f"error: {write_err}"), inline=False)
         if keys_preview:
             emb.add_field(name="Preview", value=f"```{keys_preview}```", inline=False)
+        if changed:
+            write_msg = ("ok" if wrote else "error")
+            if write_err:
+                write_msg += f" ({write_err})"
+            if write_attempt_notes:
+                write_msg += "\n" + " • ".join(write_attempt_notes)
+            emb.add_field(name="Write", value=write_msg, inline=False)
         if changed and wrote:
             emb.add_field(
                 name="Verify",
@@ -524,11 +555,6 @@ class AdminLinks(commands.Cog):
             )
 
         await interaction.followup.send(embed=emb, ephemeral=True)
-
-    @links.command(name="normalize", description="Normalize linked_players.json to plain JSON")
-    @admin_check()
-    async def links_normalize(self, interaction: discord.Interaction):
-        await self._normalize_impl(interaction)
 
     # -------- Optional debug helpers --------
 
