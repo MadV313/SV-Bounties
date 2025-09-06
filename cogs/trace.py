@@ -43,20 +43,21 @@ def _parse_dt(s: str) -> datetime | None:
 
 
 # ---- iZurvive helper ---------------------------------------------------------
+# Use correct slugs; iZurvive expects semicolon between x and z.
 _MAP_SLUG = {
-    "chernarus+": "chernarus",
-    "chernarus": "chernarus",
+    "chernarus+": "chernarusplusedition",
+    "chernarus": "chernarusplusedition",
     "livonia": "livonia",
     "namalsk": "namalsk",
 }
+
 def _active_map_name(guild_id: int | None) -> str:
     st = load_settings(guild_id) if guild_id else {}
     return (st.get("active_map") or "Livonia").strip()
 
 def _izurvive_url(map_name: str, x: float, z: float) -> str:
     slug = _MAP_SLUG.get(map_name.lower(), "livonia")
-    xi, zi = int(round(x)), int(round(z))
-    return f"https://www.izurvive.com/{slug}/#location={xi},{zi}"
+    return f"https://www.izurvive.com/{slug}/#location={x:.2f};{z:.2f}"
 # -----------------------------------------------------------------------------
 
 
@@ -169,7 +170,7 @@ class TraceCog(commands.Cog):
                 ephemeral=True
             )
 
-        # --------------- filter by explicit range ------------ (keeps your behavior)
+        # --------------- filter by explicit range ------------
         if dt_start:
             pts: List[Dict[str, Any]] = []
             dropped = 0
@@ -197,7 +198,7 @@ class TraceCog(commands.Cog):
 
         # ------------------- render image --------------------
         try:
-            # Newer renderer expects guild_id; keep backward compatibility.
+            # Some versions expect guild_id; support both.
             try:
                 img = render_track_png(doc, guild_id=guild_id)  # newer signature
             except TypeError:
@@ -227,7 +228,8 @@ class TraceCog(commands.Cog):
         try:
             ts_raw = last.get("ts")
             if ts_raw:
-                when = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")).astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+                when = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
+                    .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
         except Exception:
             pass
 
