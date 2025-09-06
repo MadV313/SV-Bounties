@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import io
 import math
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple
 
 import discord
@@ -29,6 +29,24 @@ def admin_check():
         perms = getattr(i.user, "guild_permissions", None)
         return bool(perms and (perms.administrator or perms.manage_guild))
     return app_commands.check(lambda i: pred(i))
+
+
+# ----------------------- tiny logger -----------------------
+def _now():
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _log(gid: int, msg: str, extra: Dict[str, Any] | None = None):
+    base = f"[{_now()}] [showtracked] [guild {gid}] {msg}"
+    if extra:
+        try:
+            import json
+            print(base, json.dumps(extra, default=str, ensure_ascii=False))
+            return
+        except Exception:
+            pass
+    print(base)
+# -----------------------------------------------------------
 
 
 # ----------------------- map helpers -----------------------
@@ -129,30 +147,74 @@ class ShowTracked(commands.Cog):
         st = load_settings(gid) or {}
         admin_channel_id = st.get("admin_channel_id")
 
+        _log(gid, "command invoked", {
+            "user": getattr(interaction.user, "id", None),
+            "channel": interaction.channel_id,
+            "admin_channel_id": admin_channel_id,
+        })
+
         # Require usage in the configured admin channel (if set)
         if admin_channel_id and interaction.channel_id != int(admin_channel_id):
+            _log(gid, "wrong channel; refusing")
             return await interaction.response.send_message(
                 "⚠️ Please run `/showtracked` in the configured admin channel.",
                 ephemeral=True,
             )
 
+        # Not ephemeral by default; keep your prior behavior
         await interaction.response.defer(thinking=True, ephemeral=False)
 
         # Pull snapshot from tracker
-        rows = get_guild_snapshot(gid) or []
+        try:
+            raw_rows = get_guild_snapshot(gid) or []
+        except Exception as e:
+            _log(gid, "get_guild_snapshot raised", {"error": repr(e)})
+            return await interaction.followup.send(
+                "❌ Failed to read tracker snapshot. See logs for details.",
+                ephemeral=True,
+            )
+
         active_map = _active_map_for_guild(gid)
         world_size = _world_size_for(active_map)
+
+        pre_count = len(raw_rows)
+        sample = [
+            {
+                "name": r.get("name"),
+                "short_id": r.get("short_id"),
+                "x": r.get("x"),
+                "z": r.get("z"),
+                "map": r.get("map"),
+                "ts": r.get("ts"),
+            }
+            for r in raw_rows[:5]
+        ]
+        _log(gid, "snapshot loaded", {
+            "active_map": active_map,
+            "count": pre_count,
+            "sample": sample,
+        })
 
         # Filter to current map if items include map info
         def _same_map(row: Dict[str, Any]) -> bool:
             m = (row.get("map") or active_map).strip()
             return m.lower() == active_map.lower()
 
-        rows = [r for r in rows if _same_map(r)]
+        rows = [r for r in raw_rows if _same_map(r)]
+        post_count = len(rows)
+        _log(gid, "after map filter", {"kept": post_count, "dropped": pre_count - post_count})
+
+        # If we had data but lost it all only due to map mismatch, relax filter as a safety net.
+        relaxed_used = False
+        if pre_count > 0 and post_count == 0:
+            rows = raw_rows
+            relaxed_used = True
+            _log(gid, "relaxed map filter engaged (using all rows)")
 
         # Build text summary
         if not rows:
             msg = f"**No tracked players** for `{active_map}`."
+            _log(gid, "no rows to display", {"active_map": active_map})
             return await interaction.followup.send(msg, ephemeral=False)
 
         # Sort by name for stable output
@@ -170,23 +232,32 @@ class ShowTracked(commands.Cog):
             font = ImageFont.load_default()
 
         # Draw each pin + label
+        pins = []
         for r in rows:
-            x = float(r.get("x") or 0.0)
-            z = float(r.get("z") or 0.0)
+            try:
+                x = float(r.get("x") or 0.0)
+                z = float(r.get("z") or 0.0)
+            except Exception:
+                x, z = 0.0, 0.0
             name = str(r.get("name") or r.get("short_id") or "?")
             px, py = _world_to_image(x, z, world_size, W)
             _draw_pin(drw, (px, py))
             # slight offset for text
-            label = f"{name}"
-            drw.text((px + 10, py - 4), label, fill=(235, 235, 235), font=font)
+            drw.text((px + 10, py - 4), f"{name}", fill=(235, 235, 235), font=font)
+            pins.append({"name": name, "x": x, "z": z, "px": px, "py": py})
+
+        _log(gid, "pins drawn", {"count": len(pins), "pins_sample": pins[:5]})
 
         # Compose text list with coords (rounded)
         lines = []
         for r in rows:
             name = str(r.get("name") or r.get("short_id") or "?")
             short_id = str(r.get("short_id") or "")
-            x = float(r.get("x") or 0.0)
-            z = float(r.get("z") or 0.0)
+            try:
+                x = float(r.get("x") or 0.0)
+                z = float(r.get("z") or 0.0)
+            except Exception:
+                x, z = 0.0, 0.0
             ts = r.get("ts")
             when = ""
             try:
@@ -196,7 +267,10 @@ class ShowTracked(commands.Cog):
                 pass
             lines.append(f"• **{name}** ({short_id}) — ({x:.1f}, {z:.1f}) {when}")
 
-        header = f"**Tracked players — {active_map}**\n" + "\n".join(lines)
+        header = f"**Tracked players — {active_map}**"
+        if relaxed_used:
+            header += "\n_(Note: map mismatch detected; showing all players returned by tracker.)_"
+        header += "\n" + "\n".join(lines)
 
         # Save image to in-memory buffer
         buf = io.BytesIO()
