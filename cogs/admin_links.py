@@ -1,6 +1,7 @@
 # cogs/admin_links.py
 from __future__ import annotations
 
+import base64
 import json
 import os
 from hashlib import blake2b
@@ -79,16 +80,46 @@ def _content_hash(raw_text: str | None) -> str:
     return f"#{h}"
 
 
+def _preview_text(text: str, max_chars: int = 900) -> str:
+    return (text[: max_chars - 1] + "…") if len(text) > max_chars else text
+
+
 def _preview_json(doc: dict, raw_text: str | None, max_chars: int = 900) -> str:
     """Short snippet suitable for an embed field."""
     try:
         text = raw_text if raw_text else json.dumps(doc, ensure_ascii=False, indent=2)
     except Exception:
         text = json.dumps(doc, ensure_ascii=False)
+    return _preview_text(text, max_chars)
 
-    if len(text) > max_chars:
-        return text[: max_chars - 1] + "…"
-    return text
+
+def _looks_base64(s: str) -> bool:
+    s = s.strip()
+    if not s:
+        return False
+    for ch in s:
+        if ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r\t ":
+            return False
+    return True
+
+
+def _maybe_decode_wrapped_base64(doc: dict) -> tuple[dict, str | None, str | None]:
+    """
+    If doc is {"data": "<base64-json>"} return (decoded_obj, 'data', decoded_text).
+    Otherwise return (doc, None, None).
+    """
+    if isinstance(doc, dict) and "data" in doc and isinstance(doc["data"], str):
+        blob = doc["data"]
+        if _looks_base64(blob):
+            try:
+                raw = base64.b64decode(blob)
+                txt = raw.decode("utf-8", "ignore")
+                decoded = json.loads(txt)
+                if isinstance(decoded, dict):
+                    return decoded, "data", txt
+            except Exception:
+                pass
+    return doc, None, None
 # -----------------------------------------------------------------------------
 
 
@@ -162,11 +193,14 @@ class AdminLinks(commands.Cog):
         detail = ""
         size_hint = 0
         top_keys = "—"
-        content_hash = "n/a"
-        snapshot = None
+        content_hash_raw = "n/a"
+        content_hash_decoded = None
+        snapshot_text = None
+        decoded_from = None
 
         data = None
         raw_text = None
+        decoded_text = None
 
         # Try external if chosen
         if chosen == "external" and external_present:
@@ -183,11 +217,20 @@ class AdminLinks(commands.Cog):
                 if not isinstance(data, dict):
                     raise ValueError("top-level JSON is not an object")
 
+                # record raw stats
+                content_hash_raw = _content_hash(raw_text)
+                top_keys = ", ".join(list(data.keys())[:10]) or "—"
+
+                # auto-decode {"data": "<base64-json>"} if present
+                decoded_obj, decoded_from, decoded_text = _maybe_decode_wrapped_base64(data)
+                if decoded_from is not None:
+                    # prefer decoded view for size/snapshot
+                    data = decoded_obj
+                    content_hash_decoded = _content_hash(decoded_text)
+
                 load_ok = True
                 size_hint = _size_hint(data)
-                top_keys = ", ".join(list(data.keys())[:10]) or "—"
-                content_hash = _content_hash(raw_text)
-                snapshot = _preview_json(data, raw_text)
+                snapshot_text = _preview_json(data, decoded_text or raw_text)
                 detail = "ok"
             except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as e:
                 detail = f"external load failed: {e}"
@@ -205,14 +248,19 @@ class AdminLinks(commands.Cog):
                 ok, det, doc, raw = _try_local_json_and_text(path)
                 if ok and isinstance(doc, dict):
                     src_used = f"local:{path}"
-                    load_ok = True
+                    # raw view
+                    content_hash_raw = _content_hash(raw or json.dumps(doc, ensure_ascii=False))
+                    top_keys = ", ".join(list(doc.keys())[:10]) or "—"
+                    # maybe decode
+                    decoded_obj, decoded_from, decoded_text = _maybe_decode_wrapped_base64(doc)
+                    if decoded_from is not None:
+                        doc = decoded_obj
+                        content_hash_decoded = _content_hash(decoded_text)
                     data = doc
-                    raw_text = raw or json.dumps(doc, ensure_ascii=False)
+                    load_ok = True
                     detail = det
                     size_hint = _size_hint(doc)
-                    top_keys = ", ".join(list(doc.keys())[:10]) or "—"
-                    content_hash = _content_hash(raw_text)
-                    snapshot = _preview_json(doc, raw_text)
+                    snapshot_text = _preview_json(doc, decoded_text or raw)
                     break
             if not load_ok and not detail:
                 detail = "no usable local file found"
@@ -228,12 +276,18 @@ class AdminLinks(commands.Cog):
         embed.add_field(name="Resolved source used", value=src_used, inline=False)
         embed.add_field(name="Load result", value=("✅ ok" if load_ok else f"❌ {detail}"), inline=False)
 
-        if load_ok:
-            embed.add_field(name="Top-level keys", value=top_keys, inline=False)
-            embed.add_field(name="Content hash", value=content_hash)
+        if load_ok and isinstance(data, dict):
+            embed.add_field(name="Top-level keys (raw)", value=top_keys or "—", inline=False)
+            embed.add_field(name="Content hash (raw)", value=content_hash_raw or "n/a", inline=True)
+            if content_hash_decoded:
+                embed.add_field(
+                    name=f"Content hash (decoded from '{decoded_from}')",
+                    value=content_hash_decoded,
+                    inline=True
+                )
             embed.add_field(
                 name="Snapshot (first ~900 chars)",
-                value=f"```json\n{snapshot}\n```",
+                value=f"```json\n{snapshot_text}\n```",
                 inline=False
             )
             embed.set_footer(text=f"size_hint={size_hint} • type={type(data).__name__}")
