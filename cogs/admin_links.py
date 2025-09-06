@@ -7,13 +7,14 @@ import os
 from hashlib import blake2b
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+from typing import Any, Tuple
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from utils.settings import load_settings, save_settings
-from utils.storageClient import load_file  # used for local JSON if present
+from utils.storageClient import load_file, save_file  # used for JSON (local or remote)
 
 
 def admin_check():
@@ -23,7 +24,86 @@ def admin_check():
     return app_commands.check(lambda i: pred(i))
 
 
-# ----------------------------- helpers ---------------------------------------
+# ============================= guardrail helpers =============================
+
+def _looks_base64(s: str) -> bool:
+    s = s.strip()
+    if not s:
+        return False
+    for ch in s:
+        if ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r\t ":
+            return False
+    return True
+
+
+def unwrap_links_json(obj: Any) -> Tuple[Any, bool, str]:
+    """
+    Robustly unwrap a links file that may be wrapped as:
+      {"data": "<base64-json>"}  or  {"data": "<raw json string>"}  or  {"data": {...}}
+    Returns (plain_obj, changed, reason).
+    Re-applies until fully unwrapped (handles accidental double-wraps).
+    """
+    changed_any = False
+    reason = "no wrapper"
+    seen = 0
+
+    while isinstance(obj, dict) and "data" in obj and len(obj) == 1 and seen < 3:
+        seen += 1
+        d = obj["data"]
+        # Already proper dict/list
+        if isinstance(d, (dict, list)):
+            obj = d
+            changed_any = True
+            reason = "unwrapped nested dict/list"
+            continue
+        # Try base64 → JSON
+        if isinstance(d, str) and _looks_base64(d):
+            try:
+                decoded = base64.b64decode(d, validate=True).decode("utf-8", "ignore")
+                obj = json.loads(decoded)
+                changed_any = True
+                reason = "unwrapped base64→JSON"
+                continue
+            except Exception:
+                # fall through to try raw JSON string
+                pass
+        # Try raw JSON string
+        if isinstance(d, str):
+            try:
+                obj = json.loads(d)
+                changed_any = True
+                reason = "unwrapped raw JSON string"
+                continue
+            except Exception:
+                # not decodable; stop
+                break
+        break
+
+    return obj, changed_any, reason
+
+
+def _maybe_decode_wrapped_base64(doc: dict) -> tuple[dict, str | None, str | None]:
+    """
+    If doc is {"data": "<base64-json>"} return (decoded_obj, 'data', decoded_text).
+    Otherwise return (doc, None, None).
+    (Kept for backwards-compat with the existing show embed logic.)
+    """
+    if isinstance(doc, dict) and "data" in doc and isinstance(doc["data"], str):
+        blob = doc["data"]
+        if _looks_base64(blob):
+            try:
+                raw = base64.b64decode(blob)
+                txt = raw.decode("utf-8", "ignore")
+                decoded = json.loads(txt)
+                if isinstance(decoded, dict):
+                    return decoded, "data", txt
+            except Exception:
+                pass
+    return doc, None, None
+
+
+# ----------------------------- I/O helpers -----------------------------------
+
 def _read_http_json_and_text(url: str, timeout: float = 8.0) -> tuple[dict, str]:
     """Fetch JSON from HTTP(S). Returns (parsed_dict, raw_text)."""
     req = Request(url, headers={"User-Agent": "SV-Bounties/links-check"})
@@ -93,39 +173,13 @@ def _preview_json(doc: dict, raw_text: str | None, max_chars: int = 900) -> str:
     return _preview_text(text, max_chars)
 
 
-def _looks_base64(s: str) -> bool:
-    s = s.strip()
-    if not s:
-        return False
-    for ch in s:
-        if ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r\t ":
-            return False
-    return True
-
-
-def _maybe_decode_wrapped_base64(doc: dict) -> tuple[dict, str | None, str | None]:
-    """
-    If doc is {"data": "<base64-json>"} return (decoded_obj, 'data', decoded_text).
-    Otherwise return (doc, None, None).
-    """
-    if isinstance(doc, dict) and "data" in doc and isinstance(doc["data"], str):
-        blob = doc["data"]
-        if _looks_base64(blob):
-            try:
-                raw = base64.b64decode(blob)
-                txt = raw.decode("utf-8", "ignore")
-                decoded = json.loads(txt)
-                if isinstance(decoded, dict):
-                    return decoded, "data", txt
-            except Exception:
-                pass
-    return doc, None, None
-# -----------------------------------------------------------------------------
-
+# ============================================================================
 
 class AdminLinks(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+
+    # ---- Settings controls ---------------------------------------------------
 
     @app_commands.command(
         name="setexternallinks",
@@ -170,7 +224,8 @@ class AdminLinks(commands.Cog):
             ephemeral=True
         )
 
-    # ------------------- diagnostics: show current source & snapshot ----------
+    # ---- Diagnostics: show current source & snapshot -------------------------
+
     @app_commands.command(
         name="showlinks",
         description="Show which linked_players source is used, verify it loads, and include a snapshot."
@@ -206,13 +261,18 @@ class AdminLinks(commands.Cog):
         if chosen == "external" and external_present:
             src_used = f"external:{external_path}"
             try:
-                if external_is_url:
-                    data, raw_text = _read_http_json_and_text(external_path)
+                # Prefer our storageClient loader; if that returns non-dict for URL, fallback to HTTP fetch
+                data = load_file(external_path)
+                if not isinstance(data, dict):
+                    if external_is_url:
+                        data, raw_text = _read_http_json_and_text(external_path)
+                    else:
+                        ok, det, doc, raw = _try_local_json_and_text(external_path)
+                        if not ok or not isinstance(doc, dict):
+                            raise ValueError(det or "failed to read local external path")
+                        data, raw_text = doc, raw or json.dumps(doc, ensure_ascii=False)
                 else:
-                    ok, det, doc, raw = _try_local_json_and_text(external_path)
-                    if not ok or not isinstance(doc, dict):
-                        raise ValueError(det or "failed to read local external path")
-                    data, raw_text = doc, raw or json.dumps(doc, ensure_ascii=False)
+                    raw_text = json.dumps(data, ensure_ascii=False, indent=2)
 
                 if not isinstance(data, dict):
                     raise ValueError("top-level JSON is not an object")
@@ -221,12 +281,13 @@ class AdminLinks(commands.Cog):
                 content_hash_raw = _content_hash(raw_text)
                 top_keys = ", ".join(list(data.keys())[:10]) or "—"
 
-                # auto-decode {"data": "<base64-json>"} if present
-                decoded_obj, decoded_from, decoded_text = _maybe_decode_wrapped_base64(data)
-                if decoded_from is not None:
-                    # prefer decoded view for size/snapshot
-                    data = decoded_obj
+                # prefer fully unwrapped view for size/snapshot
+                unwrapped, changed, _ = unwrap_links_json(data)
+                if changed:
+                    decoded_from = "data"
+                    decoded_text = json.dumps(unwrapped, ensure_ascii=False, indent=2)
                     content_hash_decoded = _content_hash(decoded_text)
+                    data = unwrapped
 
                 load_ok = True
                 size_hint = _size_hint(data)
@@ -251,11 +312,13 @@ class AdminLinks(commands.Cog):
                     # raw view
                     content_hash_raw = _content_hash(raw or json.dumps(doc, ensure_ascii=False))
                     top_keys = ", ".join(list(doc.keys())[:10]) or "—"
-                    # maybe decode
-                    decoded_obj, decoded_from, decoded_text = _maybe_decode_wrapped_base64(doc)
-                    if decoded_from is not None:
-                        doc = decoded_obj
+                    # unwrapped view
+                    unwrapped, changed, _ = unwrap_links_json(doc)
+                    if changed:
+                        decoded_from = "data"
+                        decoded_text = json.dumps(unwrapped, ensure_ascii=False, indent=2)
                         content_hash_decoded = _content_hash(decoded_text)
+                        doc = unwrapped
                     data = doc
                     load_ok = True
                     detail = det
@@ -293,7 +356,109 @@ class AdminLinks(commands.Cog):
             embed.set_footer(text=f"size_hint={size_hint} • type={type(data).__name__}")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
-    # -------------------------------------------------------------------------
+
+    # ---- Normalizer: fix wrapped files in-place ------------------------------
+
+    links = app_commands.Group(name="links", description="Manage linked players file")
+
+    async def _normalize_impl(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        gid = interaction.guild_id
+        st = load_settings(gid) or {}
+        prefer_external = bool(st.get("prefer_external_links", True))
+        disable_local = bool(st.get("disable_local_link", False))
+        external_path = (st.get("external_links_path") or "").strip()
+
+        # Choose path roughly the same way showlinks selects a source
+        external_present = bool(external_path)
+        use_external_first = prefer_external or disable_local
+
+        chosen_path = None
+        if use_external_first and external_present:
+            chosen_path = external_path
+        elif not disable_local:
+            # fallbacks
+            for p in ("settings/linked_players.json", "data/linked_players.json"):
+                if os.path.isfile(p):
+                    chosen_path = p
+                    break
+            if not chosen_path:
+                # Still normalize whatever path might exist locally even if not a real file yet
+                chosen_path = "data/linked_players.json"
+
+        if not chosen_path:
+            await interaction.followup.send("❌ Could not resolve a path to normalize.", ephemeral=True)
+            return
+
+        # Load current content
+        # Use storageClient first so it works for remote persistent paths as well.
+        raw_obj = load_file(chosen_path, default=None)
+        raw_text = None
+        if isinstance(raw_obj, dict):
+            raw_text = json.dumps(raw_obj, ensure_ascii=False, indent=2)
+            doc = raw_obj
+        else:
+            # try local/http helpers
+            if chosen_path.lower().startswith(("http://", "https://")):
+                doc, raw_text = _read_http_json_and_text(chosen_path)
+            else:
+                ok, det, doc0, raw0 = _try_local_json_and_text(chosen_path)
+                if not ok or not isinstance(doc0, dict):
+                    await interaction.followup.send(f"❌ Load failed: {det}", ephemeral=True)
+                    return
+                doc, raw_text = doc0, raw0 or json.dumps(doc0, ensure_ascii=False)
+
+        # Unwrap
+        fixed, changed, reason = unwrap_links_json(doc)
+
+        # Stats
+        def _count(v: Any) -> int:
+            if isinstance(v, dict):
+                return len(v)
+            if isinstance(v, list):
+                return len(v)
+            return 0
+
+        before_n = _count(doc)
+        after_n = _count(fixed)
+
+        if changed:
+            # Save back as plain JSON (no wrapper)
+            save_file(chosen_path, fixed, indent=2)
+            title = "✅ Normalized linked_players.json"
+            color = 0x2ecc71
+        else:
+            title = "ℹ️ Nothing to change"
+            color = 0x3498db
+
+        # Preview keys
+        keys_preview = ""
+        if isinstance(fixed, dict):
+            keys = list(fixed.keys())[:5]
+            keys_preview = ", ".join(keys) + ("…" if len(fixed) > 5 else "")
+        elif isinstance(fixed, list):
+            keys_preview = f"{min(5, len(fixed))} items previewed"
+
+        emb = discord.Embed(title=title, color=color)
+        emb.add_field(name="Resolved path", value=f"```{chosen_path}```", inline=False)
+        emb.add_field(name="Result", value=reason, inline=False)
+        emb.add_field(name="Counts", value=f"Before: **{before_n}** · After: **{after_n}**", inline=False)
+        if keys_preview:
+            emb.add_field(name="Preview", value=f"```{keys_preview}```", inline=False)
+
+        await interaction.followup.send(embed=emb, ephemeral=True)
+
+    @links.command(name="normalize", description="Normalize linked_players.json to plain JSON")
+    @admin_check()
+    async def links_normalize(self, interaction: discord.Interaction):
+        await self._normalize_impl(interaction)
+
+    # Alias for folks who prefer a top-level command
+    @app_commands.command(name="linksnormalize", description="(Alias) Normalize linked_players.json to plain JSON")
+    @admin_check()
+    async def linksnormalize(self, interaction: discord.Interaction):
+        await self._normalize_impl(interaction)
 
 
 async def setup(bot: commands.Bot):
