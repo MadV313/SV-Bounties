@@ -2,12 +2,15 @@
 import asyncio
 import io
 import logging
+import os
 import re
 from collections import deque
 from hashlib import blake2b
 from ftplib import FTP, error_perm
 from datetime import datetime, timezone
 from typing import Callable, Awaitable, Optional, List, Tuple, Dict, Any
+
+import requests  # <-- used only if Nitrado API keys are provided
 
 from utils.ftp_config import get_ftp_config
 from tracer.adm_state import get_guild_state, set_guild_state
@@ -95,7 +98,7 @@ def _ftp_list_names(ftp: FTP, directory: str) -> list[str]:
     ftp.retrlines("NLST", names.append)
     return names
 
-# --- NEW: LIST fallback ------------------------------------------------------
+# --- LIST fallback -----------------------------------------------------------
 def _ftp_list_via_LIST(ftp: FTP, directory: str) -> list[str]:
     """
     Fallback: parse plain LIST lines to get filenames.
@@ -106,7 +109,6 @@ def _ftp_list_via_LIST(ftp: FTP, directory: str) -> list[str]:
     ftp.retrlines("LIST", raw.append)
     names: list[str] = []
     for ln in raw:
-        # Typical: "-rw-r--r--   1 0 0   12345 Sep  6 09:03 DayZServer_X1_x64_2025-09-06_09-03-04.ADM"
         parts = ln.split()
         if not parts:
             continue
@@ -114,7 +116,7 @@ def _ftp_list_via_LIST(ftp: FTP, directory: str) -> list[str]:
         if name and name not in (".", ".."):
             names.append(name)
     return names
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def _pick_latest_by_name(names: list[str]) -> Optional[str]:
     adms = [n for n in names if n.lower().endswith(".adm")]
@@ -190,7 +192,7 @@ def _ftp_mdtm(ftp: FTP, filename: str) -> Optional[str]:
     return None
 
 
-# ==================== NEW: robust directory scan ====================
+# ==================== Robust directory scan (FTP) ====================
 def _list_adm_files(ftp: FTP) -> List[Tuple[str, int, Optional[datetime]]]:
     """
     Return (name, size, mtime) for each *.ADM in the CWD.
@@ -272,6 +274,59 @@ def _choose_latest_adm(files: List[Tuple[str, int, Optional[datetime]]]) -> Tupl
     return name, size, mtime
 # ===================================================================
 
+# =================== Nitrado API discovery (optional) ===================
+def _nitrado_api_get_latest(cfg: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (filename, download_url) for the newest ADM via Nitrado HTTP API.
+    Uses either cfg[...] or environment variables:
+      - nitrado_api_token / NITRADO_API_TOKEN
+      - nitrado_service_id / NITRADO_SERVICE_ID
+      - nitrado_log_folder_prefix / NITRADO_LOG_DIR
+    If anything is missing, returns (None, None).
+    """
+    token = (cfg.get("nitrado_api_token")
+             or os.getenv("NITRADO_API_TOKEN"))
+    service_id = (cfg.get("nitrado_service_id")
+                  or os.getenv("NITRADO_SERVICE_ID"))
+    dir_path = (cfg.get("nitrado_log_folder_prefix")
+                or os.getenv("NITRADO_LOG_DIR"))
+
+    if not token or not service_id or not dir_path:
+        return (None, None)
+
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        list_url = f"https://api.nitrado.net/services/{service_id}/gameservers/file_server/list"
+        r = requests.get(list_url, headers=headers, params={"dir": dir_path}, timeout=10)
+        if r.status_code != 200:
+            logger.info(f"[NitradoAPI] list failed HTTP {r.status_code}")
+            return (None, None)
+        entries = r.json().get("data", {}).get("entries", []) or []
+        adm = [e for e in entries if str(e.get("name","")).lower().endswith(".adm")]
+        if not adm:
+            logger.info("[NitradoAPI] no ADM entries in listing")
+            return (None, None)
+        # newest by filename timestamp
+        def _dt(e):
+            return _parse_name_ts(e.get("name","")) or datetime.min.replace(tzinfo=timezone.utc)
+        latest = max(adm, key=_dt)
+        fname = latest.get("name")
+        # fetch download token
+        down_url = f"https://api.nitrado.net/services/{service_id}/gameservers/file_server/download"
+        r2 = requests.get(down_url, headers=headers,
+                          params={"file": f"{dir_path.rstrip('/')}/{fname}"}, timeout=10)
+        if r2.status_code != 200:
+            logger.info(f"[NitradoAPI] download token failed HTTP {r2.status_code}")
+            return (None, None)
+        url = r2.json().get("data", {}).get("token", {}).get("url")
+        if not url:
+            return (None, None)
+        return (fname, url)
+    except Exception as e:
+        logger.info(f"[NitradoAPI] error: {e}")
+        return (None, None)
+# =====================================================================
+
 
 async def _to_thread(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
@@ -286,7 +341,9 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
     - Bounded full-file fallback when REST fails (<= 512 KiB)
     - Heartbeat diagnostics (size/mdtm/offset)
     - Last-line hashed print every tick
-    - NEW: unified listing (MLSD ∪ NLST ∪ LIST) + candidate logging
+    - Unified FTP listing (MLSD ∪ NLST ∪ LIST) + candidate logging
+    - **NEW**: Nitrado API discovery of the newest ADM (active file), with HTTP
+               download fallback when FTP cannot read it.
     """
     cfg = get_ftp_config(guild_id)
     if not cfg:
@@ -382,7 +439,11 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
             except Exception:
                 raw_list = []
 
-            if not files:
+            # ===== API discovery (optional). If available and newer, prefer it.
+            api_name, api_download_url = await _to_thread(_nitrado_api_get_latest, cfg)
+            api_dt = _parse_name_ts(api_name or "") if api_name else None
+
+            if not files and not api_name:
                 logger.debug(f"[Guild {guild_id}] No .ADM files found; PWD={pwd_now}")
                 logger.info(f"[Guild {guild_id}] NLST sample: {raw_nlst[:20]}")
                 logger.info(f"[Guild {guild_id}] LIST sample: {raw_list[:20]}")
@@ -392,28 +453,62 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 await asyncio.sleep(interval)
                 continue
 
-            latest_name, latest_size_guess, latest_mtime = _choose_latest_adm(files)
+            latest_name, latest_size_guess, latest_mtime = (None, 0, None)
+            if files:
+                latest_name, latest_size_guess, latest_mtime = _choose_latest_adm(files)
+
+            # Compare FTP newest vs API newest
+            chosen_name = latest_name
+            chosen_mtime = latest_mtime
+            chosen_api_url = None
+
+            if api_name:
+                if not chosen_name:
+                    chosen_name = api_name
+                    chosen_mtime = api_dt
+                    chosen_api_url = api_download_url
+                else:
+                    # pick newer by timestamp
+                    ftp_dt = chosen_mtime or _parse_name_ts(chosen_name) or datetime.min.replace(tzinfo=timezone.utc)
+                    if api_dt and api_dt > ftp_dt:
+                        logger.info(
+                            f"[Guild {guild_id}] API discovered newer ADM: {api_name} "
+                            f"(API {api_dt.isoformat()} > FTP {ftp_dt.isoformat()})"
+                        )
+                        chosen_name = api_name
+                        chosen_mtime = api_dt
+                        chosen_api_url = api_download_url
 
             # Candidate table (old→new, last few entries)
-            pretty = [
-                {
-                    "name": n,
-                    "size": s,
-                    "mtime": (mt.isoformat() if mt else None),
-                }
-                for n, s, mt in sorted(files, key=lambda r: (r[2] or _parse_name_ts(r[0]) or datetime.min))
-            ]
-            logger.info(f"[Guild {guild_id}] PWD={pwd_now}")
-            logger.info(f"[Guild {guild_id}] ADM candidates (old→new): {pretty[-6:]}")
-            logger.debug(f"[Guild {guild_id}] NLST raw (trim): {raw_nlst[-10:]}")
-            logger.debug(f"[Guild {guild_id}] LIST raw (trim): {raw_list[-10:]}")
+            if files:
+                pretty = [
+                    {
+                        "name": n,
+                        "size": s,
+                        "mtime": (mt.isoformat() if mt else None),
+                    }
+                    for n, s, mt in sorted(files, key=lambda r: (r[2] or _parse_name_ts(r[0]) or datetime.min))
+                ]
+                logger.info(f"[Guild {guild_id}] PWD={pwd_now}")
+                logger.info(f"[Guild {guild_id}] ADM candidates (old→new): {pretty[-6:]}")
+                logger.debug(f"[Guild {guild_id}] NLST raw (trim): {raw_nlst[-10:]}")
+                logger.debug(f"[Guild {guild_id}] LIST raw (trim): {raw_list[-10:]}")
+
+            if api_name:
+                logger.info(f"[Guild {guild_id}] API latest hint: {api_name}")
+
+            # Nothing chosen? Bail.
+            if not chosen_name:
+                await _to_thread(ftp.quit)
+                await asyncio.sleep(interval)
+                continue
 
             # Switch if changed
-            if latest_file != latest_name:
+            if latest_file != chosen_name:
                 logger.info(
-                    f"[Guild {guild_id}] Switching ADM {latest_file or '<none>'} → {latest_name}"
+                    f"[Guild {guild_id}] Switching ADM {latest_file or '<none>'} → {chosen_name}"
                 )
-                latest_file = latest_name
+                latest_file = chosen_name
                 offset = 0
                 set_guild_state(guild_id, latest_file=latest_file, offset=offset)
 
@@ -432,40 +527,37 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 f"[Guild {guild_id}] HEARTBEAT: file={latest_file} size={size} mdtm={mdtm} offset={offset}"
             )
 
-            # Extra guard: if another file is strictly newer than our current MDTM, switch now
+            # Try ranged read via FTP
+            ftp_failed = False
             try:
-                current_dt = None
-                if mdtm and len(mdtm) >= 14:
-                    current_dt = datetime.strptime(mdtm[:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-                else:
-                    current_dt = _parse_name_ts(latest_file or "")
-            except Exception:
-                current_dt = _parse_name_ts(latest_file or "")
+                blob: bytes = await _to_thread(_ftp_read_range_in_cwd, ftp, latest_file, offset)
+            except Exception as e:
+                ftp_failed = True
+                logger.info(f"[Guild {guild_id}] FTP RETR failed for {latest_file}: {e}")
+                blob = b""
 
-            if latest_mtime and current_dt and latest_mtime > current_dt and latest_name != latest_file:
-                logger.info(
-                    f"[Guild {guild_id}] Detected newer ADM on server "
-                    f"({latest_name} @ {latest_mtime.isoformat()}) > "
-                    f"({latest_file} @ {current_dt.isoformat()}); forcing switch."
-                )
-                latest_file = latest_name
-                offset = 0
-                set_guild_state(guild_id, latest_file=latest_file, offset=offset)
-                # refresh size for new file
-                size = await _to_thread(_ftp_size, ftp, latest_file)
-
-            # Try ranged read
-            blob: bytes = await _to_thread(_ftp_read_range_in_cwd, ftp, latest_file, offset)
-
-            # If no data but file grew, do a bounded full-file fallback (<= 512 KiB)
+            # If no data from FTP, consider HTTP download fallback (API)
             full_fetch_used = False
-            if not blob and size is not None and size > offset and size <= 512_000:
-                logger.info(
-                    f"[Guild {guild_id}] Range read empty but file grew (size={size} > offset={offset}); "
-                    "attempting bounded full-file fetch."
-                )
-                blob = await _to_thread(_ftp_read_all_in_cwd, ftp, latest_file)
-                full_fetch_used = True
+            http_size = None
+            if (not blob) and chosen_api_url:
+                try:
+                    r = await _to_thread(requests.get, chosen_api_url, )
+                    if r.status_code == 200 and r.content is not None:
+                        http_bytes = r.content
+                        http_size = len(http_bytes)
+                        # Only process new tail (prev offset .. end)
+                        data_to_process = http_bytes[offset:] if offset < http_size else b""
+                        blob = data_to_process
+                        full_fetch_used = True
+                        size = http_size  # for logging/offset update below
+                        logger.info(
+                            f"[Guild {guild_id}] HTTP fallback used for {latest_file} "
+                            f"(downloaded {http_size} bytes, tail={len(blob)} from offset {offset})."
+                        )
+                    else:
+                        logger.info(f"[Guild {guild_id}] HTTP fallback failed HTTP {r.status_code}")
+                except Exception as e:
+                    logger.info(f"[Guild {guild_id}] HTTP fallback error: {e}")
 
             await _to_thread(ftp.quit)
 
@@ -476,13 +568,11 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
             else:
                 prev_offset = offset
 
-                # If we did a full-file fetch and know the size, only process the new tail
-                data_to_process = blob
-                if full_fetch_used and size is not None:
-                    if prev_offset < size and prev_offset < len(blob):
-                        data_to_process = blob[prev_offset:]
-                    offset = size
+                # If we did an HTTP full-file fetch, offset should become http_size
+                if full_fetch_used and http_size is not None:
+                    offset = http_size
                 else:
+                    # Standard FTP increment (we fetched from 'offset' to EOF)
                     offset += len(blob)
 
                 set_guild_state(guild_id, latest_file=latest_file, offset=offset)
@@ -490,7 +580,7 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                     f"[Guild {guild_id}] Read {len(blob)} bytes from {latest_file} (prev_offset={prev_offset} -> {offset})."
                 )
 
-                text = data_to_process.decode("utf-8", errors="ignore")
+                text = blob.decode("utf-8", errors="ignore")
                 now = datetime.now(timezone.utc)
 
                 for idx, line in enumerate(text.splitlines()):
