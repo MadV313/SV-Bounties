@@ -3,7 +3,7 @@ import os, time, asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Any, List
 from collections import defaultdict, deque
 
 from utils.storageClient import load_file, save_file  # your existing helpers
@@ -24,13 +24,14 @@ def _norm_map(s: Optional[str]) -> Optional[str]:
 def _pretty_ts(dt: datetime) -> str:
     return dt.isoformat().replace("+00:00", "Z")
 
+def _short_id(pid: str) -> str:
+    return pid.split("-", 1)[-1] if "-" in pid else pid
+
 # -----------------------------------------------------------------------------
 # Logging throttling (reduce spam without losing data)
 # -----------------------------------------------------------------------------
-# How often (in seconds) we allow an INFO "append" log per player
-THROTTLE_APPEND_SECS = 5.0
-# How often we allow an INFO "indexed new player" log for the same tag
-THROTTLE_INDEX_SECS = 30.0
+THROTTLE_APPEND_SECS = 5.0   # How often (in seconds) we allow an INFO "append" log per player
+THROTTLE_INDEX_SECS  = 30.0  # How often we allow an INFO "indexed new player" log for the same tag
 
 _last_log_ts: Dict[str, float] = {}
 
@@ -204,6 +205,39 @@ def _flush_maybe(force: bool = False) -> None:
 # =============================================================================
 
 
+# =============================================================================
+# Live, in-memory snapshot per guild (for instant /showtracked)
+# =============================================================================
+# guild_id -> pid -> last row
+_live_by_guild: Dict[int, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+
+def _update_live(guild_id: int | None, pid: str, canonical: str, point: Dict[str, Any]) -> None:
+    """Keep an up-to-date, per-guild latest position for /showtracked."""
+    if guild_id is None:
+        return
+    ts_val = point.get("ts")
+    if isinstance(ts_val, str):
+        try:
+            ts_dt = datetime.fromisoformat(ts_val.replace("Z", "+00:00"))
+        except Exception:
+            ts_dt = datetime.now(timezone.utc)
+    elif isinstance(ts_val, datetime):
+        ts_dt = ts_val
+    else:
+        ts_dt = datetime.now(timezone.utc)
+
+    _live_by_guild[guild_id][pid] = {
+        "short_id": _short_id(pid),
+        "name": canonical,
+        "x": float(point.get("x", 0.0)),
+        "z": float(point.get("z", 0.0)),
+        "y": float(point.get("y", 0.0)),
+        "ts": ts_dt,
+        "map": point.get("map"),
+    }
+# =============================================================================
+
+
 def append_point(
     gamertag: str,
     x: float,
@@ -228,7 +262,7 @@ def append_point(
         "y": y,
         "z": z,
         "source": source,
-        "map": map_norm,        # harmless if readers ignore it
+        "map": map_norm,        # kept on disk; show_tracked can filter with it
         "gamertag": canonical,  # dropped on flush, used for logging
     }
 
@@ -239,6 +273,8 @@ def append_point(
     if q:
         if (q[-1].get("x"), q[-1].get("z")) == (x, z):
             logger.debug(f"[{canonical}] Duplicate adjacent point ignored at ({x},{z}) from {source}")
+            # still update live so /showtracked reflects current heartbeat
+            _update_live(guild_id, pid, canonical, point)
             return
     else:
         # Buffer empty: peek last saved point to avoid immediate duplicates
@@ -248,6 +284,7 @@ def append_point(
             last = doc["points"][-1]
             if (last.get("x"), last.get("z")) == (x, z):
                 logger.debug(f"[{canonical}] Duplicate (vs saved) point ignored at ({x},{z}) from {source}")
+                _update_live(guild_id, pid, canonical, point)
                 return
 
     # Queue and maybe flush
@@ -259,6 +296,9 @@ def append_point(
     else:
         logger.debug(f"Track append (throttled) [{canonical}] ({x},{z}) buf={len(q)} map={map_norm}")
 
+    # Update live snapshot immediately
+    _update_live(guild_id, pid, canonical, point)
+
     # Flush rules: per-player size threshold OR global interval
     if len(q) >= _MAX_BUFFER_POINTS:
         _flush_pid(pid, doc_gamertag_fallback=canonical)
@@ -269,7 +309,7 @@ def append_point(
         asyncio.get_running_loop().create_task(_notify_point(guild_id, canonical, dict(point)))
         logger.debug(f"Notified subscribers for [{canonical}] @ ({x},{z})")
     except RuntimeError:
-        # No running loop: best-effort synchronous call
+        # No running event loop; best-effort synchronous call
         logger.warning("No running event loop; notifying subscribers synchronously.")
         try:
             asyncio.run(_notify_point(guild_id, canonical, dict(point)))
@@ -338,3 +378,57 @@ def load_track(
 
     logger.info(f"[tracker.load] Loaded track for {doc.get('gamertag')} with {len(pts)} point(s) (query='{player_query}', norm='{q_norm}')")
     return pid, {**doc, "points": pts}
+
+
+# =============================================================================
+# Snapshot for /showtracked (uses live data; falls back to disk)
+# =============================================================================
+def get_guild_snapshot(guild_id: int) -> List[Dict[str, Any]]:
+    """
+    Returns a list of rows: {short_id, name, x, z, y?, ts(datetime), map?}
+    Priority is in-memory live points (instant). If none exist,
+    we flush buffers and build a snapshot from on-disk tracks (last point per player).
+    """
+    # Always flush any stale buffers so disk fallback is fresh
+    _flush_maybe(force=True)
+
+    live_map = _live_by_guild.get(guild_id) or {}
+    if live_map:
+        rows = list(live_map.values())
+        # sort by name then ts for stable output
+        rows.sort(key=lambda r: (str(r.get("name") or r.get("short_id")), str(r.get("ts") or "")))
+        logger.debug(f"snapshot(live): guild={guild_id} rows={len(rows)}")
+        return rows
+
+    # Fallback: build from disk (latest point per file)
+    rows: List[Dict[str, Any]] = []
+    try:
+        for p in _TRACKS_DIR_PATH.glob("*.json"):
+            try:
+                doc = load_file(str(p)) or {}
+                pts = doc.get("points") or []
+                if not pts:
+                    continue
+                last = pts[-1]
+                ts = last.get("ts")
+                try:
+                    ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) if isinstance(ts, str) else ts
+                except Exception:
+                    ts_dt = None
+                rows.append({
+                    "short_id": _short_id(doc.get("player_id") or p.stem),
+                    "name": doc.get("gamertag") or (doc.get("player_id") or p.stem),
+                    "x": float(last.get("x", 0.0)),
+                    "z": float(last.get("z", 0.0)),
+                    "y": float(last.get("y", 0.0)),
+                    "ts": ts_dt,
+                    "map": last.get("map"),
+                })
+            except Exception as e:
+                logger.debug(f"snapshot(disk): skip {p.name}: {e}")
+    except Exception as e:
+        logger.error(f"snapshot(disk) failed to enumerate: {e}", exc_info=True)
+
+    rows.sort(key=lambda r: (str(r.get("name") or r.get("short_id")), str(r.get("ts") or "")))
+    logger.debug(f"snapshot(disk): guild={guild_id} rows={len(rows)}")
+    return rows
