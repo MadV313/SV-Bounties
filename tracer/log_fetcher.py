@@ -4,6 +4,7 @@ import io
 import logging
 import re
 from collections import deque
+from hashlib import blake2b
 from ftplib import FTP, error_perm
 from datetime import datetime, timezone
 from typing import Callable, Awaitable, Optional
@@ -17,15 +18,16 @@ logger = logging.getLogger(__name__)
 LineCallback = Callable[[int, str, str, datetime], Awaitable[None]]
 # signature: (guild_id, line, source_ref, timestamp)
 
-# --- HASH DE-DUPE SETTINGS (Radar-style) -------------------------------------
-# Keep small rolling set of line fingerprints so we never miss a few lines
-# even if FTP size/offset logic gets flaky.
-MAX_SEEN_HASHES = 4000
+# --- HASH DE-DUPE (Radar-style) ---------------------------------------------
+# Rolling set of recent line fingerprints so “bursty” additions are never missed
+# even if FTP size/offset behavior glitches.
+MAX_SEEN_HASHES = 4000  # ~the last few thousand lines is plenty
 
 def _line_fingerprint(s: str) -> int:
-    # fast & stable enough for short-term de-dupe across a session
-    # strip trailing whitespace to be robust to \r\n vs \n
-    return hash(s.rstrip())
+    # Stable, fast 64-bit fingerprint; ignore trailing whitespace to be robust
+    # to \r\n vs \n and minor EOL differences.
+    h = blake2b(s.rstrip().encode("utf-8", "ignore"), digest_size=8)
+    return int.from_bytes(h.digest(), "big")
 # -----------------------------------------------------------------------------
 
 
@@ -95,7 +97,7 @@ def _pick_latest_by_name(names: list[str]) -> Optional[str]:
     parsed = [(n, _parse_name_ts(n)) for n in adms]
     parsed = [(n, ts) for n, ts in parsed if ts is not None]
     if parsed:
-        parsed.sort(key=lambda x: x[1])
+        parsed.sort(key=lambda x: x[1])  # ascending by timestamp
         return parsed[-1][0]
     adms.sort()
     return adms[-1]
@@ -113,7 +115,6 @@ def _ftp_read_range_in_cwd(ftp: FTP, filename: str, start: int) -> bytes:
     Retries once if the server rejects REST due to ASCII mode.
     """
     bio = io.BytesIO()
-
     _ensure_binary(ftp)
 
     if start > 0:
@@ -127,7 +128,7 @@ def _ftp_read_range_in_cwd(ftp: FTP, filename: str, start: int) -> bytes:
                     _ensure_binary(ftp)
                     ftp.sendcmd(f"REST {start}")
                 except Exception:
-                    # Give up and signal caller (they may try full fetch fallback)
+                    # Signal caller; they may try bounded full-file fallback
                     return b""
             else:
                 raise
@@ -169,8 +170,11 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
     """
     Poll FTP for a single guild. Reads new bytes since last offset; if a newer
     ADM file appears, automatically switches to it.
-    Now includes a Radar-style line-hash de-dupe so we never miss short updates
-    even when REST/SIZE are unreliable, plus a bounded full-file fallback.
+
+    Improvements:
+    - Radar-style line-hash de-dupe (never miss short bursts; skip replays)
+    - Bounded full-file fallback when REST fails (<= 512 KiB)
+    - Heartbeat diagnostics (size/mdtm/offset)
     """
     cfg = get_ftp_config(guild_id)
     if not cfg:
@@ -217,11 +221,11 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
             except Exception:
                 pass
 
-            # Always try to enter the configured directory
+            # Enter the configured directory
             try:
                 await _to_thread(ftp.cwd, directory)
             except Exception as e:
-                # Heartbeat when CWD fails: show root PWD + a root NLST
+                # Diagnostics when CWD fails
                 try:
                     pwd = await _to_thread(ftp.pwd)
                 except Exception:
@@ -251,14 +255,14 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 await asyncio.sleep(interval)
                 continue
 
-            # If we switched files or current offset is past end, reset offset
+            # If we switched files or current offset is past end, reset
             if latest_file != candidate:
                 logger.info(f"[Guild {guild_id}] Switching to new ADM file {candidate}")
                 latest_file = candidate
                 offset = 0
                 set_guild_state(guild_id, latest_file=latest_file, offset=offset)
 
-            # Gather some heartbeat stats
+            # Heartbeat stats
             size = await _to_thread(_ftp_size, ftp, latest_file)
             mdtm = await _to_thread(_ftp_mdtm, ftp, latest_file)
             try:
@@ -266,7 +270,6 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
             except Exception:
                 pwd_now = "(unknown)"
 
-            # If saved offset > current file size, the file rolled/shrank -> reset
             if size is not None and offset > size:
                 logger.info(
                     f"[Guild {guild_id}] Offset {offset} > size {size} for {latest_file}; resetting to 0 (rollover)."
@@ -278,17 +281,18 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 f"[Guild {guild_id}] HEARTBEAT: PWD={pwd_now} file={latest_file} size={size} mdtm={mdtm} offset={offset}"
             )
 
-            # Try reading only the new range
+            # Try ranged read
             blob: bytes = await _to_thread(_ftp_read_range_in_cwd, ftp, latest_file, offset)
 
-            # If no range data but size suggests growth, consider a full-file fallback
-            # (bounded to avoid huge downloads). This solves "REST not allowed" stalling.
+            # If no data but file grew, do a bounded full-file fallback (<= 512 KiB)
+            full_fetch_used = False
             if not blob and size is not None and size > offset and size <= 512_000:
                 logger.info(
                     f"[Guild {guild_id}] Range read empty but file grew (size={size} > offset={offset}); "
                     "attempting bounded full-file fetch."
                 )
                 blob = await _to_thread(_ftp_read_all_in_cwd, ftp, latest_file)
+                full_fetch_used = True
 
             await _to_thread(ftp.quit)
 
@@ -297,30 +301,33 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                     f"[Guild {guild_id}] No new bytes (file={latest_file} size={size} offset={offset}); waiting {interval}s."
                 )
             else:
-                text = blob.decode("utf-8", errors="ignore")
-                now = datetime.now(timezone.utc)
                 prev_offset = offset
 
-                # If we did a ranged read, advance by len(blob).
-                # If we fell back to full file, advance offset to end (size), if known.
-                if size is not None and len(blob) >= size:
-                    # full-file fetch case: consider we have the whole file
+                # If we did a full-file fetch and know the size, only process the new tail
+                data_to_process = blob
+                if full_fetch_used and size is not None:
+                    # Avoid reprocessing old content; rely on offset
+                    if prev_offset < size and prev_offset < len(blob):
+                        data_to_process = blob[prev_offset:]
+                    # Advance offset to the known end of file
                     offset = size
                 else:
-                    # ranged read or unknown size; increment by bytes read
+                    # Ranged read path: advance by the bytes read
                     offset += len(blob)
 
                 set_guild_state(guild_id, latest_file=latest_file, offset=offset)
-
                 logger.info(
                     f"[Guild {guild_id}] Read {len(blob)} bytes from {latest_file} (prev_offset={prev_offset} -> {offset})."
                 )
 
+                text = data_to_process.decode("utf-8", errors="ignore")
+                now = datetime.now(timezone.utc)
+
                 for idx, line in enumerate(text.splitlines()):
-                    # First de-dupe by recent hash buffer (Radar-style)
+                    # 1) radar-style recent-hash de-dupe
                     if not _remember_line(line):
                         continue
-                    # Then respect your existing line filter
+                    # 2) your existing acceptance filter
                     if buffer.accept(line):
                         source = f"ftp:{latest_file}#~{prev_offset}+{idx}"
                         await cb(guild_id, line, source, now)
