@@ -446,22 +446,26 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
             if files:
                 latest_name, latest_size_guess, latest_mtime = _choose_latest_adm(files)
 
-            # Compare FTP newest vs API newest (prefer API if newer OR equal)
-            chosen_name = latest_name
-            chosen_mtime = latest_mtime
+            # === CHOOSER: Prefer API newest whenever present ===
+            # Old behavior sometimes stuck to FTP "newest" even when API showed a newer active ADM.
+            # Here we *always* choose the API file if available; otherwise we fall back to FTP.
+            chosen_name = None
+            chosen_mtime = None
             chosen_api_url = None
-            api_dt = _parse_name_ts(api_name or "") if api_name else None
-            ftp_dt = latest_mtime or (_parse_name_ts(latest_name or "") if latest_name else None)
 
             if api_name:
-                if not chosen_name:
-                    chosen_name, chosen_mtime, chosen_api_url = api_name, api_dt, api_download_url
-                else:
-                    if api_dt and (ftp_dt is None or api_dt >= ftp_dt):
-                        logger.info(
-                            f"[Guild {guild_id}] Preferring API file (API {api_dt.isoformat()} >= FTP {ftp_dt.isoformat() if ftp_dt else 'None'})"
-                        )
-                        chosen_name, chosen_mtime, chosen_api_url = api_name, api_dt, api_download_url
+                chosen_name = api_name
+                chosen_mtime = _parse_name_ts(api_name)
+                chosen_api_url = api_download_url
+                logger.info(
+                    f"[Guild {guild_id}] Preferring API file '{api_name}' over FTP newest '{latest_name}'."
+                )
+            else:
+                chosen_name = latest_name
+                chosen_mtime = latest_mtime
+                logger.info(
+                    f"[Guild {guild_id}] No API file available; using FTP newest '{latest_name}'."
+                )
 
             # Candidate table (old→new, last few entries)
             if files:
@@ -481,8 +485,7 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
 
             logger.info(
                 f"[Guild {guild_id}] Chosen active file: {chosen_name} "
-                f"(FTP newest={latest_name} @ {ftp_dt.isoformat() if ftp_dt else 'None'}, "
-                f"API newest={api_name} @ {api_dt.isoformat() if api_dt else 'None'})"
+                f"(FTP newest={latest_name}, API newest={api_name})"
             )
 
             # Switch if changed
@@ -507,7 +510,7 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 f"[Guild {guild_id}] HEARTBEAT: file={latest_file} size={size} mdtm={mdtm} offset={offset}"
             )
 
-            # Try ranged read via FTP first (even if file wasn't listed)
+            # Try ranged read via FTP first (ok if chosen_name is the API file; FTP may still have it!)
             blob: bytes = b""
             try:
                 blob = await _to_thread(_ftp_read_range_in_cwd, ftp, latest_file, offset)
@@ -518,9 +521,9 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
             full_fetch_used = False
             http_size = None
             http_used = False
-            if (not blob) and (api_name and chosen_name == api_name) and (api_download_url):
+            if (not blob) and chosen_api_url:
                 try:
-                    r = await _to_thread(requests.get, api_download_url)
+                    r = await _to_thread(requests.get, chosen_api_url, )
                     if r.status_code == 200 and r.content is not None:
                         http_bytes = r.content
                         http_size = len(http_bytes)
