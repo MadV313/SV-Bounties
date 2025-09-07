@@ -174,7 +174,6 @@ def _draw_diamond(drw: ImageDraw.ImageDraw, p: Tuple[int, int], color: Tuple[int
 
 def _action_color(kind: str) -> Tuple[int, int, int, int]:
     k = (kind or "").lower()
-    # You can tweak these to your taste
     if "kill" in k or "death" in k or "shot" in k:
         return (66, 135, 245, 255)      # blue
     if "flag" in k or "raid" in k or "door" in k or "lock" in k:
@@ -433,7 +432,7 @@ class TraceCog(commands.Cog):
 
         _log(guild_id, "render complete", {"points_rendered": count, "actions": len(actions)})
 
-        file = discord.File(img_buf, filename=f"trace_{doc.get('gamertag','player')}.png")
+        map_file = discord.File(img_buf, filename=f"trace_{doc.get('gamertag','player')}.png")
 
         # ------- Caption + per-point clickable links ----------
         last = points[-1]
@@ -502,6 +501,8 @@ class TraceCog(commands.Cog):
 
         embeds: List[discord.Embed] = [points_embed]
 
+        # Build actions embed + snapshot text file (G Plot–style)
+        snapshot_lines: List[str] = []
         if actions:
             action_lines: List[str] = []
             for a in actions:
@@ -523,13 +524,57 @@ class TraceCog(commands.Cog):
                                       .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
                 except Exception:
                     pass
+
                 pretty = kind.capitalize()
                 text = f"• {pretty}: {link}{desc} {tss}".strip()
                 action_lines.append(text)
 
+                # Snapshot (monospace-ish) line
+                hhmmss = tss.split(" ")[0] if tss else "--:--:--"
+                coord_txt = ""
+                try:
+                    if x is not None and z is not None:
+                        coord_txt = f" ({float(x):.1f},{float(z):.1f})"
+                except Exception:
+                    coord_txt = ""
+                snapshot_lines.append(f"{hhmmss} | {pretty:<12} | {desc or '-'}{coord_txt}")
+
             actions_embed = discord.Embed(title=f"Actions snapshot ({len(actions)})")
             _add_chunked(actions_embed, "Actions", action_lines)
             embeds.append(actions_embed)
+
+        # Fallback snapshot if no actions available: list positions as POS
+        if not snapshot_lines:
+            for p in points:
+                tss = ""
+                try:
+                    ts_raw = p.get("ts")
+                    if ts_raw:
+                        tss = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
+                                      .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+                except Exception:
+                    pass
+                try:
+                    x, z = float(p.get("x", 0.0)), float(p.get("z", 0.0))
+                    coord_txt = f" ({x:.1f},{z:.1f})"
+                except Exception:
+                    coord_txt = ""
+                hhmmss = tss.split(" ")[0] if tss else "--:--:--"
+                snapshot_lines.append(f"{hhmmss} | {'POS':<12} | position update{coord_txt}")
+
+        # Build the txt attachment content
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        hdr = f"***** ADM Snapshot — {now_utc} *****\n"
+        if dt_start:
+            hdr += f"Range: {dt_start.isoformat()} .. {dt_end.isoformat()}\n"
+        else:
+            hdr += f"Range: last {window_hours}h\n"
+        hdr += f"Player: {doc.get('gamertag','player')}\n"
+        hdr += "----------------------------------------------\n"
+        snapshot_text = hdr + "\n".join(snapshot_lines) + "\n"
+
+        snapshot_buf = io.BytesIO(snapshot_text.encode("utf-8"))
+        snapshot_file = discord.File(snapshot_buf, filename="adm_snapshot.txt")
 
         # ----------- post to admin channel if set ------------
         settings = load_settings(guild_id) or {}
@@ -540,7 +585,7 @@ class TraceCog(commands.Cog):
             ch = interaction.client.get_channel(int(admin_ch_id))
             if isinstance(ch, discord.TextChannel):
                 try:
-                    await ch.send(content=caption, file=file, embeds=embeds)
+                    await ch.send(content=caption, files=[map_file, snapshot_file], embeds=embeds)
                     _log(guild_id, "posted to admin channel", {"channel": admin_ch_id})
                     return await interaction.followup.send(
                         f"📡 Posted trace in {ch.mention}.", ephemeral=True
@@ -549,7 +594,7 @@ class TraceCog(commands.Cog):
                     _log(guild_id, "failed posting to admin channel", {"error": repr(e)})
 
         # Fallback to replying in the invoking channel
-        await interaction.followup.send(caption, file=file, embeds=embeds)
+        await interaction.followup.send(caption, files=[map_file, snapshot_file], embeds=embeds)
 
 
 async def setup(bot: commands.Bot):
