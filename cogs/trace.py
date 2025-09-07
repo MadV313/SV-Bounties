@@ -4,7 +4,7 @@ from __future__ import annotations
 import io
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import discord
 from discord import app_commands
@@ -14,6 +14,12 @@ from PIL import Image, ImageDraw, ImageFont  # Pillow
 from utils.settings import load_settings
 from utils.linking import resolve_from_any
 from tracer.tracker import load_track
+
+# Optional: actions loader (if your tracker exposes it)
+try:
+    from tracer.tracker import load_actions  # type: ignore
+except Exception:  # pragma: no cover
+    load_actions = None  # we'll just skip if unavailable
 
 
 # ----------------------- tiny logger -----------------------
@@ -97,7 +103,6 @@ def _active_map_name(guild_id: int | None) -> str:
 
 def _izurvive_url(map_name: str, x: float, z: float) -> str:
     slug = MAP_SLUG.get(map_name.lower(), "livonia")
-    # iZurvive accepts decimals with a semicolon to jump to the exact location
     return f"https://www.izurvive.com/{slug}/#location={x:.2f};{z:.2f}"
 
 
@@ -160,11 +165,34 @@ def _draw_pin(drw: ImageDraw.ImageDraw, p: Tuple[int, int], color: Tuple[int, in
     drw.ellipse([x - 2, y - 2, x + 2, y + 2], fill=(0, 0, 0, 255))
 
 
-def _render_trace_png(doc: Dict[str, Any], guild_id: int | None) -> io.BytesIO:
+def _draw_diamond(drw: ImageDraw.ImageDraw, p: Tuple[int, int], color: Tuple[int, int, int, int], r: int = 7):
+    """Small diamond marker for actions."""
+    x, y = p
+    poly = [(x, y - r), (x + r, y), (x, y + r), (x - r, y)]
+    drw.polygon(poly, fill=color, outline=(0, 0, 0, 200))
+
+
+def _action_color(kind: str) -> Tuple[int, int, int, int]:
+    k = (kind or "").lower()
+    # You can tweak these to your taste
+    if "kill" in k or "death" in k or "shot" in k:
+        return (66, 135, 245, 255)      # blue
+    if "flag" in k or "raid" in k or "door" in k or "lock" in k:
+        return (186, 85, 211, 255)      # purple
+    if "connect" in k or "disconnect" in k:
+        return (160, 160, 160, 255)     # gray
+    return (255, 165, 0, 255)           # orange fallback
+
+
+def _render_trace_png(
+    doc: Dict[str, Any],
+    guild_id: int | None,
+    actions: Optional[List[Dict[str, Any]]] = None
+) -> io.BytesIO:
     """
-    Minimal, self-contained renderer (avoids old map_renderer dependency).
-    Draws the player's path with colored pins:
-      start = green, middle = yellow, end = red.
+    Self-contained renderer:
+      - draws path (start=green, middle=yellow, end=red)
+      - overlays action diamonds (colored by type) when actions supplied
     """
     map_name = _active_map_name(guild_id)
     world_size = _world_size_for(map_name)
@@ -186,13 +214,13 @@ def _render_trace_png(doc: Dict[str, Any], guild_id: int | None) -> io.BytesIO:
             x, z = float(p.get("x")), float(p.get("z"))
         except Exception:
             continue
-        # skip near-duplicates for cleaner path
+        # Skip near-duplicates for a cleaner path
         if last_xz and (round(x, 1), round(z, 1)) == (round(last_xz[0], 1), round(last_xz[1], 1)):
             continue
         pix.append(_world_to_image(x, z, world_size, W))
         last_xz = (x, z)
 
-    # polyline with subtle outline (black under, red over)
+    # polyline with subtle outline
     if len(pix) >= 2:
         try:
             drw.line(pix, fill=(0, 0, 0, 140), width=6)
@@ -200,14 +228,13 @@ def _render_trace_png(doc: Dict[str, Any], guild_id: int | None) -> io.BytesIO:
             pass
         drw.line(pix, fill=(255, 90, 90, 255), width=3)
 
-    # pins: start green, middle yellow, end red
+    # pins
     if pix:
         _draw_pin(drw, pix[0], (82, 200, 120, 255), r=9)     # start
         for p in pix[1:-1]:
-            _draw_pin(drw, p, (238, 210, 2, 255), r=7)      # middle
+            _draw_pin(drw, p, (238, 210, 2, 255), r=7)      # middles
         if len(pix) > 1:
             _draw_pin(drw, pix[-1], (255, 72, 72, 255), r=9)  # end
-            # label near end
             name = str(doc.get("gamertag") or "player")
             ex, ey = pix[-1]
             drw.text(
@@ -218,6 +245,17 @@ def _render_trace_png(doc: Dict[str, Any], guild_id: int | None) -> io.BytesIO:
                 stroke_width=2,
                 stroke_fill=(0, 0, 0, 255),
             )
+
+    # actions overlay
+    if actions:
+        for a in actions:
+            try:
+                x, z = float(a.get("x")), float(a.get("z"))
+            except Exception:
+                continue
+            px, py = _world_to_image(x, z, world_size, W)
+            color = _action_color(str(a.get("type") or a.get("kind") or "event"))
+            _draw_diamond(drw, (px, py), color, r=6)
 
     buf = io.BytesIO()
     base.save(buf, format="PNG")
@@ -369,9 +407,23 @@ class TraceCog(commands.Cog):
             points = pts
             count = len(points)
 
+        # -------------------- load actions --------------------
+        actions: List[Dict[str, Any]] = []
+        if load_actions is not None:
+            try:
+                # Your tracker can choose to respect start/end or window_hours.
+                actions = load_actions(
+                    resolved_tag,
+                    start=dt_start,
+                    end=dt_end if dt_start else None,
+                    window_hours=window_hours if not dt_start else None,
+                ) or []
+            except Exception as e:
+                _log(guild_id, "load_actions raised", {"error": repr(e)})
+
         # ------------------- render image --------------------
         try:
-            img_buf = _render_trace_png(doc, guild_id=guild_id)
+            img_buf = _render_trace_png(doc, guild_id=guild_id, actions=actions)
         except Exception as e:
             _log(guild_id, "internal renderer failed", {"error": repr(e)})
             return await interaction.followup.send(
@@ -379,11 +431,11 @@ class TraceCog(commands.Cog):
                 ephemeral=True
             )
 
-        _log(guild_id, "render complete", {"points_rendered": count})
+        _log(guild_id, "render complete", {"points_rendered": count, "actions": len(actions)})
 
         file = discord.File(img_buf, filename=f"trace_{doc.get('gamertag','player')}.png")
 
-        # ------- Build caption + per-point clickable links ----
+        # ------- Caption + per-point clickable links ----------
         last = points[-1]
         try:
             lx, lz = float(last.get("x", 0.0)), float(last.get("z", 0.0))
@@ -411,9 +463,8 @@ class TraceCog(commands.Cog):
         else:
             caption += f"\nRange: last {window_hours}h"
 
-        # Build embed listing ALL points with clickable links
-        # We keep chronological order; mark start/middle/end.
-        lines: List[str] = []
+        # --------- Embeds: Points and (optional) Actions -------
+        point_lines: List[str] = []
         n = len(points)
         for idx, p in enumerate(points, start=1):
             try:
@@ -430,21 +481,55 @@ class TraceCog(commands.Cog):
             except Exception:
                 pass
             url = _izurvive_url(map_name, x, z)
-            lines.append(f"{idx}. [{x:.1f}, {z:.1f}]({url}) — {tag} {ts_s}")
+            point_lines.append(f"{idx}. [{x:.1f}, {z:.1f}]({url}) — {tag} {ts_s}")
 
-        embed = discord.Embed(title="Trace points (click to open in iZurvive)")
-        # Discord embed field value limit ~1024 chars; split smartly
-        chunk: List[str] = []
-        size = 0
-        part = 1
-        for ln in lines:
-            if size + len(ln) + 1 > 1000 and chunk:
-                embed.add_field(name=f"Points {part}", value="\n".join(chunk), inline=False)
-                chunk, size, part = [], 0, part + 1
-            chunk.append(ln)
-            size += len(ln) + 1
-        if chunk:
-            embed.add_field(name=f"Points {part}", value="\n".join(chunk), inline=False)
+        points_embed = discord.Embed(title="Trace points (click to open in iZurvive)")
+        # Split across multiple fields to fit Discord limits
+        def _add_chunked(embed: discord.Embed, title_prefix: str, lines: List[str]):
+            chunk: List[str] = []
+            size = 0
+            part = 1
+            for ln in lines:
+                if size + len(ln) + 1 > 1000 and chunk:
+                    embed.add_field(name=f"{title_prefix} {part}", value="\n".join(chunk), inline=False)
+                    chunk, size, part = [], 0, part + 1
+                chunk.append(ln)
+                size += len(ln) + 1
+            if chunk:
+                embed.add_field(name=f"{title_prefix} {part}", value="\n".join(chunk), inline=False)
+
+        _add_chunked(points_embed, "Points", point_lines)
+
+        embeds: List[discord.Embed] = [points_embed]
+
+        if actions:
+            action_lines: List[str] = []
+            for a in actions:
+                kind = str(a.get("type") or a.get("kind") or "event")
+                desc = str(a.get("desc") or a.get("message") or a.get("detail") or "").strip()
+                x = a.get("x")
+                z = a.get("z")
+                link = ""
+                try:
+                    if x is not None and z is not None:
+                        link = f"[({float(x):.1f}, {float(z):.1f})]({_izurvive_url(map_name, float(x), float(z))}) "
+                except Exception:
+                    link = ""
+                tss = ""
+                try:
+                    ts_raw = a.get("ts")
+                    if ts_raw:
+                        tss = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
+                                      .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+                except Exception:
+                    pass
+                pretty = kind.capitalize()
+                text = f"• {pretty}: {link}{desc} {tss}".strip()
+                action_lines.append(text)
+
+            actions_embed = discord.Embed(title=f"Actions snapshot ({len(actions)})")
+            _add_chunked(actions_embed, "Actions", action_lines)
+            embeds.append(actions_embed)
 
         # ----------- post to admin channel if set ------------
         settings = load_settings(guild_id) or {}
@@ -455,7 +540,7 @@ class TraceCog(commands.Cog):
             ch = interaction.client.get_channel(int(admin_ch_id))
             if isinstance(ch, discord.TextChannel):
                 try:
-                    await ch.send(content=caption, file=file, embed=embed)
+                    await ch.send(content=caption, file=file, embeds=embeds)
                     _log(guild_id, "posted to admin channel", {"channel": admin_ch_id})
                     return await interaction.followup.send(
                         f"📡 Posted trace in {ch.mention}.", ephemeral=True
@@ -464,7 +549,7 @@ class TraceCog(commands.Cog):
                     _log(guild_id, "failed posting to admin channel", {"error": repr(e)})
 
         # Fallback to replying in the invoking channel
-        await interaction.followup.send(caption, file=file, embed=embed)
+        await interaction.followup.send(caption, file=file, embeds=embeds)
 
 
 async def setup(bot: commands.Bot):
