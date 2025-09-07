@@ -82,6 +82,32 @@ def _wallet_candidate_paths_for_guild(gid: int) -> List[str]:
     candidates += LOCAL_WALLET_PATHS
     return candidates
 
+def _http_post_json(url: str, obj: dict) -> bool:
+    """Best-effort write to an HTTP(S) endpoint that accepts raw JSON body."""
+    try:
+        payload = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+        req = Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json; charset=utf-8", "User-Agent": "SV-Bounties/wallet-write"},
+            method="POST",
+        )
+        with urlopen(req, timeout=8.0) as resp:
+            return 200 <= getattr(resp, "status", 200) < 300
+    except Exception as e:
+        print(f"[bounty] HTTP write failed for {url}: {type(e).__name__}: {e}")
+        return False
+
+def _write_json_to_any(path: str, obj: dict) -> bool:
+    """Write JSON to local path via save_file, or POST if path is http(s)."""
+    if path.lower().startswith(("http://", "https://")):
+        return _http_post_json(path, obj)
+    try:
+        return bool(save_file(path, obj))
+    except Exception as e:
+        print(f"[bounty] Local write failed for {path}: {type(e).__name__}: {e}")
+        return False
+
 def _load_json_from_any(path: str) -> Optional[dict]:
     """
     Load a JSON object from either a local path (via storageClient / FS) or an HTTP(S) URL.
@@ -181,7 +207,13 @@ def _adjust_tickets(gid: int, discord_id: str, delta: int) -> Tuple[bool, int]:
 
     new_bal = cur + delta
     wallets[discord_id]["sv_tickets"] = new_bal
-    save_file(path, wallets)
+
+    # WRITE (supports http(s) endpoints via POST)
+    wrote = _write_json_to_any(path, wallets)
+    if not wrote:
+        print(f"[bounty] write failed for wallet path: {path}")
+        return False, cur
+
     return True, new_bal
 
 def _canon_map_and_cfg(map_name: Optional[str]) -> Tuple[str, dict]:
@@ -219,8 +251,18 @@ def _load_map_image(map_key: str, size: int = 1400) -> Image.Image:
     return img
 
 def _izurvive_url(map_key: str, x: float, z: float) -> str:
-    slug = {"livonia":"livonia","chernarus":"chernarus"}.get(map_key, "livonia")
+    slug = {"livonia": "livonia", "chernarus": "chernarus"}.get(map_key, "livonia")
     return f"https://www.izurvive.com/{slug}/#loc:{int(x)},{int(z)}"
+
+def _safe_png_name(basename: str) -> str:
+    """Sanitize filenames used for Discord attachments."""
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "_", basename).strip("._")
+    if not s:
+        s = "map"
+    s = s[:60]
+    if not s.lower().endswith(".png"):
+        s += ".png"
+    return s
 
 # ----------------------- Aggregated updates helper ---------------------------
 class BountyUpdater:
@@ -255,6 +297,7 @@ class BountyUpdater:
                 # latest point
                 _, doc = load_track(tgt, window_hours=48, max_points=1)
                 if not doc or not doc.get("points"):
+                    # no recent points; skip rendering for now
                     continue
                 pt = doc["points"][-1]
                 x, z = float(pt["x"]), float(pt["z"])
@@ -280,34 +323,41 @@ class BountyUpdater:
                 if reason:
                     desc += f"\n**Reason:** {reason[:300]}"
 
+                # Sanitize filename and bind embed image to the attachment
+                fname = _safe_png_name(f"{tgt}_bounty")
                 embed = discord.Embed(
                     title=f"🎯 Bounty: {tgt}",
                     description=desc,
                     color=discord.Color.red(),
                     timestamp=datetime.now(timezone.utc)
                 )
-                # Show the attached PNG inside the embed
-                filename = f"{tgt}_bounty.png"
-                embed.set_image(url=f"attachment://{filename}")
+                embed.set_image(url=f"attachment://{fname}")
 
-                # Always send a fresh message with the file so the image is present.
-                # If there was a previous message, delete it to avoid clutter.
-                old_msg_id = b.get("message", {}).get("message_id")
-                if old_msg_id:
+                # Edit or create the bounty message per target
+                msg_id = b.get("message", {}).get("message_id")
+                file = discord.File(fp=buf, filename=fname)
+
+                if msg_id:
                     try:
-                        old = await ch.fetch_message(int(old_msg_id))
-                        await old.delete()
-                    except Exception:
-                        pass
+                        msg = await ch.fetch_message(int(msg_id))
+                        # IMPORTANT: use attachments=[file] (or files=[file]) to upload the new image on edit
+                        await msg.edit(embed=embed, attachments=[file])
+                        continue
+                    except Exception as e:
+                        print(f"[bounty] edit failed for message {msg_id}: {e}")  # will send new message
 
-                file = discord.File(fp=buf, filename=filename)
-                msg = await ch.send(embed=embed, file=file)
+                # New message path
+                try:
+                    msg = await ch.send(embed=embed, file=file)
+                except Exception as e:
+                    print(f"[bounty] send failed in channel {ch.id}: {e}")
+                    continue
 
                 # Persist message reference
                 b["message"] = {"channel_id": ch.id, "message_id": msg.id}
                 db = load_file(BOUNTIES_DB) or {"open": [], "closed": []}
                 for i, ob in enumerate(db["open"]):
-                    if ob.get("target_gamertag","").lower() == tgt.lower() and int(ob.get("guild_id",0)) == gid:
+                    if ob.get("target_gamertag", "").lower() == tgt.lower() and int(ob.get("guild_id", 0)) == gid:
                         db["open"][i] = b
                         break
                 save_file(BOUNTIES_DB, db)
