@@ -45,6 +45,7 @@ class ActiveBounty:
     target_gamertag: str
     tickets: int
     created_at: str  # ISO
+    reason: Optional[str] = None
     message: Optional[BountyMsgRef] = None
 
 # ----------------------------- Utilities ------------------------------------
@@ -61,7 +62,7 @@ def _is_linked_discord(guild_id: int, discord_id: str) -> Tuple[bool, Optional[s
 
 def _is_player_seen(gamertag: str) -> bool:
     idx = load_file(INDEX_PATH) or {}
-    g = gamertag
+    g = gamertag or ""
     return any(k.lower() == g.lower() for k in idx.keys())
 
 def _ensure_wallet(doc: dict, discord_id: str) -> dict:
@@ -172,9 +173,14 @@ class BountyUpdater:
                 buf.seek(0)
 
                 url = _izurvive_url(map_key, x, z)
+                reason = b.get("reason")
+                desc = f"Last known location: **{int(x)} {int(z)}**  •  [iZurvive link]({url})"
+                if reason:
+                    desc += f"\n**Reason:** {reason[:300]}"
+
                 embed = discord.Embed(
                     title=f"🎯 Bounty: {tgt}",
-                    description=f"Last known location: **{int(x)} {int(z)}**  •  [iZurvive link]({url})",
+                    description=desc,
                     color=discord.Color.red(),
                     timestamp=datetime.now(timezone.utc)
                 )
@@ -281,14 +287,20 @@ class BountyCog(commands.Cog):
             except Exception:
                 pass
 
-    @app_commands.command(name="svbounty", description="Set a bounty on a linked player (2–10 SV tickets).")
-    @app_commands.describe(user="Discord user (if linked)", gamertag="In-game gamertag", tickets="Tickets to set (2–10)")
+    @app_commands.command(name="svbounty", description="Set a bounty on a player (2–10 SV tickets).")
+    @app_commands.describe(
+        user="Discord user (if linked)",
+        gamertag="Exact in-game gamertag (include digits immediately after the name, no space)",
+        tickets="Tickets to set (2–10)",
+        reason="Why are you placing this bounty? (optional)"
+    )
     async def svbounty(
         self,
         interaction: discord.Interaction,
         user: Optional[discord.Member] = None,
         gamertag: Optional[str] = None,
-        tickets: int = 2
+        tickets: int = 2,
+        reason: Optional[str] = None
     ):
         await interaction.response.defer(ephemeral=True)
 
@@ -296,12 +308,29 @@ class BountyCog(commands.Cog):
         if not gid:
             return await interaction.followup.send("❌ Guild-only command.", ephemeral=True)
 
+        settings = _guild_settings(gid)
+        bounty_channel_id = settings.get("bounty_channel_id")
+
+        # Require command to be used in the configured bounty channel
+        if not bounty_channel_id:
+            return await interaction.followup.send(
+                "⚠️ No bounty channel is set yet. Please run `/setchannels` to configure `bounty_channel`.",
+                ephemeral=True
+            )
+        if interaction.channel_id != int(bounty_channel_id):
+            ch = self.bot.get_channel(int(bounty_channel_id))
+            where = f"<#{bounty_channel_id}>" if ch else "`the configured bounty channel`"
+            return await interaction.followup.send(
+                f"⚠️ This command can only be used in {where}.",
+                ephemeral=True
+            )
+
         # Invoker must be linked
         inv_id = str(interaction.user.id)
         is_linked, _ = _is_linked_discord(gid, inv_id)
         if not is_linked:
             return await interaction.followup.send(
-                "❌ You are not linked yet. Please run the Rewards Bot `/link` command first.",
+                "❌ You are not linked yet. Please use the Rewards Bot `/link` command first.",
                 ephemeral=True
             )
 
@@ -312,11 +341,12 @@ class BountyCog(commands.Cog):
                 ephemeral=True
             )
 
-        # Identify target
+        # Identify/validate target
         target_discord_id: Optional[str] = None
         target_gt: Optional[str] = None
 
         if user is not None:
+            # If a Discord user is provided, they must be linked to a gamertag
             did, gt = resolve_from_any(gid, discord_id=str(user.id))
             if not did or not gt:
                 return await interaction.followup.send(
@@ -326,26 +356,39 @@ class BountyCog(commands.Cog):
             target_discord_id = str(did)
             target_gt = gt
         elif gamertag:
+            # Target does NOT need to be linked; accept if linked OR seen in ADM
             did, gt = resolve_from_any(gid, gamertag=gamertag)
-            if not gt:
-                return await interaction.followup.send(
-                    "❌ That gamertag is not linked.",
-                    ephemeral=True
-                )
-            target_discord_id = str(did) if did else None
-            target_gt = gt
+            if gt:
+                target_discord_id = str(did) if did else None
+                target_gt = gt
+            else:
+                # Not linked — check ADM index
+                if _is_player_seen(gamertag):
+                    target_gt = gamertag
+                else:
+                    return await interaction.followup.send(
+                        "❌ That gamertag wasn’t found as linked **or** in recent ADM scans.\n"
+                        "➡️ Please use the **exact in-game spelling**, and include digits **immediately** after the name "
+                        "(no space) so it matches our scanner.",
+                        ephemeral=True
+                    )
         else:
             return await interaction.followup.send(
                 "❌ Provide either a `user` or a `gamertag`.",
                 ephemeral=True
             )
 
-        # Safeguard: must have been seen in ADM (players_index)
+        # Double-check we’ve seen them in ADM at least once if they’re not linked
         if not _is_player_seen(target_gt):
-            return await interaction.followup.send(
-                f"❌ `{target_gt}` hasn't been seen in ADM yet — bounty can't be set.",
-                ephemeral=True
-            )
+            # Still allow if they are linked (resolve_from_any found them),
+            # otherwise block (likely a misspelling).
+            did_check, _gt_check = resolve_from_any(gid, gamertag=target_gt)
+            if not did_check:
+                return await interaction.followup.send(
+                    f"❌ `{target_gt}` hasn’t been seen in ADM yet. "
+                    "If you’re using the gamertag path, be sure it’s exactly as in game and digits come right after the name (no space).",
+                    ephemeral=True
+                )
 
         # Check invoker has tickets
         ok, bal_after = _adjust_tickets(inv_id, -tickets)
@@ -363,6 +406,7 @@ class BountyCog(commands.Cog):
             "target_gamertag": target_gt,
             "tickets": tickets,
             "created_at": _now_iso(),
+            "reason": (reason or "").strip() or None,
             "message": None,
         }
         bdoc = load_file(BOUNTIES_DB) or {"open": [], "closed": []}
@@ -376,8 +420,15 @@ class BountyCog(commands.Cog):
         bdoc["open"].append(rec)
         save_file(BOUNTIES_DB, bdoc)
 
+        # Confirmation
+        extra = ""
+        if not target_discord_id:
+            extra = (
+                "\nℹ️ Target isn’t linked; tracking will rely on ADM updates only. "
+                "Make sure the gamertag formatting matches in-game (digits right after the name, no space)."
+            )
         await interaction.followup.send(
-            f"✅ Bounty set on **{target_gt}** for **{tickets} SV tickets**. "
+            f"✅ Bounty set on **{target_gt}** for **{tickets} SV tickets**.{extra} "
             f"Your new balance: **{bal_after}**.",
             ephemeral=True
         )
