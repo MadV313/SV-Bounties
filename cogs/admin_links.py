@@ -79,24 +79,6 @@ def unwrap_links_json(obj: Any) -> Tuple[Any, bool, str]:
     return obj, changed_any, reason
 
 
-def _maybe_decode_wrapped_base64(doc: dict) -> tuple[dict, str | None, str | None]:
-    """Kept for backwards-compat with show embed logic."""
-    if isinstance(doc, dict) and "data" in doc and isinstance(doc["data"], str):
-        blob = doc["data"]
-        if _looks_base64(blob):
-            try:
-                raw = base64.b64decode(blob)
-                txt = raw.decode("utf-8", "ignore")
-                decoded = json.loads(txt)
-                if isinstance(decoded, dict):
-                    return decoded, "data", txt
-            except Exception:
-                pass
-    return doc, None, None
-
-
-# ----------------------------- I/O helpers -----------------------------------
-
 def _read_http_json_and_text(url: str, timeout: float = 8.0) -> tuple[dict, str]:
     """Fetch JSON from HTTP(S). Returns (parsed_dict, raw_text)."""
     req = Request(url, headers={"User-Agent": "SV-Bounties/links-check"})
@@ -161,7 +143,6 @@ def _try_local_json_and_text(path: str) -> tuple[bool, str, dict | None, str | N
 
 
 def _size_hint(doc: dict) -> int:
-    """Rough size based on common containers."""
     for k in ("links", "players", "mapping", "map", "by_id", "by_name"):
         v = doc.get(k)
         if isinstance(v, (list, dict)):
@@ -181,7 +162,6 @@ def _preview_text(text: str, max_chars: int = 900) -> str:
 
 
 def _preview_json(doc: dict, raw_text: str | None, max_chars: int = 900) -> str:
-    """Short snippet suitable for an embed field."""
     try:
         text = raw_text if raw_text else json.dumps(doc, ensure_ascii=False, indent=2)
     except Exception:
@@ -195,14 +175,30 @@ class AdminLinks(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    # ---- Settings controls ---------------------------------------------------
+    # ---- Core settings -------------------------------------------------------
+
+    @app_commands.command(
+        name="setexternalbase",
+        description="Set a base path/URL to your persistent data folder (e.g., https://.../data)"
+    )
+    @admin_check()
+    @app_commands.describe(base="Base path/URL to the folder that contains wallet.json and linked_players.json")
+    async def setexternalbase(self, interaction: discord.Interaction, base: str | None):
+        gid = interaction.guild_id
+        base = (base or "").rstrip("/")
+        save_settings(gid, {"external_data_base": (base or None)})
+        await interaction.response.send_message(
+            f"✅ External data base {'set' if base else 'cleared'}."
+            + (f"\n`{base}`" if base else ""),
+            ephemeral=True
+        )
 
     @app_commands.command(
         name="setexternallinks",
-        description="Set path/URL to external linked_players.json (per guild, e.g., SV13 persistent repo)"
+        description="Set path/URL to external linked_players.json (overrides base)"
     )
     @admin_check()
-    @app_commands.describe(path="Local path or URL to linked_players.json (leave blank to disable)")
+    @app_commands.describe(path="Local path or URL to linked_players.json (leave blank to clear)")
     async def setexternallinks(self, interaction: discord.Interaction, path: str | None = None):
         gid = interaction.guild_id
         save_settings(gid, {"external_links_path": (path or None)})
@@ -213,11 +209,26 @@ class AdminLinks(commands.Cog):
         )
 
     @app_commands.command(
+        name="setexternalwallet",
+        description="Set path/URL to external wallet.json (overrides base)"
+    )
+    @admin_check()
+    @app_commands.describe(path="Local path or URL to wallet.json (leave blank to clear)")
+    async def setexternalwallet(self, interaction: discord.Interaction, path: str | None = None):
+        gid = interaction.guild_id
+        save_settings(gid, {"external_wallet_path": (path or None)})
+        await interaction.response.send_message(
+            f"✅ External wallet source {'set' if path else 'cleared'}."
+            + (f"\n`{path}`" if path else ""),
+            ephemeral=True
+        )
+
+    @app_commands.command(
         name="setexternallinkswriter",
         description="Set a WRITABLE path for linked_players.json (used by /links normalize to write back)"
     )
     @admin_check()
-    @app_commands.describe(path="Writable path (e.g. /app/data/linked_players.json or sftp://user:pass@host/path/linked_players.json)")
+    @app_commands.describe(path="Writable path (e.g. /app/data/linked_players.json or https://.../linked_players.json)")
     async def setexternallinkswriter(self, interaction: discord.Interaction, path: str):
         gid = interaction.guild_id
         save_settings(gid, {"external_links_write_path": path})
@@ -267,7 +278,9 @@ class AdminLinks(commands.Cog):
         prefer_external = bool(st.get("prefer_external_links", True))
         disable_local = bool(st.get("disable_local_link", False))
         external_path = (st.get("external_links_path") or "").strip()
-        external_write = (st.get("external_links_write_path") or "").strip()
+        base = (st.get("external_data_base") or "").strip().rstrip("/")
+        if not external_path and base:
+            external_path = f"{base}/linked_players.json"
 
         external_is_url = external_path.lower().startswith(("http://", "https://"))
         external_present = bool(external_path)
@@ -359,9 +372,8 @@ class AdminLinks(commands.Cog):
         )
         embed.add_field(name="prefer_external_links", value=str(prefer_external))
         embed.add_field(name="disable_local_link", value=str(disable_local))
-        embed.add_field(name="external_links_path", value=external_path or "—", inline=False)
-        if external_write:
-            embed.add_field(name="external_links_write_path", value=external_write, inline=False)
+        embed.add_field(name="external_data_base", value=(base or "—"), inline=False)
+        embed.add_field(name="external_links_path", value=(external_path or "—"), inline=False)
         embed.add_field(name="Resolved source used", value=src_used, inline=False)
         embed.add_field(name="Load result", value=("✅ ok" if load_ok else f"❌ {detail}"), inline=False)
 
@@ -369,13 +381,62 @@ class AdminLinks(commands.Cog):
             embed.add_field(name="Top-level keys (raw)", value=top_keys or "—", inline=False)
             embed.add_field(name="Content hash (raw)", value=content_hash_raw or "n/a", inline=True)
             if content_hash_decoded:
-                embed.add_field(name=f"Content hash (decoded from '{decoded_from}')", value=content_hash_decoded, inline=True)
+                embed.add_field(name=f"Content hash (decoded from 'data')", value=content_hash_decoded, inline=True)
             embed.add_field(name="Snapshot (first ~900 chars)", value=f"```json\n{snapshot_text}\n```", inline=False)
             embed.set_footer(text=f"size_hint={size_hint} • type={type(data).__name__}")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ---- Normalizer ----------------------------------------------------------
+    @app_commands.command(
+        name="showwallet",
+        description="Show which wallet.json source would be used (base / explicit / local) and preview."
+    )
+    @admin_check()
+    async def showwallet(self, interaction: discord.Interaction):
+        gid = interaction.guild_id
+        st = load_settings(gid) or {}
+        base = (st.get("external_data_base") or "").strip().rstrip("/")
+        explicit = (st.get("external_wallet_path") or "").strip()
+
+        candidates: list[str] = []
+        if explicit:
+            candidates.append(explicit)
+        if base:
+            candidates.append(f"{base}/wallet.json")
+        candidates += ["data/wallet.json", "wallet.json"]
+
+        chosen = None
+        doc = None
+        raw = None
+        note = ""
+        for p in candidates:
+            ok, det, d, r = _try_local_json_and_text(p)
+            if ok and isinstance(d, dict):
+                chosen, doc, raw = p, d, (r or json.dumps(d, ensure_ascii=False))
+                break
+            else:
+                note = det or note
+
+        if not chosen:
+            await interaction.response.send_message(
+                "❌ Could not locate a usable wallet.json in any configured path.\n"
+                f"Checked:\n```\n" + "\n".join(candidates) + "\n```",
+                ephemeral=True
+            )
+            return
+
+        emb = discord.Embed(title="wallet.json status", color=0x3BA55C)
+        emb.add_field(name="external_data_base", value=(base or "—"), inline=False)
+        emb.add_field(name="external_wallet_path", value=(explicit or "—"), inline=False)
+        emb.add_field(name="Resolved source used", value=chosen, inline=False)
+        emb.add_field(name="Content hash", value=_content_hash(raw), inline=False)
+
+        snippet = (raw[:900] + ("…" if len(raw) > 900 else ""))
+        emb.add_field(name="Snapshot (first ~900 chars)", value=f"```json\n{snippet}\n```", inline=False)
+
+        await interaction.response.send_message(embed=emb, ephemeral=True)
+
+    # ------------ Links normalizer (unchanged core) ---------------------------
 
     links = app_commands.Group(name="links", description="Manage linked players file")
 
@@ -387,6 +448,9 @@ class AdminLinks(commands.Cog):
         prefer_external = bool(st.get("prefer_external_links", True))
         disable_local = bool(st.get("disable_local_link", False))
         read_path = (st.get("external_links_path") or "").strip()
+        base = (st.get("external_data_base") or "").strip().rstrip("/")
+        if not read_path and base:
+            read_path = f"{base}/linked_players.json"
         write_path = (st.get("external_links_write_path") or "").strip()
 
         external_present = bool(read_path)
@@ -447,10 +511,9 @@ class AdminLinks(commands.Cog):
         before_n = _count(doc)
         after_n = _count(fixed)
 
-        # ---- WRITE: for HTTP(S) send a JSON STRING; try storageClient, then direct HTTP POST ----
         wrote = False
         write_err = None
-        wrote_raw_plain = False   # whether RAW now looks like plain JSON
+        wrote_raw_plain = False
         write_attempt_notes: list[str] = []
 
         if changed:
@@ -458,18 +521,15 @@ class AdminLinks(commands.Cog):
                 if write_path.lower().startswith(("http://", "https://")):
                     payload = json.dumps(fixed, ensure_ascii=False, indent=2)
 
-                    # 1) Try storageClient (some impls accept raw string and don't wrap)
                     try_sc = bool(save_file(write_path, payload))
                     write_attempt_notes.append(f"storageClient-> {try_sc}")
                     wrote = wrote or try_sc
 
-                    # 2) If storageClient didn't write, try direct HTTP POST
                     if not wrote:
                         ok2, note2 = _http_post_text(write_path, payload)
                         write_attempt_notes.append(f"http_post-> {ok2} ({note2})")
                         wrote = wrote or ok2
 
-                    # quick RAW check right away (best effort)
                     try:
                         _, raw_after = _read_http_json_and_text(chosen_read)
                         wrote_raw_plain = raw_after.strip().startswith("{") and not raw_after.strip().startswith('{"data"')
@@ -477,13 +537,11 @@ class AdminLinks(commands.Cog):
                         pass
 
                 else:
-                    # Local/FTP/SFTP etc. via storageClient
                     wrote = bool(save_file(write_path, fixed))
-                    wrote_raw_plain = True  # local writes yield plain files
+                    wrote_raw_plain = True
             except Exception as e:
                 write_err = f"{type(e).__name__}: {e}"
 
-        # ---- VERIFY: RAW + decoded (only if we wrote) ----
         raw_match_plain = False
         decoded_match = False
         verify_note = ""
@@ -494,13 +552,11 @@ class AdminLinks(commands.Cog):
                     sep = '&' if '?' in verify_path else '?'
                     verify_path = f"{verify_path}{sep}t={int(discord.utils.utcnow().timestamp())}"
 
-                # RAW fetch (no JSON parse) to see exact bytes
                 req = Request(verify_path, headers={"User-Agent": "SV-Bounties/links-verify"})
                 with urlopen(req, timeout=8.0) as resp:
                     raw_verify = resp.read().decode(resp.headers.get_content_charset() or "utf-8", "replace")
                 raw_match_plain = raw_verify.strip().startswith("{") and not raw_verify.strip().startswith('{"data"')
 
-                # Decoded compare (tolerates wrapper if any)
                 ver_doc, _ = _read_http_json_and_text(verify_path)
                 ver_plain, _, _ = unwrap_links_json(ver_doc)
                 decoded_match = (ver_plain == fixed)
@@ -510,7 +566,6 @@ class AdminLinks(commands.Cog):
             except Exception as e:
                 verify_note = f"verify failed: {type(e).__name__}: {e}"
 
-        # ---- Build embed ----
         keys_preview = ""
         if isinstance(fixed, dict):
             keys = list(fixed.keys())[:5]
@@ -556,19 +611,19 @@ class AdminLinks(commands.Cog):
 
         await interaction.followup.send(embed=emb, ephemeral=True)
 
-    # -------- Optional debug helpers --------
-
     @links.command(name="raw", description="Show first ~900 chars of RAW linked_players.json (no decoding)")
     @admin_check()
     async def links_raw(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         st = load_settings(interaction.guild_id) or {}
         path = (st.get("external_links_path") or "").strip()
+        base = (st.get("external_data_base") or "").strip().rstrip("/")
+        if not path and base:
+            path = f"{base}/linked_players.json"
         if not path:
-            await interaction.followup.send("No external_links_path is set.", ephemeral=True)
+            await interaction.followup.send("No external_links_path or base is set.", ephemeral=True)
             return
         if path.lower().startswith(("http://", "https://")):
-            # Fetch RAW over HTTP
             req = Request(path, headers={"User-Agent": "SV-Bounties/links-raw"})
             with urlopen(req, timeout=8.0) as resp:
                 raw_text = resp.read().decode(resp.headers.get_content_charset() or "utf-8", "replace")
@@ -588,8 +643,11 @@ class AdminLinks(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         st = load_settings(interaction.guild_id) or {}
         path = (st.get("external_links_path") or "").strip()
+        base = (st.get("external_data_base") or "").strip().rstrip("/")
+        if not path and base:
+            path = f"{base}/linked_players.json"
         if not path:
-            await interaction.followup.send("No external_links_path is set.", ephemeral=True)
+            await interaction.followup.send("No external_links_path or base is set.", ephemeral=True)
             return
         if path.lower().startswith(("http://", "https://")):
             doc, _ = _read_http_json_and_text(path)
@@ -603,7 +661,6 @@ class AdminLinks(commands.Cog):
         snippet = pretty[:1900] + ("…" if len(pretty) > 1900 else "")
         await interaction.followup.send(f"```json\n{snippet}\n```", ephemeral=True)
 
-    # Alias (optional)
     @app_commands.command(name="linksnormalize", description="(Alias) Normalize linked_players.json to plain JSON")
     @admin_check()
     async def linksnormalize(self, interaction: discord.Interaction):
