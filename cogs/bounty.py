@@ -52,6 +52,14 @@ class ActiveBounty:
     reason: Optional[str] = None
     message: Optional[BountyMsgRef] = None
 
+# ----------------------------- Small logger ---------------------------------
+def _log(msg: str, **kv):
+    try:
+        extra = (" " + json.dumps(kv, ensure_ascii=False, default=str)) if kv else ""
+    except Exception:
+        extra = f" {kv!r}" if kv else ""
+    print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] [bounty]{extra} {msg}")
+
 # ----------------------------- Utilities ------------------------------------
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -95,7 +103,7 @@ def _http_post_json(url: str, obj: dict) -> bool:
         with urlopen(req, timeout=8.0) as resp:
             return 200 <= getattr(resp, "status", 200) < 300
     except Exception as e:
-        print(f"[bounty] HTTP write failed for {url}: {type(e).__name__}: {e}")
+        _log(f"HTTP write failed for {url}: {type(e).__name__}: {e}")
         return False
 
 def _write_json_to_any(path: str, obj: dict) -> bool:
@@ -105,7 +113,7 @@ def _write_json_to_any(path: str, obj: dict) -> bool:
     try:
         return bool(save_file(path, obj))
     except Exception as e:
-        print(f"[bounty] Local write failed for {path}: {type(e).__name__}: {e}")
+        _log(f"Local write failed for {path}: {type(e).__name__}: {e}")
         return False
 
 def _load_json_from_any(path: str) -> Optional[dict]:
@@ -124,7 +132,7 @@ def _load_json_from_any(path: str) -> Optional[dict]:
                 return doc
             return None
         except Exception as e:
-            print(f"[bounty] HTTP load failed for {path}: {type(e).__name__}: {e}")
+            _log(f"HTTP load failed for {path}: {type(e).__name__}: {e}")
             return None
 
     # Local: try storageClient first
@@ -146,7 +154,7 @@ def _load_json_from_any(path: str) -> Optional[dict]:
         if p.is_file():
             return json.loads(p.read_text(encoding="utf-8"))
     except Exception as e:
-        print(f"[bounty] Local load failed for {path}: {type(e).__name__}: {e}")
+        _log(f"Local load failed for {path}: {type(e).__name__}: {e}")
     return None
 
 def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
@@ -162,13 +170,13 @@ def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
         doc = _load_json_from_any(p)
         if isinstance(doc, dict):
             if doc:
-                print(f"[bounty] Using wallet file: {p} (non-empty)")
+                _log("Using wallet file (non-empty)", path=p)
                 return doc, p
             empty_path = empty_path or p
     if empty_path is not None:
-        print(f"[bounty] Using wallet file: {empty_path} (empty)")
+        _log("Using wallet file (empty)", path=empty_path)
         return {}, empty_path
-    print(f"[bounty] No wallet file found. Tried: {', '.join(tried)}")
+    _log("No wallet file found", tried=", ".join(tried))
     return None, None
 
 def _get_user_balance(gid: int, discord_id: str) -> Tuple[int, Optional[dict], Optional[str]]:
@@ -195,11 +203,11 @@ def _adjust_tickets(gid: int, discord_id: str, delta: int) -> Tuple[bool, int]:
     """
     cur, wallets, path = _get_user_balance(gid, discord_id)
     if wallets is None or path is None:
-        print("[bounty] _adjust_tickets: wallet file missing; refusing to write")
+        _log("_adjust_tickets: wallet file missing; refusing to write", gid=gid, discord_id=discord_id)
         return False, 0
 
     if discord_id not in wallets:
-        print(f"[bounty] _adjust_tickets: user {discord_id} not in wallet map for {path}")
+        _log("_adjust_tickets: user not in wallet map", gid=gid, discord_id=discord_id, path=path)
         return False, cur
 
     if delta < 0 and cur < (-delta):
@@ -211,7 +219,7 @@ def _adjust_tickets(gid: int, discord_id: str, delta: int) -> Tuple[bool, int]:
     # WRITE (supports http(s) endpoints via POST)
     wrote = _write_json_to_any(path, wallets)
     if not wrote:
-        print(f"[bounty] write failed for wallet path: {path}")
+        _log("write failed for wallet path", path=path)
         return False, cur
 
     return True, new_bal
@@ -280,27 +288,36 @@ class BountyUpdater:
             settings = _guild_settings(gid)
             channel_id = settings.get("bounty_channel_id")
             if not channel_id:
+                _log("update_guild: no bounty_channel_id; skip", gid=gid)
                 return
             ch = self.bot.get_channel(int(channel_id))
             if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                _log("update_guild: channel not found/visible", gid=gid, channel_id=channel_id)
                 return
 
             open_bounties = (load_file(BOUNTIES_DB) or {}).get("open", [])
             targets = [b for b in open_bounties if int(b.get("guild_id", 0)) == gid]
+            _log("update_guild: start", gid=gid, count=len(targets))
             if not targets:
                 return
 
             for b in targets:
-                tgt = b.get("target_gamertag") or ""
+                tgt = (b.get("target_gamertag") or "").strip()
+                if not tgt:
+                    continue
                 map_key, cfg = _canon_map_and_cfg(settings.get("active_map"))
 
                 # latest point
                 _, doc = load_track(tgt, window_hours=48, max_points=1)
                 if not doc or not doc.get("points"):
-                    # no recent points; skip rendering for now
+                    _log("no points for target; skip", gid=gid, target=tgt)
                     continue
                 pt = doc["points"][-1]
-                x, z = float(pt["x"]), float(pt["z"])
+                try:
+                    x, z = float(pt["x"]), float(pt["z"])
+                except Exception:
+                    _log("bad point data; skip", gid=gid, target=tgt, pt=str(pt))
+                    continue
 
                 img = _load_map_image(map_key)
                 draw = ImageDraw.Draw(img)
@@ -333,34 +350,14 @@ class BountyUpdater:
                 )
                 embed.set_image(url=f"attachment://{fname}")
 
-                # Edit or create the bounty message per target
-                msg_id = b.get("message", {}).get("message_id")
-                file = discord.File(fp=buf, filename=fname)
-
-                if msg_id:
-                    try:
-                        msg = await ch.fetch_message(int(msg_id))
-                        # IMPORTANT: use attachments=[file] (or files=[file]) to upload the new image on edit
-                        await msg.edit(embed=embed, attachments=[file])
-                        continue
-                    except Exception as e:
-                        print(f"[bounty] edit failed for message {msg_id}: {e}")  # will send new message
-
-                # New message path
+                # Always send a NEW message (you asked for 5-min posts)
                 try:
+                    file = discord.File(fp=buf, filename=fname)
                     msg = await ch.send(embed=embed, file=file)
+                    _log("sent bounty map", gid=gid, target=tgt, channel_id=ch.id, message_id=msg.id)
                 except Exception as e:
-                    print(f"[bounty] send failed in channel {ch.id}: {e}")
+                    _log(f"send failed in channel {ch.id}: {e}", gid=gid, target=tgt)
                     continue
-
-                # Persist message reference
-                b["message"] = {"channel_id": ch.id, "message_id": msg.id}
-                db = load_file(BOUNTIES_DB) or {"open": [], "closed": []}
-                for i, ob in enumerate(db["open"]):
-                    if ob.get("target_gamertag", "").lower() == tgt.lower() and int(ob.get("guild_id", 0)) == gid:
-                        db["open"][i] = b
-                        break
-                save_file(BOUNTIES_DB, db)
 
 # ---------------------------- Kill detection ---------------------------------
 KILL_RE = re.compile(
@@ -460,6 +457,13 @@ class BountyCog(commands.Cog):
         tickets: int = 2,
         reason: Optional[str] = None
     ):
+        _log("svbounty invoked",
+             guild_id=interaction.guild_id,
+             channel_id=interaction.channel_id,
+             user_id=getattr(interaction.user, "id", None),
+             target_user_id=getattr(user, "id", None),
+             gamertag=gamertag, tickets=tickets)
+
         await interaction.response.defer(ephemeral=True)
 
         gid = interaction.guild_id
@@ -538,8 +542,6 @@ class BountyCog(commands.Cog):
 
         # Double-check we’ve seen them in ADM at least once if they’re not linked
         if not _is_player_seen(target_gt):
-            # Still allow if they are linked (resolve_from_any found them),
-            # otherwise block (likely a misspelling).
             did_check, _gt_check = resolve_from_any(gid, gamertag=target_gt)
             if not did_check:
                 return await interaction.followup.send(
@@ -564,7 +566,7 @@ class BountyCog(commands.Cog):
                 ephemeral=True
             )
 
-        # Create/open bounty record
+        # Create/open bounty record (we keep a record even if we don't reuse message IDs now)
         rec = {
             "guild_id": gid,
             "set_by_discord_id": inv_id,
@@ -587,6 +589,7 @@ class BountyCog(commands.Cog):
                 )
         bdoc["open"].append(rec)
         save_file(BOUNTIES_DB, bdoc)
+        _log("bounty recorded", guild_id=gid, target=target_gt, tickets=tickets)
 
         # Ephemeral confirmation to invoker
         extra = ""
@@ -613,14 +616,14 @@ class BountyCog(commands.Cog):
                     "Be on the look out for their live updates here in this channel — below is their most recent last known location!\n"
                     "**Stay Frosty!**"
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                _log(f"announcement send failed: {e}", guild_id=gid, channel_id=ch.id)
 
         # Trigger an immediate update for this guild (posts the live map under the announcement)
         try:
             await self.updater.update_guild(gid)
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f"immediate update failed: {e}", guild_id=gid)
 
     # Optional admin cleanups
     @app_commands.command(name="svbounty_remove", description="Remove an active bounty by user or gamertag.")
@@ -654,11 +657,12 @@ class BountyCog(commands.Cog):
         # Update all guilds that currently have open bounties
         doc = load_file(BOUNTIES_DB) or {}
         gids = {int(b["guild_id"]) for b in doc.get("open", []) if b.get("guild_id")}
+        _log("bounty_updater tick", guilds=list(gids))
         for gid in gids:
             try:
                 await self.updater.update_guild(gid)
             except Exception as e:
-                print(f"[BountyCog] update failed for guild {gid}: {e}")
+                _log(f"update failed for guild {gid}: {e}")
 
     @bounty_updater.before_loop
     async def _before_bounty_updater(self):
