@@ -409,13 +409,24 @@ class AdminLinks(commands.Cog):
         doc = None
         raw = None
         note = ""
+
         for p in candidates:
-            ok, det, d, r = _try_local_json_and_text(p)
-            if ok and isinstance(d, dict):
-                chosen, doc, raw = p, d, (r or json.dumps(d, ensure_ascii=False))
-                break
-            else:
-                note = det or note
+            try:
+                if p.lower().startswith(("http://", "https://")):
+                    # HTTP(S) support added here
+                    d, r = _read_http_json_and_text(p)
+                    if isinstance(d, dict):
+                        chosen, doc, raw = p, d, r
+                        break
+                else:
+                    ok, det, d, r = _try_local_json_and_text(p)
+                    if ok and isinstance(d, dict):
+                        chosen, doc, raw = p, d, (r or json.dumps(d, ensure_ascii=False))
+                        break
+                    else:
+                        note = det or note
+            except Exception as e:
+                note = f"{type(e).__name__}: {e}"
 
         if not chosen:
             await interaction.response.send_message(
