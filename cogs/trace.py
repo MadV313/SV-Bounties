@@ -15,6 +15,7 @@ from utils.settings import load_settings
 from utils.linking import resolve_from_any
 from tracer.tracker import load_track
 
+
 # ----------------------- tiny logger -----------------------
 def _now() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -91,9 +92,7 @@ def _resolve_asset(rel_path: str) -> Path | None:
 
 def _active_map_name(guild_id: int | None) -> str:
     s = load_settings(guild_id) if guild_id else {}
-    # your settings store map in lowercase (admin_assign); normalize lookups
-    val = (s.get("active_map") or "Livonia").strip()
-    return val
+    return (s.get("active_map") or "Livonia").strip()
 
 
 def _izurvive_url(map_name: str, x: float, z: float) -> str:
@@ -155,9 +154,8 @@ def _load_map_image(gid: int | None, map_name: str, size_px: int = 1400) -> Imag
     return img
 
 
-def _draw_pin(drw: ImageDraw.ImageDraw, p: Tuple[int, int], color: Tuple[int, int, int, int]):
+def _draw_pin(drw: ImageDraw.ImageDraw, p: Tuple[int, int], color: Tuple[int, int, int, int], r: int = 8):
     x, y = p
-    r = 8
     drw.ellipse([x - r, y - r, x + r, y + r], fill=color, outline=(0, 0, 0, 255), width=2)
     drw.ellipse([x - 2, y - 2, x + 2, y + 2], fill=(0, 0, 0, 255))
 
@@ -165,7 +163,8 @@ def _draw_pin(drw: ImageDraw.ImageDraw, p: Tuple[int, int], color: Tuple[int, in
 def _render_trace_png(doc: Dict[str, Any], guild_id: int | None) -> io.BytesIO:
     """
     Minimal, self-contained renderer (avoids old map_renderer dependency).
-    Draws the player's path on the active map background.
+    Draws the player's path with colored pins:
+      start = green, middle = yellow, end = red.
     """
     map_name = _active_map_name(guild_id)
     world_size = _world_size_for(map_name)
@@ -178,7 +177,6 @@ def _render_trace_png(doc: Dict[str, Any], guild_id: int | None) -> io.BytesIO:
         font = ImageFont.load_default()
 
     pts = doc.get("points", []) or []
-    # convert to pixels, keep only sensible numbers
     pix: List[Tuple[int, int]] = []
     last_xz: Tuple[float, float] | None = None
     W, _ = base.size
@@ -188,40 +186,39 @@ def _render_trace_png(doc: Dict[str, Any], guild_id: int | None) -> io.BytesIO:
             x, z = float(p.get("x")), float(p.get("z"))
         except Exception:
             continue
+        # skip near-duplicates for cleaner path
         if last_xz and (round(x, 1), round(z, 1)) == (round(last_xz[0], 1), round(last_xz[1], 1)):
-            # skip tiny duplicates for a cleaner line
             continue
         pix.append(_world_to_image(x, z, world_size, W))
         last_xz = (x, z)
 
-    # draw polyline
+    # polyline with subtle outline (black under, red over)
     if len(pix) >= 2:
-        # main path
-        drw.line(pix, fill=(255, 90, 90, 255), width=4)
-        # a thin black outline for contrast
         try:
-            drw.line(pix, fill=(0, 0, 0, 120), width=6, joint="curve")  # Pillow may ignore 'joint' on some builds
-            drw.line(pix, fill=(255, 90, 90, 255), width=3)
+            drw.line(pix, fill=(0, 0, 0, 140), width=6)
         except Exception:
             pass
+        drw.line(pix, fill=(255, 90, 90, 255), width=3)
 
-    # pins
+    # pins: start green, middle yellow, end red
     if pix:
-        _draw_pin(drw, pix[0], (82, 200, 120, 255))   # start - green
-        _draw_pin(drw, pix[-1], (255, 72, 72, 255))   # end   - red
-        # label near end
-        name = str(doc.get("gamertag") or "player")
-        ex, ey = pix[-1]
-        drw.text(
-            (ex + 10, ey - 6),
-            name,
-            fill=(255, 255, 255, 255),
-            font=font,
-            stroke_width=2,
-            stroke_fill=(0, 0, 0, 255),
-        )
+        _draw_pin(drw, pix[0], (82, 200, 120, 255), r=9)     # start
+        for p in pix[1:-1]:
+            _draw_pin(drw, p, (238, 210, 2, 255), r=7)      # middle
+        if len(pix) > 1:
+            _draw_pin(drw, pix[-1], (255, 72, 72, 255), r=9)  # end
+            # label near end
+            name = str(doc.get("gamertag") or "player")
+            ex, ey = pix[-1]
+            drw.text(
+                (ex + 10, ey - 6),
+                name,
+                fill=(255, 255, 255, 255),
+                font=font,
+                stroke_width=2,
+                stroke_fill=(0, 0, 0, 255),
+            )
 
-    # out to buffer
     buf = io.BytesIO()
     base.save(buf, format="PNG")
     buf.seek(0)
@@ -267,7 +264,6 @@ class TraceCog(commands.Cog):
         })
 
         # ---------------- identity resolution ----------------
-        # If a gamertag was explicitly provided, trust it (no link required).
         resolved_tag: str | None = None
         resolved_did: str | None = None
 
@@ -387,7 +383,7 @@ class TraceCog(commands.Cog):
 
         file = discord.File(img_buf, filename=f"trace_{doc.get('gamertag','player')}.png")
 
-        # Caption with clickable iZurvive link to last point
+        # ------- Build caption + per-point clickable links ----
         last = points[-1]
         try:
             lx, lz = float(last.get("x", 0.0)), float(last.get("z", 0.0))
@@ -395,25 +391,60 @@ class TraceCog(commands.Cog):
             lx, lz = 0.0, 0.0
 
         map_name = _active_map_name(guild_id)
-        izu = _izurvive_url(map_name, lx, lz)
+        izu_last = _izurvive_url(map_name, lx, lz)
 
-        when = ""
+        when_last = ""
         try:
             ts_raw = last.get("ts")
             if ts_raw:
-                when = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
+                when_last = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
                                .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
         except Exception:
             pass
 
         caption = (
             f"**{doc.get('gamertag','?')}** — {count} points\n"
-            f"Last: [({lx:.1f}, {lz:.1f})]({izu}) {when}"
+            f"Last: [({lx:.1f}, {lz:.1f})]({izu_last}) {when_last}"
         )
         if dt_start:
             caption += f"\nRange: `{dt_start.isoformat()}` to `{dt_end.isoformat()}`"
         else:
             caption += f"\nRange: last {window_hours}h"
+
+        # Build embed listing ALL points with clickable links
+        # We keep chronological order; mark start/middle/end.
+        lines: List[str] = []
+        n = len(points)
+        for idx, p in enumerate(points, start=1):
+            try:
+                x, z = float(p.get("x", 0.0)), float(p.get("z", 0.0))
+            except Exception:
+                x, z = 0.0, 0.0
+            tag = "🟢 start" if idx == 1 else ("🔴 end" if idx == n else "🟡")
+            ts_s = ""
+            try:
+                ts_raw = p.get("ts")
+                if ts_raw:
+                    ts_s = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
+                                   .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+            except Exception:
+                pass
+            url = _izurvive_url(map_name, x, z)
+            lines.append(f"{idx}. [{x:.1f}, {z:.1f}]({url}) — {tag} {ts_s}")
+
+        embed = discord.Embed(title="Trace points (click to open in iZurvive)")
+        # Discord embed field value limit ~1024 chars; split smartly
+        chunk: List[str] = []
+        size = 0
+        part = 1
+        for ln in lines:
+            if size + len(ln) + 1 > 1000 and chunk:
+                embed.add_field(name=f"Points {part}", value="\n".join(chunk), inline=False)
+                chunk, size, part = [], 0, part + 1
+            chunk.append(ln)
+            size += len(ln) + 1
+        if chunk:
+            embed.add_field(name=f"Points {part}", value="\n".join(chunk), inline=False)
 
         # ----------- post to admin channel if set ------------
         settings = load_settings(guild_id) or {}
@@ -424,7 +455,7 @@ class TraceCog(commands.Cog):
             ch = interaction.client.get_channel(int(admin_ch_id))
             if isinstance(ch, discord.TextChannel):
                 try:
-                    await ch.send(content=caption, file=file)
+                    await ch.send(content=caption, file=file, embed=embed)
                     _log(guild_id, "posted to admin channel", {"channel": admin_ch_id})
                     return await interaction.followup.send(
                         f"📡 Posted trace in {ch.mention}.", ephemeral=True
@@ -433,7 +464,7 @@ class TraceCog(commands.Cog):
                     _log(guild_id, "failed posting to admin channel", {"error": repr(e)})
 
         # Fallback to replying in the invoking channel
-        await interaction.followup.send(caption, file=file)
+        await interaction.followup.send(caption, file=file, embed=embed)
 
 
 async def setup(bot: commands.Bot):
