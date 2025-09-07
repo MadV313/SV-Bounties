@@ -4,9 +4,10 @@ from __future__ import annotations
 import io
 import re
 import asyncio
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple, List
+from pathlib import Path  # ← needed by kill scanner
 
 import discord
 from discord import app_commands
@@ -118,8 +119,9 @@ def _izurvive_url(map_key: str, x: float, z: float) -> str:
     slug = {"livonia":"livonia","chernarus":"chernarus"}.get(map_key, "livonia")
     return f"https://www.izurvive.com/{slug}/#loc:{int(x)},{int(z)}"
 
-# ----------------------- Aggregated updates every 5 min ----------------------
+# ----------------------- Aggregated updates helper ---------------------------
 class BountyUpdater:
+    """Light wrapper that can render/update one guild on demand."""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._locks: Dict[int, asyncio.Lock] = {}  # per guild
@@ -140,31 +142,28 @@ class BountyUpdater:
 
             open_bounties = (load_file(BOUNTIES_DB) or {}).get("open", [])
             targets = [b for b in open_bounties if int(b.get("guild_id", 0)) == gid]
-
             if not targets:
                 return
 
-            # Build a map per target (single-pin) and edit its message, or create one.
             for b in targets:
                 tgt = b.get("target_gamertag") or ""
                 map_key, cfg = _canon_map_and_cfg(settings.get("active_map"))
-                # Load latest point for that player
-                pid, doc = load_track(tgt, window_hours=48, max_points=1)
+
+                # latest point
+                _, doc = load_track(tgt, window_hours=48, max_points=1)
                 if not doc or not doc.get("points"):
-                    # nothing new; skip
                     continue
                 pt = doc["points"][-1]
                 x, z = float(pt["x"]), float(pt["z"])
+
                 img = _load_map_image(map_key)
                 draw = ImageDraw.Draw(img)
                 px, py = _world_to_px(cfg, x, z, img.width)
                 r = 9
                 draw.ellipse([px - r, py - r, px + r, py + r], outline=(255, 0, 0, 255), width=4)
                 draw.ellipse([px - 2, py - 2, px + 2, py + 2], fill=(255, 0, 0, 255))
-                # Label
-                label = f"{tgt} • {int(x)},{int(z)}"
                 try:
-                    draw.text((px + 12, py - 12), label, fill=(255, 255, 255, 255))
+                    draw.text((px + 12, py - 12), f"{tgt} • {int(x)},{int(z)}", fill=(255, 255, 255, 255))
                 except Exception:
                     pass
 
@@ -188,82 +187,78 @@ class BountyUpdater:
                         await msg.edit(embed=embed, attachments=[discord.File(buf, filename=f"{tgt}_bounty.png")])
                         continue
                     except Exception:
-                        pass  # fall through to send new
+                        pass  # will send new message
 
                 file = discord.File(buf, filename=f"{tgt}_bounty.png")
                 msg = await ch.send(embed=embed, file=file)
-                # Persist message reference back to DB
+                # Persist message reference
                 b["message"] = {"channel_id": ch.id, "message_id": msg.id}
-                doc_all = load_file(BOUNTIES_DB) or {"open": [], "closed": []}
-                # update record in place
-                for i, ob in enumerate(doc_all["open"]):
+                db = load_file(BOUNTIES_DB) or {"open": [], "closed": []}
+                for i, ob in enumerate(db["open"]):
                     if ob.get("target_gamertag","").lower() == tgt.lower() and int(ob.get("guild_id",0)) == gid:
-                        doc_all["open"][i] = b
+                        db["open"][i] = b
                         break
-                save_file(BOUNTIES_DB, doc_all)
-
-    @tasks.loop(minutes=5.0)
-    async def loop(self):
-        await asyncio.sleep(5)  # slight delay on startup
-        # Update all guilds seen in bounties DB
-        doc = load_file(BOUNTIES_DB) or {}
-        gids = {int(b["guild_id"]) for b in doc.get("open", []) if b.get("guild_id")}
-        for gid in gids:
-            try:
-                await self.update_guild(gid)
-            except Exception as e:
-                print(f"[BountyUpdater] update failed for guild {gid}: {e}")
+                save_file(BOUNTIES_DB, db)
 
 # ---------------------------- Kill detection ---------------------------------
-KILL_RE = re.compile(r"^(?P<ts>\d\d:\d\d:\d\d).*?(?P<victim>.+?) was killed by (?P<killer>.+?)\b", re.IGNORECASE)
+KILL_RE = re.compile(
+    r"^(?P<ts>\d\d:\d\d:\d\d).*?(?P<victim>.+?) was killed by (?P<killer>.+?)\b",
+    re.IGNORECASE
+)
 
-async def check_kills_and_award(guild_id: int):
-    # Try open latest ADM text (if present). If unavailable, silently skip.
+async def check_kills_and_award(bot: commands.Bot, guild_id: int):
+    """Close bounties whose target was killed and award killer."""
     try:
         txt = Path(ADM_LATEST_PATH).read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return
+
     bdoc = load_file(BOUNTIES_DB) or {}
     open_bounties = bdoc.get("open", [])
     if not open_bounties:
         return
 
-    kills: List[Tuple[str,str]] = []  # (victim, killer)
-    for line in txt.splitlines()[-2000:]:  # scan last chunk
+    kills: List[Tuple[str,str]] = []
+    for line in txt.splitlines()[-2000:]:
         m = KILL_RE.search(line)
-        if not m:
-            continue
-        kills.append((m.group("victim").strip(), m.group("killer").strip()))
+        if m:
+            kills.append((m.group("victim").strip(), m.group("killer").strip()))
+
+    if not kills:
+        return
 
     changed = False
     for victim, killer in kills:
-        # If victim has an open bounty in this guild, close and award killer if linked
         for b in list(open_bounties):
             if int(b.get("guild_id", 0)) != guild_id:
                 continue
-            if b.get("target_gamertag","").lower() == victim.lower():
-                tickets = int(b.get("tickets", 0))
-                # Resolve killer's discord id (if linked), else try by gamertag
-                did, k_gt = resolve_from_any(guild_id, gamertag=killer)
-                if not did:
-                    did, k_gt = resolve_from_any(guild_id, discord_id=killer)  # unlikely, fallback
-                if did:
-                    ok, newbal = _adjust_tickets(str(did), +tickets)
-                # remove bounty
-                open_bounties.remove(b)
-                changed = True
-                # Announce
-                settings = _guild_settings(guild_id)
-                ch_id = settings.get("bounty_channel_id")
-                ch = None
-                if ch_id:
-                    ch = bot.get_channel(int(ch_id))  # type: ignore[name-defined]
-                msg = f"✅ **Bounty completed!** `{victim}` was taken out by `{killer}`. Award: **{tickets} SV tickets**."
-                if ch:
-                    try:
-                        await ch.send(msg)
-                    except Exception:
-                        pass
+            if b.get("target_gamertag","").lower() != victim.lower():
+                continue
+
+            tickets = int(b.get("tickets", 0))
+            # Resolve killer → discord id if linked
+            did, _ = resolve_from_any(guild_id, gamertag=killer)
+            if not did:
+                did, _ = resolve_from_any(guild_id, discord_id=killer)  # fallback
+
+            if did:
+                _adjust_tickets(str(did), +tickets)
+
+            open_bounties.remove(b)
+            changed = True
+
+            # Announce in bounty channel
+            ch_id = _guild_settings(guild_id).get("bounty_channel_id")
+            ch = bot.get_channel(int(ch_id)) if ch_id else None
+            if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                try:
+                    await ch.send(
+                        f"✅ **Bounty completed!** `{victim}` was taken out by `{killer}`. "
+                        f"Award: **{tickets} SV tickets**."
+                    )
+                except Exception:
+                    pass
+
     if changed:
         bdoc["open"] = open_bounties
         save_file(BOUNTIES_DB, bdoc)
@@ -272,19 +267,29 @@ async def check_kills_and_award(guild_id: int):
 class BountyCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        live_pulse.init(bot)  # available if used elsewhere
+        live_pulse.init(bot)  # ok if unused elsewhere
         self.updater = BountyUpdater(bot)
-        self.updater.loop.start()
+
+        # Start both loops owned by the Cog
+        self.bounty_updater.start()
+        self.kill_watcher.start()
 
     def cog_unload(self):
-        try:
-            self.updater.loop.cancel()
-        except Exception:
-            pass
+        for loop_task in (self.bounty_updater, self.kill_watcher):
+            try:
+                loop_task.cancel()
+            except Exception:
+                pass
 
     @app_commands.command(name="svbounty", description="Set a bounty on a linked player (2–10 SV tickets).")
     @app_commands.describe(user="Discord user (if linked)", gamertag="In-game gamertag", tickets="Tickets to set (2–10)")
-    async def svbounty(self, interaction: discord.Interaction, user: Optional[discord.Member] = None, gamertag: Optional[str] = None, tickets: int = 2):
+    async def svbounty(
+        self,
+        interaction: discord.Interaction,
+        user: Optional[discord.Member] = None,
+        gamertag: Optional[str] = None,
+        tickets: int = 2
+    ):
         await interaction.response.defer(ephemeral=True)
 
         gid = interaction.guild_id
@@ -293,48 +298,61 @@ class BountyCog(commands.Cog):
 
         # Invoker must be linked
         inv_id = str(interaction.user.id)
-        is_linked, inv_gt = _is_linked_discord(gid, inv_id)
+        is_linked, _ = _is_linked_discord(gid, inv_id)
         if not is_linked:
             return await interaction.followup.send(
-                "❌ You are not linked yet. Please run the Rewards Bot `/link` command first.", ephemeral=True
+                "❌ You are not linked yet. Please run the Rewards Bot `/link` command first.",
+                ephemeral=True
             )
 
         # Validate tickets
         if tickets < 2 or tickets > 10:
-            return await interaction.followup.send("❌ Ticket amount must be between **2** and **10**.", ephemeral=True)
+            return await interaction.followup.send(
+                "❌ Ticket amount must be between **2** and **10**.",
+                ephemeral=True
+            )
 
         # Identify target
         target_discord_id: Optional[str] = None
         target_gt: Optional[str] = None
 
         if user is not None:
-            # Resolve linked gamertag for this discord user
             did, gt = resolve_from_any(gid, discord_id=str(user.id))
             if not did or not gt:
-                return await interaction.followup.send("❌ That Discord user is not linked to a gamertag.", ephemeral=True)
+                return await interaction.followup.send(
+                    "❌ That Discord user is not linked to a gamertag.",
+                    ephemeral=True
+                )
             target_discord_id = str(did)
             target_gt = gt
         elif gamertag:
-            # Resolve to ensure it's a known/linked gamertag (any source)
             did, gt = resolve_from_any(gid, gamertag=gamertag)
             if not gt:
-                return await interaction.followup.send("❌ That gamertag is not linked.", ephemeral=True)
+                return await interaction.followup.send(
+                    "❌ That gamertag is not linked.",
+                    ephemeral=True
+                )
             target_discord_id = str(did) if did else None
             target_gt = gt
         else:
-            return await interaction.followup.send("❌ Provide either a `user` or a `gamertag`.", ephemeral=True)
+            return await interaction.followup.send(
+                "❌ Provide either a `user` or a `gamertag`.",
+                ephemeral=True
+            )
 
         # Safeguard: must have been seen in ADM (players_index)
         if not _is_player_seen(target_gt):
             return await interaction.followup.send(
-                f"❌ `{target_gt}` hasn't been seen in ADM yet — bounty can't be set.", ephemeral=True
+                f"❌ `{target_gt}` hasn't been seen in ADM yet — bounty can't be set.",
+                ephemeral=True
             )
 
         # Check invoker has tickets
         ok, bal_after = _adjust_tickets(inv_id, -tickets)
         if not ok:
             return await interaction.followup.send(
-                f"❌ Not enough SV tickets. You need **{tickets}**, but your balance is **{bal_after}**.", ephemeral=True
+                f"❌ Not enough SV tickets. You need **{tickets}**, but your balance is **{bal_after}**.",
+                ephemeral=True
             )
 
         # Create/open bounty record
@@ -348,14 +366,21 @@ class BountyCog(commands.Cog):
             "message": None,
         }
         bdoc = load_file(BOUNTIES_DB) or {"open": [], "closed": []}
-        # Prevent duplicates (same target)
+        # Prevent duplicates (same target in this guild)
         for b in bdoc["open"]:
             if int(b.get("guild_id", 0)) == gid and str(b.get("target_gamertag","")).lower() == target_gt.lower():
-                return await interaction.followup.send("❌ A bounty for that player is already active.", ephemeral=True)
+                return await interaction.followup.send(
+                    "❌ A bounty for that player is already active.",
+                    ephemeral=True
+                )
         bdoc["open"].append(rec)
         save_file(BOUNTIES_DB, bdoc)
 
-        await interaction.followup.send(f"✅ Bounty set on **{target_gt}** for **{tickets} SV tickets**. Your new balance: **{bal_after}**.", ephemeral=True)
+        await interaction.followup.send(
+            f"✅ Bounty set on **{target_gt}** for **{tickets} SV tickets**. "
+            f"Your new balance: **{bal_after}**.",
+            ephemeral=True
+        )
 
         # Trigger an immediate update for this guild
         try:
@@ -365,16 +390,46 @@ class BountyCog(commands.Cog):
 
     # Optional admin cleanups
     @app_commands.command(name="svbounty_remove", description="Remove an active bounty by user or gamertag.")
-    async def svbounty_remove(self, interaction: discord.Interaction, user: Optional[discord.Member] = None, gamertag: Optional[str] = None):
+    async def svbounty_remove(
+        self,
+        interaction: discord.Interaction,
+        user: Optional[discord.Member] = None,
+        gamertag: Optional[str] = None
+    ):
         await interaction.response.defer(ephemeral=True)
-        gid = interaction.guild_id or 0
         if user:
             n = remove_bounty_by_discord_id(str(user.id))
-            return await interaction.followup.send(f"Removed **{n}** bounty(ies) for {user.mention}.", ephemeral=True)
+            return await interaction.followup.send(
+                f"Removed **{n}** bounty(ies) for {user.mention}.",
+                ephemeral=True
+            )
         if gamertag:
             n = remove_bounty_by_gamertag(gamertag)
-            return await interaction.followup.send(f"Removed **{n}** bounty(ies) for `{gamertag}`.", ephemeral=True)
-        await interaction.followup.send("Provide `user` or `gamertag`.", ephemeral=True)
+            return await interaction.followup.send(
+                f"Removed **{n}** bounty(ies) for `{gamertag}`.",
+                ephemeral=True
+            )
+        await interaction.followup.send(
+            "Provide `user` or `gamertag`.",
+            ephemeral=True
+        )
+
+    # ------------------ Background loops owned by the Cog ------------------
+    @tasks.loop(minutes=5.0)
+    async def bounty_updater(self):
+        # Update all guilds that currently have open bounties
+        doc = load_file(BOUNTIES_DB) or {}
+        gids = {int(b["guild_id"]) for b in doc.get("open", []) if b.get("guild_id")}
+        for gid in gids:
+            try:
+                await self.updater.update_guild(gid)
+            except Exception as e:
+                print(f"[BountyCog] update failed for guild {gid}: {e}")
+
+    @bounty_updater.before_loop
+    async def _before_bounty_updater(self):
+        await self.bot.wait_until_ready()
+        await asyncio.sleep(5)
 
     @tasks.loop(minutes=2.0)
     async def kill_watcher(self):
@@ -383,16 +438,12 @@ class BountyCog(commands.Cog):
         gids = {int(b["guild_id"]) for b in doc.get("open", []) if b.get("guild_id")}
         for gid in gids:
             try:
-                await check_kills_and_award(gid)
+                await check_kills_and_award(self.bot, gid)
             except Exception:
                 pass
 
     @kill_watcher.before_loop
     async def _before_kw(self):
-        await self.bot.wait_until_ready()
-
-    @loop.before_loop  # type: ignore[name-defined]
-    async def _before_updater(self):
         await self.bot.wait_until_ready()
 
 
