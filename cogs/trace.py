@@ -1,4 +1,4 @@
-import inspect
+# cogs/trace.py
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -9,7 +9,6 @@ from utils.settings import load_settings
 from utils.linking import resolve_from_any
 from tracer.tracker import load_track
 from tracer.map_renderer import render_track_png
-
 
 # ----------------------- tiny logger -----------------------
 def _now() -> str:
@@ -55,33 +54,9 @@ def _active_map_name(guild_id: int | None) -> str:
 
 def _izurvive_url(map_name: str, x: float, z: float) -> str:
     slug = _MAP_SLUG.get(map_name.lower(), "livonia")
+    # iZurvive accepts decimals; semicolon delimiter jumps to the exact spot
     return f"https://www.izurvive.com/{slug}/#location={x:.2f};{z:.2f}"
 # -----------------------------------------------------------------------------
-
-
-def _render_track_image(doc: Dict[str, Any], guild_id: int | None):
-    """
-    Call the renderer in a signature-agnostic way.
-    It may be defined as either:
-        render_track_png(doc)
-        render_track_png(doc, guild_id=...)
-        render_track_png(guild_id, doc)
-    We try the sensible permutations.
-    """
-    # First, try keyword guild_id with doc first (most common)
-    try:
-        return render_track_png(doc, guild_id=guild_id)  # type: ignore[arg-type]
-    except TypeError:
-        pass
-
-    # Second, try positional (guild_id, doc)
-    try:
-        return render_track_png(guild_id, doc)  # type: ignore[misc]
-    except TypeError:
-        pass
-
-    # Finally, try plain (doc) with no guild
-    return render_track_png(doc)  # type: ignore[misc]
 
 
 class TraceCog(commands.Cog):
@@ -122,29 +97,40 @@ class TraceCog(commands.Cog):
         })
 
         # ---------------- identity resolution ----------------
-        did = str(user.id) if user else None
-        if not (did or gamertag):
-            did = str(interaction.user.id)
-        _log(guild_id, "resolving identity", {"discord_id": did, "gamertag": gamertag})
+        # If a gamertag was explicitly provided, trust it (no link required).
+        resolved_tag: str | None = None
+        resolved_did: str | None = None
 
-        try:
-            resolved_did, resolved_tag = resolve_from_any(
-                guild_id, discord_id=did, gamertag=gamertag
-            )
-        except Exception as e:
-            _log(guild_id, "resolve_from_any raised", {"error": repr(e)})
-            return await interaction.followup.send(
-                "❌ Internal error while resolving player identity. Check logs.", ephemeral=True
-            )
+        def _clean_tag(s: str) -> str:
+            # trim, normalize common weird whitespace/quotes
+            return (s or "").strip().strip("“”\"'")
 
-        _log(guild_id, "identity resolved", {
+        if gamertag and _clean_tag(gamertag):
+            resolved_tag = _clean_tag(gamertag)
+            resolved_did = str(user.id) if user else None
+            _log(guild_id, "using provided gamertag (bypassing link lookup)", {"gamertag": resolved_tag})
+        else:
+            did = str(user.id) if user else str(interaction.user.id)
+            _log(guild_id, "resolving via link table", {"discord_id": did})
+            try:
+                resolved_did, resolved_tag = resolve_from_any(
+                    guild_id, discord_id=did, gamertag=None
+                )
+            except Exception as e:
+                _log(guild_id, "resolve_from_any raised", {"error": repr(e)})
+                return await interaction.followup.send(
+                    "❌ Internal error while resolving player identity. Check logs.", ephemeral=True
+                )
+
+        _log(guild_id, "identity result", {
             "resolved_discord_id": resolved_did,
             "resolved_gamertag": resolved_tag
         })
 
         if not resolved_tag:
             return await interaction.followup.send(
-                "❌ Couldn’t resolve that player. Use `/link` first or provide a gamertag.",
+                "❌ Couldn’t resolve that player. "
+                "Provide a **gamertag** in the command or `/link` your Discord first.",
                 ephemeral=True
             )
 
@@ -152,6 +138,7 @@ class TraceCog(commands.Cog):
         dt_start = _parse_dt(start) if start else None
         dt_end = _parse_dt(end) if end else datetime.now(timezone.utc)
 
+        # If explicit start provided, compute a sane end if missing/invalid and ignore window_hours
         if dt_start:
             if not dt_end or dt_end <= dt_start:
                 dt_end = dt_start + timedelta(hours=1)
@@ -218,14 +205,13 @@ class TraceCog(commands.Cog):
             points = pts
             count = len(points)
 
-        # Ensure the map is present in doc for renderers that need it
-        doc_map = doc.get("map") or _active_map_name(guild_id)
-        if "map" not in doc:
-            doc = {**doc, "map": doc_map}
-
         # ------------------- render image --------------------
         try:
-            img = _render_track_image(doc, guild_id)
+            # Newer renderer may accept guild_id; call compatibly.
+            try:
+                img = render_track_png(doc, guild_id=guild_id)  # newer signature
+            except TypeError:
+                img = render_track_png(doc)  # older signature
         except Exception as e:
             _log(guild_id, "render_track_png failed", {"error": repr(e), "doc_keys": list(doc.keys())})
             return await interaction.followup.send(
@@ -244,13 +230,15 @@ class TraceCog(commands.Cog):
         except Exception:
             lx, lz = 0.0, 0.0
 
-        izu = _izurvive_url(doc_map, lx, lz)
+        map_name = _active_map_name(guild_id)
+        izu = _izurvive_url(map_name, lx, lz)
 
         when = ""
         try:
             ts_raw = last.get("ts")
             if ts_raw:
-                when = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")).astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+                when = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
+                               .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
         except Exception:
             pass
 
