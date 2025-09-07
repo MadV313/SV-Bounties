@@ -25,8 +25,8 @@ from tracer.tracker import load_track
 
 # ---------------------------- Persistence paths ------------------------------
 BOUNTIES_DB = "data/bounties.json"        # list of open/closed bounties (utils.bounties also writes here)
-# IMPORTANT: probe both, so we match your external layout no matter how it's mounted
-WALLET_PATHS = ["data/wallet.json", "wallet.json"]
+# Local fallbacks if no external base/path is configured
+LOCAL_WALLET_PATHS = ["data/wallet.json", "wallet.json"]
 LINKS_DB     = "data/linked_players.json" # external links file (via /set external)
 
 # Optional: ADM latest path for kill detection (can be overridden via settings later)
@@ -66,30 +66,45 @@ def _is_player_seen(gamertag: str) -> bool:
     g = gamertag or ""
     return any(k.lower() == g.lower() for k in idx.keys())
 
-# ---------------- Wallet helpers (probe multiple paths; do NOT overwrite on miss) ---
-def _load_wallet_doc_and_path() -> Tuple[Optional[dict], Optional[str]]:
+# -------- Wallet helpers (use per-guild settings, then local fallbacks) -------
+def _wallet_candidate_paths_for_guild(gid: int) -> List[str]:
+    st = _guild_settings(gid) or {}
+    base = (st.get("external_data_base") or "").strip().rstrip("/")
+    explicit = (st.get("external_wallet_path") or "").strip()
+    candidates: List[str] = []
+    if explicit:
+        candidates.append(explicit)
+    if base:
+        candidates.append(f"{base}/wallet.json")
+    candidates += LOCAL_WALLET_PATHS
+    return candidates
+
+def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
     """
-    Try the known wallet locations and return the first non-empty dict plus its path.
-    If none exist, return ({}, path) if an empty file exists; otherwise (None, None).
+    Try the configured external paths first, then locals.
+    Return (doc, path) for the first JSON object found.
+    If none found, return (None, None).
     """
-    chosen_empty_path: Optional[str] = None
-    for p in WALLET_PATHS:
-        doc = load_file(p)
+    empty_path: Optional[str] = None
+    for p in _wallet_candidate_paths_for_guild(gid):
+        try:
+            doc = load_file(p)
+        except Exception:
+            doc = None
         if isinstance(doc, dict):
-            # Remember an empty-but-present dict so we can still write back if user exists.
+            # Prefer a non-empty mapping, but remember an empty one as a fallback
             if doc:
                 print(f"[bounty] Using wallet file: {p} (non-empty)")
                 return doc, p
-            else:
-                chosen_empty_path = chosen_empty_path or p
-    if chosen_empty_path:
-        print(f"[bounty] Using wallet file: {chosen_empty_path} (empty)")
-        return {}, chosen_empty_path
-    print("[bounty] No wallet file found in expected paths.")
+            empty_path = empty_path or p
+    if empty_path is not None:
+        print(f"[bounty] Using wallet file: {empty_path} (empty)")
+        return {}, empty_path
+    print(f"[bounty] No wallet file found in expected paths: {', '.join(_wallet_candidate_paths_for_guild(gid))}")
     return None, None
 
-def _get_user_balance(discord_id: str) -> Tuple[int, Optional[dict], Optional[str]]:
-    wallets, path = _load_wallet_doc_and_path()
+def _get_user_balance(gid: int, discord_id: str) -> Tuple[int, Optional[dict], Optional[str]]:
+    wallets, path = _load_wallet_doc_and_path(gid)
     if wallets is None:
         return 0, None, None
     entry = wallets.get(discord_id, {})
@@ -103,15 +118,14 @@ def _get_user_balance(discord_id: str) -> Tuple[int, Optional[dict], Optional[st
             bal = 0
     return bal, wallets, path
 
-def _adjust_tickets(discord_id: str, delta: int) -> Tuple[bool, int]:
+def _adjust_tickets(gid: int, discord_id: str, delta: int) -> Tuple[bool, int]:
     """
     Adjust tickets only if:
       - wallet file is present
       - user already has a wallet entry
-    We DO NOT auto-create a new user entry (to avoid accidentally overwriting the external repo
-    if we’re pointing at the wrong location). This mirrors Rewards Bot behavior.
+    We DO NOT auto-create a new user entry (to avoid writing to a wrong mount).
     """
-    cur, wallets, path = _get_user_balance(discord_id)
+    cur, wallets, path = _get_user_balance(gid, discord_id)
     if wallets is None or path is None:
         print("[bounty] _adjust_tickets: wallet file missing; refusing to write")
         return False, 0
@@ -294,7 +308,7 @@ async def check_kills_and_award(bot: commands.Bot, guild_id: int):
                 did, _ = resolve_from_any(guild_id, discord_id=killer)  # fallback
 
             if did:
-                _adjust_tickets(str(did), +tickets)
+                _adjust_tickets(guild_id, str(did), +tickets)
 
             open_bounties.remove(b)
             changed = True
@@ -439,12 +453,12 @@ class BountyCog(commands.Cog):
                 )
 
         # Check invoker has tickets (do NOT create wallet entries on the fly)
-        ok, bal_after = _adjust_tickets(inv_id, -tickets)
+        ok, bal_after = _adjust_tickets(gid, inv_id, -tickets)
         if not ok:
             # Give a clear hint if the wallet file wasn't present or user not found
-            cur, wallets, path = _get_user_balance(inv_id)
+            cur, wallets, path = _get_user_balance(gid, inv_id)
             if wallets is None:
-                hint = " Wallet file not found on this bot host."
+                hint = " Wallet file not found on this bot host. Configure with `/setexternalbase` or `/setexternalwallet`."
             elif inv_id not in wallets:
                 hint = " Your wallet entry was not found."
             else:
@@ -470,7 +484,7 @@ class BountyCog(commands.Cog):
         for b in bdoc["open"]:
             if int(b.get("guild_id", 0)) == gid and str(b.get("target_gamertag","")).lower() == target_gt.lower():
                 # refund since we already deducted
-                _adjust_tickets(inv_id, +tickets)
+                _adjust_tickets(gid, inv_id, +tickets)
                 return await interaction.followup.send(
                     "❌ A bounty for that player is already active.",
                     ephemeral=True
