@@ -253,14 +253,16 @@ async def check_kills_and_award(bot: commands.Bot, guild_id: int):
             open_bounties.remove(b)
             changed = True
 
-            # Announce in bounty channel
+            # Announce in bounty channel (snazzy)
             ch_id = _guild_settings(guild_id).get("bounty_channel_id")
             ch = bot.get_channel(int(ch_id)) if ch_id else None
             if isinstance(ch, (discord.TextChannel, discord.Thread)):
                 try:
                     await ch.send(
-                        f"✅ **Bounty completed!** `{victim}` was taken out by `{killer}`. "
-                        f"Award: **{tickets} SV tickets**."
+                        "📢 **Attention survivors!**\n"
+                        f"The bounty for **{victim}** has been claimed by **{killer}** and they have been "
+                        f"duly awarded **{tickets} SV tickets** for bringing down the culprit!\n"
+                        "Be on the look out for more bounties as they update here!"
                     )
                 except Exception:
                     pass
@@ -420,7 +422,7 @@ class BountyCog(commands.Cog):
         bdoc["open"].append(rec)
         save_file(BOUNTIES_DB, bdoc)
 
-        # Confirmation
+        # Ephemeral confirmation to invoker
         extra = ""
         if not target_discord_id:
             extra = (
@@ -433,7 +435,22 @@ class BountyCog(commands.Cog):
             ephemeral=True
         )
 
-        # Trigger an immediate update for this guild
+        # Public announcement in the bounty channel (snazzy)
+        ch = self.bot.get_channel(int(bounty_channel_id))
+        if isinstance(ch, (discord.TextChannel, discord.Thread)):
+            try:
+                pretty_reason = rec["reason"] or "_no reason provided_"
+                await ch.send(
+                    "📢 **Attention survivors!**\n"
+                    f"A new bounty has been set for **{target_gt}** by <@{inv_id}> for **{tickets} SV tickets**.\n"
+                    f"**Reason:** {pretty_reason}\n"
+                    "Be on the look out for their live updates here in this channel — below is their most recent last known location!\n"
+                    "**Stay Frosty!**"
+                )
+            except Exception:
+                pass
+
+        # Trigger an immediate update for this guild (posts the live map under the announcement)
         try:
             await self.updater.update_guild(gid)
         except Exception:
