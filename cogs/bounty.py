@@ -5,12 +5,12 @@ import io
 import re
 import json
 import asyncio
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple, List
 from pathlib import Path  # ← needed by kill scanner
-from urllib.request import Request, urlopen  # ← for http(s) JSON
-from urllib.error import URLError, HTTPError
 
 import discord
 from discord import app_commands
@@ -69,46 +69,6 @@ def _is_player_seen(gamertag: str) -> bool:
     g = gamertag or ""
     return any(k.lower() == g.lower() for k in idx.keys())
 
-# -------- JSON loader that handles http(s) OR local paths --------------------
-def _read_json_any(path: str) -> Optional[dict]:
-    """
-    Returns a dict if path can be loaded and parsed, else None.
-    Supports:
-      - http(s) URLs
-      - a path that utils.storageClient.load_file can read
-      - direct filesystem fallback
-    """
-    try:
-        lo = path.lower()
-        if lo.startswith("http://") or lo.startswith("https://"):
-            req = Request(path, headers={"User-Agent": "SV-Bounties/wallet-fetch"})
-            with urlopen(req, timeout=8.0) as resp:  # nosec - admin-provided URL
-                charset = resp.headers.get_content_charset() or "utf-8"
-                raw = resp.read().decode(charset, errors="replace")
-            return json.loads(raw)
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
-        print(f"[bounty] http load failed for {path}: {e}")
-
-    # Try storageClient route
-    try:
-        data = load_file(path)
-        if isinstance(data, dict):
-            return data
-        if isinstance(data, str):
-            return json.loads(data)
-    except Exception as e:
-        pass
-
-    # Last-resort: filesystem
-    try:
-        p = Path(path)
-        if p.is_file():
-            return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-
-    return None
-
 # -------- Wallet helpers (use per-guild settings, then local fallbacks) -------
 def _wallet_candidate_paths_for_guild(gid: int) -> List[str]:
     st = _guild_settings(gid) or {}
@@ -122,6 +82,47 @@ def _wallet_candidate_paths_for_guild(gid: int) -> List[str]:
     candidates += LOCAL_WALLET_PATHS
     return candidates
 
+def _load_json_from_any(path: str) -> Optional[dict]:
+    """
+    Load a JSON object from either a local path (via storageClient / FS) or an HTTP(S) URL.
+    Returns a dict on success, otherwise None.
+    """
+    if path.lower().startswith(("http://", "https://")):
+        try:
+            req = Request(path, headers={"User-Agent": "SV-Bounties/wallet-fetch"})
+            with urlopen(req, timeout=8.0) as resp:  # nosec - admin-provided URL
+                charset = resp.headers.get_content_charset() or "utf-8"
+                raw = resp.read().decode(charset, errors="replace")
+            doc = json.loads(raw)
+            if isinstance(doc, dict):
+                return doc
+            return None
+        except Exception as e:
+            print(f"[bounty] HTTP load failed for {path}: {type(e).__name__}: {e}")
+            return None
+
+    # Local: try storageClient first
+    try:
+        data = load_file(path)
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, str):
+        try:
+            return json.loads(data)
+        except Exception:
+            return None
+
+    # Final local FS fallback
+    try:
+        p = Path(path)
+        if p.is_file():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[bounty] Local load failed for {path}: {type(e).__name__}: {e}")
+    return None
+
 def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
     """
     Try the configured external paths first, then locals.
@@ -129,9 +130,10 @@ def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
     If none found, return (None, None).
     """
     empty_path: Optional[str] = None
-    candidates = _wallet_candidate_paths_for_guild(gid)
-    for p in candidates:
-        doc = _read_json_any(p)
+    tried: List[str] = []
+    for p in _wallet_candidate_paths_for_guild(gid):
+        tried.append(p)
+        doc = _load_json_from_any(p)
         if isinstance(doc, dict):
             if doc:
                 print(f"[bounty] Using wallet file: {p} (non-empty)")
@@ -140,7 +142,7 @@ def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
     if empty_path is not None:
         print(f"[bounty] Using wallet file: {empty_path} (empty)")
         return {}, empty_path
-    print(f"[bounty] No wallet file found in expected paths: {', '.join(candidates)}")
+    print(f"[bounty] No wallet file found. Tried: {', '.join(tried)}")
     return None, None
 
 def _get_user_balance(gid: int, discord_id: str) -> Tuple[int, Optional[dict], Optional[str]]:
@@ -498,7 +500,7 @@ class BountyCog(commands.Cog):
             # Give a clear hint if the wallet file wasn't present or user not found
             cur, wallets, path = _get_user_balance(gid, inv_id)
             if wallets is None:
-                hint = " Wallet file not found on this bot host. Configure with `/setexternalbase` or `/setexternalwallet`."
+                hint = " Wallet file not found on this bot host or remote URL."
             elif inv_id not in wallets:
                 hint = " Your wallet entry was not found."
             else:
