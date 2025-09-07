@@ -12,7 +12,7 @@ from pathlib import Path  # ← needed by kill scanner
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from PIL import Image, ImageDraw, ImageFont  # Pillow
+from PIL import Image, ImageDraw  # Pillow
 
 from utils.settings import load_settings
 from utils.storageClient import load_file, save_file
@@ -24,9 +24,10 @@ from tracer.config import MAPS, INDEX_PATH, TRACKS_DIR
 from tracer.tracker import load_track
 
 # ---------------------------- Persistence paths ------------------------------
-BOUNTIES_DB = "data/bounties.json"       # list of open/closed bounties (utils.bounties also writes here)
-WALLETS_DB  = "data/wallet.json"         # persistent repo (external) via /set external previously
-LINKS_DB    = "data/linked_players.json" # external links file (via /set external)
+BOUNTIES_DB = "data/bounties.json"        # list of open/closed bounties (utils.bounties also writes here)
+# IMPORTANT: probe both, so we match your external layout no matter how it's mounted
+WALLET_PATHS = ["data/wallet.json", "wallet.json"]
+LINKS_DB     = "data/linked_players.json" # external links file (via /set external)
 
 # Optional: ADM latest path for kill detection (can be overridden via settings later)
 ADM_LATEST_PATH = "data/latest_adm.log"
@@ -65,22 +66,67 @@ def _is_player_seen(gamertag: str) -> bool:
     g = gamertag or ""
     return any(k.lower() == g.lower() for k in idx.keys())
 
-def _ensure_wallet(doc: dict, discord_id: str) -> dict:
-    if discord_id not in doc:
-        doc[discord_id] = {"sv_tickets": 0}
-    if "sv_tickets" not in doc[discord_id]:
-        doc[discord_id]["sv_tickets"] = 0
-    return doc
+# ---------------- Wallet helpers (probe multiple paths; do NOT overwrite on miss) ---
+def _load_wallet_doc_and_path() -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Try the known wallet locations and return the first non-empty dict plus its path.
+    If none exist, return ({}, path) if an empty file exists; otherwise (None, None).
+    """
+    chosen_empty_path: Optional[str] = None
+    for p in WALLET_PATHS:
+        doc = load_file(p)
+        if isinstance(doc, dict):
+            # Remember an empty-but-present dict so we can still write back if user exists.
+            if doc:
+                print(f"[bounty] Using wallet file: {p} (non-empty)")
+                return doc, p
+            else:
+                chosen_empty_path = chosen_empty_path or p
+    if chosen_empty_path:
+        print(f"[bounty] Using wallet file: {chosen_empty_path} (empty)")
+        return {}, chosen_empty_path
+    print("[bounty] No wallet file found in expected paths.")
+    return None, None
+
+def _get_user_balance(discord_id: str) -> Tuple[int, Optional[dict], Optional[str]]:
+    wallets, path = _load_wallet_doc_and_path()
+    if wallets is None:
+        return 0, None, None
+    entry = wallets.get(discord_id, {})
+    bal = entry.get("sv_tickets", 0)
+    try:
+        bal = int(bal)
+    except Exception:
+        try:
+            bal = int(float(bal))
+        except Exception:
+            bal = 0
+    return bal, wallets, path
 
 def _adjust_tickets(discord_id: str, delta: int) -> Tuple[bool, int]:
-    wallets = load_file(WALLETS_DB) or {}
-    wallets = _ensure_wallet(wallets, discord_id)
-    cur = int(wallets[discord_id]["sv_tickets"])
+    """
+    Adjust tickets only if:
+      - wallet file is present
+      - user already has a wallet entry
+    We DO NOT auto-create a new user entry (to avoid accidentally overwriting the external repo
+    if we’re pointing at the wrong location). This mirrors Rewards Bot behavior.
+    """
+    cur, wallets, path = _get_user_balance(discord_id)
+    if wallets is None or path is None:
+        print("[bounty] _adjust_tickets: wallet file missing; refusing to write")
+        return False, 0
+
+    if discord_id not in wallets:
+        print(f"[bounty] _adjust_tickets: user {discord_id} not in wallet map for {path}")
+        return False, cur
+
     if delta < 0 and cur < (-delta):
         return False, cur
-    wallets[discord_id]["sv_tickets"] = cur + delta
-    save_file(WALLETS_DB, wallets)
-    return True, wallets[discord_id]["sv_tickets"]
+
+    new_bal = cur + delta
+    wallets[discord_id]["sv_tickets"] = new_bal
+    save_file(path, wallets)
+    return True, new_bal
 
 def _canon_map_and_cfg(map_name: Optional[str]) -> Tuple[str, dict]:
     key = (map_name or "livonia").lower()
@@ -392,11 +438,19 @@ class BountyCog(commands.Cog):
                     ephemeral=True
                 )
 
-        # Check invoker has tickets
+        # Check invoker has tickets (do NOT create wallet entries on the fly)
         ok, bal_after = _adjust_tickets(inv_id, -tickets)
         if not ok:
+            # Give a clear hint if the wallet file wasn't present or user not found
+            cur, wallets, path = _get_user_balance(inv_id)
+            if wallets is None:
+                hint = " Wallet file not found on this bot host."
+            elif inv_id not in wallets:
+                hint = " Your wallet entry was not found."
+            else:
+                hint = ""
             return await interaction.followup.send(
-                f"❌ Not enough SV tickets. You need **{tickets}**, but your balance is **{bal_after}**.",
+                f"❌ Not enough SV tickets. You need **{tickets}**, but your balance is **{cur}**.{hint}",
                 ephemeral=True
             )
 
@@ -415,6 +469,8 @@ class BountyCog(commands.Cog):
         # Prevent duplicates (same target in this guild)
         for b in bdoc["open"]:
             if int(b.get("guild_id", 0)) == gid and str(b.get("target_gamertag","")).lower() == target_gt.lower():
+                # refund since we already deducted
+                _adjust_tickets(inv_id, +tickets)
                 return await interaction.followup.send(
                     "❌ A bounty for that player is already active.",
                     ephemeral=True
