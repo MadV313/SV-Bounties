@@ -12,7 +12,6 @@ from discord.ext import commands
 from utils.settings import load_settings
 from PIL import Image, ImageDraw, ImageFont  # Pillow
 
-
 # Optional import from tracker (safe fallback if not present during reloads)
 try:
     from tracer.tracker import get_guild_snapshot  # type: ignore
@@ -47,6 +46,14 @@ def _log(gid: int, msg: str, extra: Dict[str, Any] | None = None):
 
 
 # ----------------------- map helpers -----------------------
+# Canonical names for maps (so we can accept any case/variant)
+CANON_MAP = {
+    "chernarus+": "Chernarus+",
+    "chernarus": "Chernarus",
+    "livonia": "Livonia",
+    "namalsk": "Namalsk",
+}
+
 # World sizes (meters) for common DayZ maps (x/z range).
 WORLD_SIZE = {
     "Chernarus+": 15360,
@@ -70,7 +77,13 @@ MAP_PATHS = {
     "Namalsk": "assets/maps/namalsk_base.PNG",
 }
 
-# Stronger path resolution (handles different working dirs / case sensitive FS)
+
+def _canon_map_name(s: str | None) -> str:
+    s = (s or "Livonia").strip()
+    return CANON_MAP.get(s.casefold(), "Livonia")
+
+
+# Strong path resolution (handles different working dirs / case sensitive FS)
 def _resolve_asset(rel_path: str) -> Path | None:
     """
     Try several locations to find the asset on disk:
@@ -91,7 +104,6 @@ def _resolve_asset(rel_path: str) -> Path | None:
     candidates.append(here / rel)
 
     # 3) project root (../)
-    # cogs/<this file>  -> project root is parent of cogs
     candidates.append(here.parent / rel)
 
     # 4) explicit /app (Railway containers usually run from /app)
@@ -108,11 +120,12 @@ def _resolve_asset(rel_path: str) -> Path | None:
 
 def _active_map_for_guild(gid: int) -> str:
     st = load_settings(gid) or {}
-    return (st.get("active_map") or "Livonia").strip()
+    active = _canon_map_name(st.get("active_map"))
+    return active
 
 
 def _world_size_for(map_name: str) -> int:
-    return WORLD_SIZE.get(map_name, 15360)
+    return WORLD_SIZE.get(_canon_map_name(map_name), 15360)
 
 
 def _load_map_image(gid: int, map_name: str, size_px: int = 1400) -> Image.Image:
@@ -120,7 +133,8 @@ def _load_map_image(gid: int, map_name: str, size_px: int = 1400) -> Image.Image
     Try loading a map background; fall back to blank grid if missing.
     Returns an RGBA image (square) so we can draw anti-aliased labels.
     """
-    rel = MAP_PATHS.get(map_name)
+    canon = _canon_map_name(map_name)
+    rel = MAP_PATHS.get(canon)
     if rel:
         abs_path = _resolve_asset(rel)
         if abs_path:
@@ -133,12 +147,14 @@ def _load_map_image(gid: int, map_name: str, size_px: int = 1400) -> Image.Image
                     oy = (side - img.height) // 2
                     canvas.paste(img, (ox, oy))
                     img = canvas
-                _log(gid, "map image loaded", {"map": map_name, "path": str(abs_path)})
+                _log(gid, "map image loaded", {"map": canon, "path": str(abs_path)})
                 return img.resize((size_px, size_px), Image.BICUBIC)
             except Exception as e:
-                _log(gid, "map open failed; using fallback", {"map": map_name, "path": str(abs_path), "error": repr(e)})
+                _log(gid, "map open failed; using fallback",
+                     {"map": canon, "path": str(abs_path), "error": repr(e)})
         else:
-            _log(gid, "map file not found; using fallback", {"expected_dir": "/app/assets/maps", "rel": rel})
+            _log(gid, "map file not found; using fallback",
+                 {"expected_dir": "/app/assets/maps", "rel": rel, "map": canon})
 
     # Fallback: plain dark background with grid
     side = size_px
@@ -149,7 +165,7 @@ def _load_map_image(gid: int, map_name: str, size_px: int = 1400) -> Image.Image
     for k in range(0, side + 1, step):
         drw.line([(k, 0), (k, side)], fill=(40, 40, 46, 255), width=1)
         drw.line([(0, k), (side, k)], fill=(40, 40, 46, 255), width=1)
-    title = f"{map_name} (fallback)"
+    title = f"{_canon_map_name(map_name)} (fallback)"
     try:
         font = ImageFont.truetype("arial.ttf", 24)
     except Exception:
@@ -181,7 +197,8 @@ def _draw_pin(drw: ImageDraw.ImageDraw, p: Tuple[int, int]):
 
 
 def _izurvive_url(map_name: str, x: float, z: float) -> str:
-    slug = MAP_SLUG.get(map_name, "livonia")
+    canon = _canon_map_name(map_name)
+    slug = MAP_SLUG.get(canon, "livonia")
     # iZurvive likes decimals with a semicolon delimiter
     return f"https://www.izurvive.com/{slug}/#location={x:.2f};{z:.2f}"
 
@@ -249,8 +266,8 @@ class ShowTracked(commands.Cog):
 
         # Filter to current map if items include map info
         def _same_map(row: Dict[str, Any]) -> bool:
-            m = (row.get("map") or active_map).strip()
-            return m.lower() == active_map.lower()
+            m = _canon_map_name((row.get("map") or active_map))
+            return m == active_map
 
         rows = [r for r in raw_rows if _same_map(r)]
         post_count = len(rows)
