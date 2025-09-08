@@ -226,11 +226,13 @@ def _load_map_image(map_key: str, size: int = 1400) -> Image.Image:
         img = canvas
     return img
 
+# iZurvive deep link — this format jumps to the exact location.
 def _izurvive_url(map_key: str, x: float, z: float) -> str:
     slug = {"livonia": "livonia", "chernarus": "chernarus"}.get(map_key, "livonia")
-    return f"https://www.izurvive.com/{slug}/#loc:{int(x)},{int(z)}"
+    return f"https://www.izurvive.com/{slug}/#location={x:.2f};{z:.2f}"
 
 def _safe_png_name(basename: str) -> str:
+    """Sanitize filenames used for Discord attachments."""
     s = re.sub(r"[^A-Za-z0-9_.-]+", "_", basename).strip("._")
     if not s:
         s = "map"
@@ -240,7 +242,7 @@ def _safe_png_name(basename: str) -> str:
     return s
 
 def _coords_link_text(map_key: str, x: float, z: float) -> str:
-    """Return Markdown where the **coords themselves** are the blue clickable link."""
+    """Return Markdown where the coords themselves are the clickable link."""
     url = _izurvive_url(map_key, x, z)
     return f"[**{int(x)} {int(z)}**]({url})"
 
@@ -250,6 +252,18 @@ def _db() -> dict:
 
 def _save_db(doc: dict):
     save_file(BOUNTIES_DB, doc)
+
+def _set_online_state(guild_id: int, target: str, online: bool) -> bool:
+    doc = _db()
+    changed = False
+    for b in doc["open"]:
+        if int(b.get("guild_id", 0)) == guild_id and str(b.get("target_gamertag", "")).lower() == target.lower():
+            if b.get("online", True) != online:
+                b["online"] = online
+                changed = True
+    if changed:
+        _save_db(doc)
+    return changed
 
 # ----------------------- Aggregated updates helper ---------------------------
 class BountyUpdater:
@@ -341,7 +355,7 @@ class BountyUpdater:
 KILL_RE = re.compile(r"^(?P<ts>\d\d:\d\d:\d\d).*?(?P<victim>.+?) was killed by (?P<killer>.+?)\b", re.I)
 # Nitrado line you pasted:
 KILL_RE_NIT = re.compile(
-    r'Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\).*?killed by Player\s+"(?P<killer>[^"]+)"',
+    r'Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?.*?killed by Player\s+"(?P<killer>[^"]+)"',
     re.I,
 )
 CONNECT_RE = re.compile(r'Player\s+"(?P<name>[^"]+)"\s*\(id=.*?\)\s+is connected', re.I)
