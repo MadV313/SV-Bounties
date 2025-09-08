@@ -146,23 +146,6 @@ def _load_json_from_any(path: str) -> Optional[dict]:
         _log("Local load failed", path=path, err=repr(e))
     return None
 
-def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
-    empty_path: Optional[str] = None
-    tried: List[str] = []
-    for p in _wallet_candidate_paths_for_guild(gid):
-        tried.append(p)
-        doc = _load_json_from_any(p)
-        if isinstance(doc, dict):
-            if doc:
-                _log("Using wallet file (non-empty)", path=p)
-                return doc, p
-            empty_path = empty_path or p
-    if empty_path is not None:
-        _log("Using wallet file (empty)", path=empty_path)
-        return {}, empty_path
-    _log("No wallet file found", tried=", ".join(tried))
-    return None, None
-
 def _coerce_int(val) -> int:
     try:
         return int(val)
@@ -174,7 +157,7 @@ def _coerce_int(val) -> int:
 
 def _get_user_balance(gid: int, discord_id: str) -> Tuple[int, Optional[dict], Optional[str]]:
     """
-    Support both wallet schemas:
+    Support wallet schemas:
       A) {"<id>": {"sv_tickets": 5, ...}}
       B) {"<id>": 5}
       C) {"<id>": "5"}
@@ -204,7 +187,7 @@ def _adjust_tickets(gid: int, discord_id: str, delta: int) -> Tuple[bool, int]:
         return False, cur
 
     new_bal = cur + delta
-    # Write back preserving schema
+    # Preserve schema on writeback
     if isinstance(wallets[discord_id], dict):
         wallets[discord_id]["sv_tickets"] = new_bal
     else:
@@ -303,6 +286,7 @@ DISCONNECT_RE = re.compile(r'Player\s+"(?P<name>[^"]+)"\s*\(id=.*?\)\s+has been 
 # PlayerList block
 PL_HEADER_RE = re.compile(r'^(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+##### PlayerList log:\s+(?P<count>\d+)\s+players?', re.I)
 PL_PLAYER_RE = re.compile(
+    # allow optional whitespace before "pos=", and flexible comma spacing
     r'^\d\d:\d\d:\d\d\s+\|\s+Player\s+"(?P<name>[^"]+)"\s+\(id=[^)]*?\s+pos=<(?P<x>[-\d.]+)\s*,\s*(?P<z>[-\d.]+)\s*,\s*[-\d.]+>\)',
     re.I,
 )
@@ -429,7 +413,7 @@ class BountyUpdater:
                     if track and track.get("points"):
                         pt = track["points"][-1]
                         try:
-                            x, z = float(pt["x"]), float(pt["z"])}
+                            x, z = float(pt["x"]), float(pt["z"])
                             await self._send_map(ch, map_key, tgt, x, z, reason)
                             b["has_initial_posted"] = True
                             b["last_coords"] = {"x": x, "z": z}
