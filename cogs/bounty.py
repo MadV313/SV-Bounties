@@ -72,6 +72,10 @@ def _is_player_seen(gamertag: str) -> bool:
     g = gamertag or ""
     return any(k.lower() == g.lower() for k in idx.keys())
 
+def _norm(name: str) -> str:
+    """Normalize names for ADM matching."""
+    return (name or "").strip().casefold()
+
 # -------- Wallet helpers (use per-guild settings, then local fallbacks) -------
 def _wallet_candidate_paths_for_guild(gid: int) -> List[str]:
     st = _guild_settings(gid) or {}
@@ -257,7 +261,7 @@ def _set_online_state(guild_id: int, target: str, online: bool) -> bool:
     doc = _db()
     changed = False
     for b in doc["open"]:
-        if int(b.get("guild_id", 0)) == guild_id and str(b.get("target_gamertag", "")).lower() == target.lower():
+        if int(b.get("guild_id", 0)) == guild_id and _norm(b.get("target_gamertag", "")) == _norm(target):
             if b.get("online", True) != online:
                 b["online"] = online
                 changed = True
@@ -296,7 +300,7 @@ def _read_adm_lines(limit: int = 5000) -> List[str]:
 def _latest_playerlist(lines: List[str]) -> Tuple[Optional[str], Dict[str, Tuple[float, float]]]:
     """
     Parse the most recent PlayerList block.
-    Returns (pl_ts, {name_lower: (x,z)}).
+    Returns (pl_ts, {normalized_name: (x,z)}).
     """
     pl_ts: Optional[str] = None
     players: Dict[str, Tuple[float, float]] = {}
@@ -304,14 +308,13 @@ def _latest_playerlist(lines: List[str]) -> Tuple[Optional[str], Dict[str, Tuple
     while i >= 0:
         mhead = PL_HEADER_RE.search(lines[i])
         if mhead:
-            # Walk forward to collect this block (header at i, players at i+1.., footer)
             ts = mhead.group("ts")
             j = i + 1
             tmp_players: Dict[str, Tuple[float, float]] = {}
             while j < len(lines) and not PL_FOOTER_RE.search(lines[j]):
                 pm = PL_PLAYER_RE.search(lines[j])
                 if pm:
-                    nm = pm.group("name").strip().lower()
+                    nm = _norm(pm.group("name"))
                     try:
                         x = float(pm.group("x"))
                         z = float(pm.group("z"))
@@ -319,7 +322,6 @@ def _latest_playerlist(lines: List[str]) -> Tuple[Optional[str], Dict[str, Tuple
                     except Exception:
                         pass
                 j += 1
-            # Found a complete block (header + maybe players + footer)
             pl_ts = ts
             players = tmp_players
             break
@@ -328,7 +330,7 @@ def _latest_playerlist(lines: List[str]) -> Tuple[Optional[str], Dict[str, Tuple
 
 # ----------------------- Renderer with PlayerList gating ----------------------
 class BountyUpdater:
-    """Renderer that posts bounty maps only when target appears in latest PlayerList (after initial seed)."""
+    """Posts a seed map, then only posts further maps when target appears in the latest PlayerList."""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._locks: Dict[int, asyncio.Lock] = {}
@@ -385,7 +387,6 @@ class BountyUpdater:
                 return
 
             doc = _db()
-            # Only consider this guild's bounties
             targets = [b for b in doc.get("open", []) if int(b.get("guild_id", 0)) == gid]
             if not targets:
                 return
@@ -401,7 +402,7 @@ class BountyUpdater:
                 map_key, _cfg = _canon_map_and_cfg(settings.get("active_map"))
                 reason = (b.get("reason") or "").strip() or None
 
-                # Seed initial post one time regardless of PlayerList (uses latest tracker point)
+                # 1) Seed initial post (once), regardless of PlayerList.
                 if not b.get("has_initial_posted"):
                     _, track = load_track(tgt, window_hours=48, max_points=1)
                     if track and track.get("points"):
@@ -411,28 +412,23 @@ class BountyUpdater:
                             await self._send_map(ch, map_key, tgt, x, z, reason)
                             b["has_initial_posted"] = True
                             b["last_coords"] = {"x": x, "z": z}
-                            # do NOT set last_pl_ts here; we only advance it when a PlayerList drives the update
                             _save_db(doc)
                             _log("initial map posted", gid=gid, target=tgt)
                         except Exception as e:
                             _log("initial map failed", gid=gid, target=tgt, err=repr(e))
-                    continue  # After initial seed, wait for PlayerList-gated loop next tick
+                    continue  # wait for PlayerList-gated loop next tick
 
-                # From here on, only post if ONLINE and present in latest PlayerList with a new timestamp
+                # 2) Gated updates only while online AND present in latest PlayerList.
                 if not b.get("online", True):
-                    continue  # offline: no updates
-
-                # Must have a fresh PlayerList that contains this target
+                    continue
                 if not pl_ts or not pl_players:
                     continue
-                coords = pl_players.get(tgt.lower())
+                coords = pl_players.get(_norm(tgt))
                 if not coords:
-                    continue  # target not in the latest PL → skip update
+                    continue  # target not in latest PlayerList
 
-                # Check dedupe by last_pl_ts
-                last_pl_ts = b.get("last_pl_ts")
-                if last_pl_ts == pl_ts:
-                    continue  # already posted for this PL snapshot
+                if b.get("last_pl_ts") == pl_ts:
+                    continue  # already posted for this snapshot
 
                 x, z = coords
                 try:
@@ -452,7 +448,10 @@ async def _announce_online(bot: commands.Bot, gid: int, name: str):
     if not isinstance(ch, (discord.TextChannel, discord.Thread)):
         return
     try:
-        await ch.send(f"🟢 **{name}** is back **online** — tracking resumed. Next update will appear on the next PlayerList refresh.")
+        await ch.send(
+            f"🟢 **{name}** is back **online** — tracking resumed. "
+            f"Next update will appear on the next PlayerList refresh."
+        )
     except Exception:
         pass
 
@@ -461,12 +460,41 @@ async def _announce_offline(bot: commands.Bot, gid: int, name: str, x: Optional[
     ch = bot.get_channel(int(ch_id)) if ch_id else None
     if not isinstance(ch, (discord.TextChannel, discord.Thread)):
         return
+
     map_key, _ = _canon_map_and_cfg(_guild_settings(gid).get("active_map"))
-    coords = "unknown"
+    coords_md = "unknown"
     if x is not None and z is not None:
-        coords = _coords_link_text(map_key, x, z)
+        coords_md = _coords_link_text(map_key, x, z)
+
+    # Send text + image of last known
     try:
-        await ch.send(f"🔴 **{name}** has **disconnected**. Last known location: {coords}.")
+        # Image
+        if x is not None and z is not None:
+            img = _load_map_image(map_key)
+            draw = ImageDraw.Draw(img)
+            cfg = MAPS.get(map_key, MAPS["livonia"])
+            px, py = _world_to_px(cfg, x, z, img.width)
+            r = 9
+            draw.ellipse([px - r, py - r, px + r, py + r], outline=(255, 0, 0, 255), width=4)
+            draw.ellipse([px - 2, py - 2, px + 2, py + 2], fill=(255, 0, 0, 255))
+            try:
+                draw.text((px + 12, py - 12), f"{name} • {int(x)},{int(z)}", fill=(255, 255, 255, 255))
+            except Exception:
+                pass
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
+            fname = _safe_png_name(f"{name}_offline_last_known")
+            embed = discord.Embed(
+                title=f"🔴 {name} disconnected",
+                description=f"Last known location: {coords_md}",
+                color=discord.Color.red(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.set_image(url=f"attachment://{fname}")
+            await ch.send(file=discord.File(fp=buf, filename=fname), embed=embed)
+        else:
+            await ch.send(f"🔴 **{name}** has **disconnected**. Last known location: {coords_md}.")
     except Exception:
         pass
 
@@ -475,7 +503,7 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
     """
     - Close bounties on kill, award killer (both common and Nitrado lines).
     - Flip online/offline on connect/disconnect with announcements.
-    - Do NOT post map updates here; the updater does that gated by PlayerList.
+    - Map updates are handled by the updater (gated by PlayerList).
     """
     lines = _read_adm_lines()
     if not lines:
@@ -496,7 +524,7 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
         changed = False
         for victim, killer in kills:
             for b in list(open_bounties):
-                if b.get("target_gamertag", "").lower() != victim.lower():
+                if _norm(b.get("target_gamertag", "")) != _norm(victim):
                     continue
                 tickets = int(b.get("tickets", 0))
                 did, _ = resolve_from_any(guild_id, gamertag=killer)
@@ -525,7 +553,6 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
                         pass
         if changed:
             _save_db(doc)
-            # refresh local
             open_bounties = [b for b in doc.get("open", []) if int(b.get("guild_id", 0)) == guild_id]
 
     # 2) Connection status + announcements
@@ -533,16 +560,16 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
         return
 
     # Build last seen state by scanning backwards once
-    last_status: Dict[str, str] = {}  # name -> "connected"/"disconnected"
+    last_status: Dict[str, str] = {}  # norm(name) -> "connected"/"disconnected"
     for ln in reversed(lines):
         mc = CONNECT_RE.search(ln)
         if mc:
-            nm = mc.group("name").strip()
+            nm = _norm(mc.group("name"))
             if nm not in last_status:
                 last_status[nm] = "connected"
         md = DISCONNECT_RE.search(ln)
         if md:
-            nm = md.group("name").strip()
+            nm = _norm(md.group("name"))
             if nm not in last_status:
                 last_status[nm] = "disconnected"
         if len(last_status) > 2000:
@@ -555,9 +582,9 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
             continue
         prev_online = bool(b.get("online", True))
         last_flag = b.get("last_state_announce")  # "online"/"offline"/None
-        status = last_status.get(tgt)
+        status = last_status.get(_norm(tgt))
 
-        # Flip state if the latest evidence indicates a change
+        # Flip state if latest evidence indicates a change
         now_online = prev_online
         if status == "connected":
             now_online = True
@@ -569,7 +596,7 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
             changed = True
             _log("online flip", target=tgt, online=now_online, gid=guild_id)
 
-        # Announce connects (dedup by last_state_announce)
+        # Announce connects (dedupe)
         if status == "connected" and last_flag != "online":
             try:
                 await _announce_online(bot, guild_id, tgt)
@@ -578,9 +605,8 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
             b["last_state_announce"] = "online"
             changed = True
 
-        # Announce disconnects (with last known coords) (dedup by last_state_announce)
+        # Announce disconnects (with last known coords) (dedupe)
         if status == "disconnected" and last_flag != "offline":
-            # Prefer last PlayerList coords; fall back to tracker
             lx = lz = None
             lc = b.get("last_coords") or {}
             if "x" in lc and "z" in lc:
@@ -747,15 +773,15 @@ class BountyCog(commands.Cog):
             "reason": (reason or "").strip() or None,
             "message": None,
             # Tracking fields for gating + announcements
-            "online": True,                # default true until watcher flips
-            "has_initial_posted": False,   # first seed image regardless of PlayerList
-            "last_pl_ts": None,            # last PlayerList timestamp we posted for
-            "last_state_announce": "online",  # dedupe “online/offline” notices
-            "last_coords": None,           # {"x": float, "z": float}
+            "online": True,                  # default true until watcher flips
+            "has_initial_posted": False,     # first seed image regardless of PlayerList
+            "last_pl_ts": None,              # last PlayerList timestamp we posted for
+            "last_state_announce": "online", # dedupe “online/offline” notices
+            "last_coords": None,             # {"x": float, "z": float}
         }
         bdoc = _db()
         for b in bdoc["open"]:
-            if int(b.get("guild_id", 0)) == gid and str(b.get("target_gamertag","")).lower() == target_gt.lower():
+            if int(b.get("guild_id", 0)) == gid and _norm(b.get("target_gamertag","")) == _norm(target_gt or ""):
                 _adjust_tickets(gid, inv_id, +tickets)
                 return await interaction.followup.send("❌ A bounty for that player is already active.", ephemeral=True)
         bdoc["open"].append(rec)
@@ -847,7 +873,6 @@ class BountyCog(commands.Cog):
         for b in doc.get("open", []):
             by_guild.setdefault(int(b.get("guild_id", 0)), []).append(b)
         for gid, rows in by_guild.items():
-            # if at least one online → skip
             if any(r.get("online", True) for r in rows):
                 continue
             ch_id = _guild_settings(gid).get("bounty_channel_id")
