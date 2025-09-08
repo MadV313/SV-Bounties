@@ -335,7 +335,7 @@ class BountyUpdater:
 
                 fname = _safe_png_name(f"{tgt}_bounty")
                 embed = discord.Embed(
-                    title=f"🎯 Bounty: {tgt}",
+                    title=f"<:wanted:1414383833494847540> Bounty: {tgt}",
                     description=desc,
                     color=discord.Color.red(),
                     timestamp=datetime.now(timezone.utc)
