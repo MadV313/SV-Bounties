@@ -282,9 +282,10 @@ CONNECT_RE = re.compile(r'Player\s+"(?P<name>[^"]+)"\s*\(id=.*?\)\s+is connected
 DISCONNECT_RE = re.compile(r'Player\s+"(?P<name>[^"]+)"\s*\(id=.*?\)\s+has been disconnected', re.I)
 
 # PlayerList block
-PL_HEADER_RE = re.compile(r'^(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+##### PlayerList log:\s+(?P<count>\d+)\s+players', re.I)
+PL_HEADER_RE = re.compile(r'^(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+##### PlayerList log:\s+(?P<count>\d+)\s+players?', re.I)
 PL_PLAYER_RE = re.compile(
-    r'^\d\d:\d\d:\d\d\s+\|\s+Player\s+"(?P<name>[^"]+)"\s+\(id=[^)]+pos=<(?P<x>[-\d.]+),\s*(?P<z>[-\d.]+),\s*[-\d.]+>\)',
+    # allow optional whitespace before "pos=", and flexible comma spacing
+    r'^\d\d:\d\d:\d\d\s+\|\s+Player\s+"(?P<name>[^"]+)"\s+\(id=[^)]*?\s+pos=<(?P<x>[-\d.]+)\s*,\s*(?P<z>[-\d.]+)\s*,\s*[-\d.]+>\)',
     re.I,
 )
 PL_FOOTER_RE = re.compile(r'^\d\d:\d\d:\d\d\s+\|\s+#####\s*$', re.I)
@@ -292,7 +293,8 @@ PL_FOOTER_RE = re.compile(r'^\d\d:\d\d:\d\d\s+\|\s+#####\s*$', re.I)
 def _read_adm_lines(limit: int = 5000) -> List[str]:
     try:
         txt = Path(ADM_LATEST_PATH).read_text(encoding="utf-8", errors="ignore")
-    except Exception:
+    except Exception as e:
+        _log("ADM read failed", path=ADM_LATEST_PATH, err=repr(e))
         return []
     lines = txt.splitlines()
     return lines[-limit:]
@@ -394,6 +396,7 @@ class BountyUpdater:
             # Read latest ADM once per tick
             lines = _read_adm_lines()
             pl_ts, pl_players = _latest_playerlist(lines)
+            _log("playerlist parsed", gid=gid, pl_ts=pl_ts, count=len(pl_players))
 
             for b in targets:
                 tgt = (b.get("target_gamertag") or "").strip()
@@ -466,9 +469,7 @@ async def _announce_offline(bot: commands.Bot, gid: int, name: str, x: Optional[
     if x is not None and z is not None:
         coords_md = _coords_link_text(map_key, x, z)
 
-    # Send text + image of last known
     try:
-        # Image
         if x is not None and z is not None:
             img = _load_map_image(map_key)
             draw = ImageDraw.Draw(img)
@@ -559,7 +560,6 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
     if not open_bounties:
         return
 
-    # Build last seen state by scanning backwards once
     last_status: Dict[str, str] = {}  # norm(name) -> "connected"/"disconnected"
     for ln in reversed(lines):
         mc = CONNECT_RE.search(ln)
@@ -583,8 +583,8 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
         prev_online = bool(b.get("online", True))
         last_flag = b.get("last_state_announce")  # "online"/"offline"/None
         status = last_status.get(_norm(tgt))
+        _log("status resolved", gid=guild_id, target=tgt, status=status, prev_online=prev_online)
 
-        # Flip state if latest evidence indicates a change
         now_online = prev_online
         if status == "connected":
             now_online = True
@@ -596,7 +596,6 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
             changed = True
             _log("online flip", target=tgt, online=now_online, gid=guild_id)
 
-        # Announce connects (dedupe)
         if status == "connected" and last_flag != "online":
             try:
                 await _announce_online(bot, guild_id, tgt)
@@ -605,7 +604,6 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
             b["last_state_announce"] = "online"
             changed = True
 
-        # Announce disconnects (with last known coords) (dedupe)
         if status == "disconnected" and last_flag != "offline":
             lx = lz = None
             lc = b.get("last_coords") or {}
