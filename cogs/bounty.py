@@ -9,7 +9,7 @@ from urllib.request import Request, urlopen
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple, List
-from pathlib import Path  # ← needed by kill scanner
+from pathlib import Path  # ← needed by ADM parsing
 
 import discord
 from discord import app_commands
@@ -226,7 +226,7 @@ def _load_map_image(map_key: str, size: int = 1400) -> Image.Image:
         img = canvas
     return img
 
-# iZurvive deep link — this format jumps to the exact location.
+# iZurvive deep link — jump to exact location.
 def _izurvive_url(map_key: str, x: float, z: float) -> str:
     slug = {"livonia": "livonia", "chernarus": "chernarus"}.get(map_key, "livonia")
     return f"https://www.izurvive.com/{slug}/#location={x:.2f};{z:.2f}"
@@ -265,9 +265,70 @@ def _set_online_state(guild_id: int, target: str, online: bool) -> bool:
         _save_db(doc)
     return changed
 
-# ----------------------- Aggregated updates helper ---------------------------
+# ----------------------------- ADM parsing -----------------------------------
+# Kills (both common and Nitrado variants)
+KILL_RE = re.compile(r"^(?P<ts>\d\d:\d\d:\d\d).*?(?P<victim>.+?) was killed by (?P<killer>.+?)\b", re.I)
+KILL_RE_NIT = re.compile(
+    r'Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?.*?killed by Player\s+"(?P<killer>[^"]+)"',
+    re.I,
+)
+
+# Connect / Disconnect
+CONNECT_RE = re.compile(r'Player\s+"(?P<name>[^"]+)"\s*\(id=.*?\)\s+is connected', re.I)
+DISCONNECT_RE = re.compile(r'Player\s+"(?P<name>[^"]+)"\s*\(id=.*?\)\s+has been disconnected', re.I)
+
+# PlayerList block
+PL_HEADER_RE = re.compile(r'^(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+##### PlayerList log:\s+(?P<count>\d+)\s+players', re.I)
+PL_PLAYER_RE = re.compile(
+    r'^\d\d:\d\d:\d\d\s+\|\s+Player\s+"(?P<name>[^"]+)"\s+\(id=[^)]+pos=<(?P<x>[-\d.]+),\s*(?P<z>[-\d.]+),\s*[-\d.]+>\)',
+    re.I,
+)
+PL_FOOTER_RE = re.compile(r'^\d\d:\d\d:\d\d\s+\|\s+#####\s*$', re.I)
+
+def _read_adm_lines(limit: int = 5000) -> List[str]:
+    try:
+        txt = Path(ADM_LATEST_PATH).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return []
+    lines = txt.splitlines()
+    return lines[-limit:]
+
+def _latest_playerlist(lines: List[str]) -> Tuple[Optional[str], Dict[str, Tuple[float, float]]]:
+    """
+    Parse the most recent PlayerList block.
+    Returns (pl_ts, {name_lower: (x,z)}).
+    """
+    pl_ts: Optional[str] = None
+    players: Dict[str, Tuple[float, float]] = {}
+    i = len(lines) - 1
+    while i >= 0:
+        mhead = PL_HEADER_RE.search(lines[i])
+        if mhead:
+            # Walk forward to collect this block (header at i, players at i+1.., footer)
+            ts = mhead.group("ts")
+            j = i + 1
+            tmp_players: Dict[str, Tuple[float, float]] = {}
+            while j < len(lines) and not PL_FOOTER_RE.search(lines[j]):
+                pm = PL_PLAYER_RE.search(lines[j])
+                if pm:
+                    nm = pm.group("name").strip().lower()
+                    try:
+                        x = float(pm.group("x"))
+                        z = float(pm.group("z"))
+                        tmp_players[nm] = (x, z)
+                    except Exception:
+                        pass
+                j += 1
+            # Found a complete block (header + maybe players + footer)
+            pl_ts = ts
+            players = tmp_players
+            break
+        i -= 1
+    return pl_ts, players
+
+# ----------------------- Renderer with PlayerList gating ----------------------
 class BountyUpdater:
-    """Renderer that posts bounty maps only for ONLINE bounties."""
+    """Renderer that posts bounty maps only when target appears in latest PlayerList (after initial seed)."""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._locks: Dict[int, asyncio.Lock] = {}
@@ -275,6 +336,41 @@ class BountyUpdater:
     def _lock_for(self, gid: int) -> asyncio.Lock:
         self._locks.setdefault(gid, asyncio.Lock())
         return self._locks[gid]
+
+    async def _send_map(self, ch: discord.abc.Messageable, map_key: str, tgt: str, x: float, z: float, reason: Optional[str]):
+        img = _load_map_image(map_key)
+        draw = ImageDraw.Draw(img)
+        cfg = MAPS.get(map_key, MAPS["livonia"])
+        px, py = _world_to_px(cfg, x, z, img.width)
+        r = 9
+        draw.ellipse([px - r, py - r, px + r, py + r], outline=(255, 0, 0, 255), width=4)
+        draw.ellipse([px - 2, py - 2, px + 2, py + 2], fill=(255, 0, 0, 255))
+        try:
+            draw.text((px + 12, py - 12), f"{tgt} • {int(x)},{int(z)}", fill=(255, 255, 255, 255))
+        except Exception:
+            pass
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+
+        coords_md = _coords_link_text(map_key, x, z)
+        desc = f"Last known location: {coords_md}"
+        if reason:
+            desc += f"\n**Reason:** {reason[:300]}"
+
+        fname = _safe_png_name(f"{tgt}_bounty")
+        embed = discord.Embed(
+            title=f"<:wanted:1414383833494847540> Bounty: {tgt}",
+            description=desc,
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.set_image(url=f"attachment://{fname}")
+
+        file = discord.File(fp=buf, filename=fname)
+        msg = await ch.send(embed=embed, file=file)
+        return msg.id
 
     async def update_guild(self, gid: int):
         async with self._lock_for(gid):
@@ -289,85 +385,76 @@ class BountyUpdater:
                 return
 
             doc = _db()
-            targets = [b for b in doc.get("open", []) if int(b.get("guild_id", 0)) == gid and b.get("online", True)]
-            _log("update_guild: start", gid=gid, online_targets=len(targets))
+            # Only consider this guild's bounties
+            targets = [b for b in doc.get("open", []) if int(b.get("guild_id", 0)) == gid]
             if not targets:
                 return
+
+            # Read latest ADM once per tick
+            lines = _read_adm_lines()
+            pl_ts, pl_players = _latest_playerlist(lines)
 
             for b in targets:
                 tgt = (b.get("target_gamertag") or "").strip()
                 if not tgt:
                     continue
-                map_key, cfg = _canon_map_and_cfg(settings.get("active_map"))
-
-                # latest point for this target
-                _, track = load_track(tgt, window_hours=48, max_points=1)
-                if not track or not track.get("points"):
-                    _log("no points for target; skip", gid=gid, target=tgt)
-                    continue
-                pt = track["points"][-1]
-                try:
-                    x, z = float(pt["x"]), float(pt["z"])
-                except Exception:
-                    _log("bad point data; skip", gid=gid, target=tgt, pt=str(pt))
-                    continue
-
-                img = _load_map_image(map_key)
-                draw = ImageDraw.Draw(img)
-                px, py = _world_to_px(cfg, x, z, img.width)
-                r = 9
-                draw.ellipse([px - r, py - r, px + r, py + r], outline=(255, 0, 0, 255), width=4)
-                draw.ellipse([px - 2, py - 2, px + 2, py + 2], fill=(255, 0, 0, 255))
-                try:
-                    draw.text((px + 12, py - 12), f"{tgt} • {int(x)},{int(z)}", fill=(255, 255, 255, 255))
-                except Exception:
-                    pass
-
-                buf = io.BytesIO()
-                img.save(buf, format="PNG")
-                buf.seek(0)
-
+                map_key, _cfg = _canon_map_and_cfg(settings.get("active_map"))
                 reason = (b.get("reason") or "").strip() or None
-                coords_md = _coords_link_text(map_key, x, z)
-                desc = f"Last known location: {coords_md}"
-                if reason:
-                    desc += f"\n**Reason:** {reason[:300]}"
 
-                fname = _safe_png_name(f"{tgt}_bounty")
-                embed = discord.Embed(
-                    title=f"<:wanted:1414383833494847540> Bounty: {tgt}",
-                    description=desc,
-                    color=discord.Color.red(),
-                    timestamp=datetime.now(timezone.utc)
-                )
-                embed.set_image(url=f"attachment://{fname}")
+                # Seed initial post one time regardless of PlayerList (uses latest tracker point)
+                if not b.get("has_initial_posted"):
+                    _, track = load_track(tgt, window_hours=48, max_points=1)
+                    if track and track.get("points"):
+                        pt = track["points"][-1]
+                        try:
+                            x, z = float(pt["x"]), float(pt["z"])
+                            await self._send_map(ch, map_key, tgt, x, z, reason)
+                            b["has_initial_posted"] = True
+                            b["last_coords"] = {"x": x, "z": z}
+                            # do NOT set last_pl_ts here; we only advance it when a PlayerList drives the update
+                            _save_db(doc)
+                            _log("initial map posted", gid=gid, target=tgt)
+                        except Exception as e:
+                            _log("initial map failed", gid=gid, target=tgt, err=repr(e))
+                    continue  # After initial seed, wait for PlayerList-gated loop next tick
 
+                # From here on, only post if ONLINE and present in latest PlayerList with a new timestamp
+                if not b.get("online", True):
+                    continue  # offline: no updates
+
+                # Must have a fresh PlayerList that contains this target
+                if not pl_ts or not pl_players:
+                    continue
+                coords = pl_players.get(tgt.lower())
+                if not coords:
+                    continue  # target not in the latest PL → skip update
+
+                # Check dedupe by last_pl_ts
+                last_pl_ts = b.get("last_pl_ts")
+                if last_pl_ts == pl_ts:
+                    continue  # already posted for this PL snapshot
+
+                x, z = coords
                 try:
-                    file = discord.File(fp=buf, filename=fname)
-                    msg = await ch.send(embed=embed, file=file)
-                    _log("sent bounty map", gid=gid, target=tgt, channel_id=ch.id, message_id=msg.id)
+                    await self._send_map(ch, map_key, tgt, x, z, reason)
+                    b["last_pl_ts"] = pl_ts
+                    b["last_coords"] = {"x": x, "z": z}
+                    b["last_state_announce"] = "online"
+                    _save_db(doc)
+                    _log("playerlist-gated map posted", gid=gid, target=tgt, pl_ts=pl_ts)
                 except Exception as e:
                     _log("send failed", gid=gid, target=tgt, err=repr(e))
-                    continue
 
-# ---------------------------- ADM parsing ------------------------------------
-# Old/community style:
-KILL_RE = re.compile(r"^(?P<ts>\d\d:\d\d:\d\d).*?(?P<victim>.+?) was killed by (?P<killer>.+?)\b", re.I)
-# Nitrado line you pasted:
-KILL_RE_NIT = re.compile(
-    r'Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?.*?killed by Player\s+"(?P<killer>[^"]+)"',
-    re.I,
-)
-CONNECT_RE = re.compile(r'Player\s+"(?P<name>[^"]+)"\s*\(id=.*?\)\s+is connected', re.I)
-DISCONNECT_RE = re.compile(r'Player\s+"(?P<name>[^"]+)"\s*\(id=.*?\)\s+has been disconnected', re.I)
-
-def _read_adm_lines(limit: int = 5000) -> List[str]:
+# ---------------------------- Announce helpers --------------------------------
+async def _announce_online(bot: commands.Bot, gid: int, name: str):
+    ch_id = _guild_settings(gid).get("bounty_channel_id")
+    ch = bot.get_channel(int(ch_id)) if ch_id else None
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return
     try:
-        txt = Path(ADM_LATEST_PATH).read_text(encoding="utf-8", errors="ignore")
+        await ch.send(f"🟢 **{name}** is back **online** — tracking resumed. Next update will appear on the next PlayerList refresh.")
     except Exception:
-        return []
-    lines = txt.splitlines()
-    return lines[-limit:]
+        pass
 
 async def _announce_offline(bot: commands.Bot, gid: int, name: str, x: Optional[float], z: Optional[float]):
     ch_id = _guild_settings(gid).get("bounty_channel_id")
@@ -379,16 +466,17 @@ async def _announce_offline(bot: commands.Bot, gid: int, name: str, x: Optional[
     if x is not None and z is not None:
         coords = _coords_link_text(map_key, x, z)
     try:
-        await ch.send(
-            f"📡 **Bounty target offline:** **{name}** has logged out. "
-            f"Last known location: {coords}."
-        )
+        await ch.send(f"🔴 **{name}** has **disconnected**. Last known location: {coords}.")
     except Exception:
         pass
 
 # ---------------------------- Kill + status watcher --------------------------
 async def check_kills_and_status(bot: commands.Bot, guild_id: int):
-    """Close bounties on kill, award killer; flip online/offline on connect/disconnect."""
+    """
+    - Close bounties on kill, award killer (both common and Nitrado lines).
+    - Flip online/offline on connect/disconnect with announcements.
+    - Do NOT post map updates here; the updater does that gated by PlayerList.
+    """
     lines = _read_adm_lines()
     if not lines:
         return
@@ -398,7 +486,7 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
     if not open_bounties:
         return
 
-    # 1) Kills (support both formats)
+    # 1) Kills
     kills: List[Tuple[str, str]] = []
     for ln in lines[-2000:]:
         m = KILL_RE.search(ln) or KILL_RE_NIT.search(ln)
@@ -411,21 +499,18 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
                 if b.get("target_gamertag", "").lower() != victim.lower():
                     continue
                 tickets = int(b.get("tickets", 0))
-                # Resolve killer → discord id if linked
                 did, _ = resolve_from_any(guild_id, gamertag=killer)
                 if not did:
                     did, _ = resolve_from_any(guild_id, discord_id=killer)
                 if did:
                     _adjust_tickets(guild_id, str(did), +tickets)
 
-                # Remove bounty from DB
                 try:
                     doc["open"].remove(b)
                 except Exception:
                     pass
                 changed = True
 
-                # Announce
                 ch_id = _guild_settings(guild_id).get("bounty_channel_id")
                 ch = bot.get_channel(int(ch_id)) if ch_id else None
                 if isinstance(ch, (discord.TextChannel, discord.Thread)):
@@ -440,13 +525,14 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
                         pass
         if changed:
             _save_db(doc)
-            # prune local copy
+            # refresh local
             open_bounties = [b for b in doc.get("open", []) if int(b.get("guild_id", 0)) == guild_id]
 
-    # 2) Connection status (look backwards, first mention wins)
+    # 2) Connection status + announcements
     if not open_bounties:
         return
 
+    # Build last seen state by scanning backwards once
     last_status: Dict[str, str] = {}  # name -> "connected"/"disconnected"
     for ln in reversed(lines):
         mc = CONNECT_RE.search(ln)
@@ -459,7 +545,7 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
             nm = md.group("name").strip()
             if nm not in last_status:
                 last_status[nm] = "disconnected"
-        if len(last_status) > 1000:
+        if len(last_status) > 2000:
             break
 
     changed = False
@@ -467,29 +553,56 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
         tgt = b.get("target_gamertag", "")
         if not tgt:
             continue
-        prev = b.get("online", True)
-        now = prev
+        prev_online = bool(b.get("online", True))
+        last_flag = b.get("last_state_announce")  # "online"/"offline"/None
         status = last_status.get(tgt)
-        if status == "connected":
-            now = True
-        elif status == "disconnected":
-            now = False
 
-        if now != prev:
-            b["online"] = now
+        # Flip state if the latest evidence indicates a change
+        now_online = prev_online
+        if status == "connected":
+            now_online = True
+        elif status == "disconnected":
+            now_online = False
+
+        if now_online != prev_online:
+            b["online"] = now_online
             changed = True
-            _log("online flip", target=tgt, online=now, gid=guild_id)
-            if now is False:
-                # Announce offline with last coords
+            _log("online flip", target=tgt, online=now_online, gid=guild_id)
+
+        # Announce connects (dedup by last_state_announce)
+        if status == "connected" and last_flag != "online":
+            try:
+                await _announce_online(bot, guild_id, tgt)
+            except Exception:
+                pass
+            b["last_state_announce"] = "online"
+            changed = True
+
+        # Announce disconnects (with last known coords) (dedup by last_state_announce)
+        if status == "disconnected" and last_flag != "offline":
+            # Prefer last PlayerList coords; fall back to tracker
+            lx = lz = None
+            lc = b.get("last_coords") or {}
+            if "x" in lc and "z" in lc:
+                try:
+                    lx = float(lc["x"])
+                    lz = float(lc["z"])
+                except Exception:
+                    lx = lz = None
+            if lx is None or lz is None:
                 _, track = load_track(tgt, window_hours=48, max_points=1)
-                x = z = None
                 if track and track.get("points"):
                     pt = track["points"][-1]
                     try:
-                        x, z = float(pt["x"]), float(pt["z"])
+                        lx, lz = float(pt["x"]), float(pt["z"])
                     except Exception:
-                        x = z = None
-                await _announce_offline(bot, guild_id, tgt, x, z)
+                        lx = lz = None
+            try:
+                await _announce_offline(bot, guild_id, tgt, lx, lz)
+            except Exception:
+                pass
+            b["last_state_announce"] = "offline"
+            changed = True
 
     if changed:
         _save_db(doc)
@@ -623,7 +736,7 @@ class BountyCog(commands.Cog):
                 ephemeral=True
             )
 
-        # Create/open bounty record (track online status; default True until watcher flips it)
+        # Create/open bounty record
         rec = {
             "guild_id": gid,
             "set_by_discord_id": inv_id,
@@ -633,7 +746,12 @@ class BountyCog(commands.Cog):
             "created_at": _now_iso(),
             "reason": (reason or "").strip() or None,
             "message": None,
-            "online": True,
+            # Tracking fields for gating + announcements
+            "online": True,                # default true until watcher flips
+            "has_initial_posted": False,   # first seed image regardless of PlayerList
+            "last_pl_ts": None,            # last PlayerList timestamp we posted for
+            "last_state_announce": "online",  # dedupe “online/offline” notices
+            "last_coords": None,           # {"x": float, "z": float}
         }
         bdoc = _db()
         for b in bdoc["open"]:
@@ -662,7 +780,8 @@ class BountyCog(commands.Cog):
                     "📢 **Attention survivors!**\n"
                     f"A new bounty has been set for **{target_gt}** by <@{inv_id}> for **{tickets} SV tickets**.\n"
                     f"**Reason:** {pretty_reason}\n"
-                    "Live updates will appear below with their most recent last known location.\n"
+                    "Live updates will appear below. First post shows last known location; "
+                    "subsequent updates will appear when the PlayerList refreshes.\n"
                     "**Stay Frosty!**"
                 )
             except Exception as e:
