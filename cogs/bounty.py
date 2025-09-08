@@ -163,19 +163,33 @@ def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
     _log("No wallet file found", tried=", ".join(tried))
     return None, None
 
+def _coerce_int(val) -> int:
+    try:
+        return int(val)
+    except Exception:
+        try:
+            return int(float(val))
+        except Exception:
+            return 0
+
 def _get_user_balance(gid: int, discord_id: str) -> Tuple[int, Optional[dict], Optional[str]]:
+    """
+    Support both wallet schemas:
+      A) {"<id>": {"sv_tickets": 5, ...}}
+      B) {"<id>": 5}
+      C) {"<id>": "5"}
+    """
     wallets, path = _load_wallet_doc_and_path(gid)
     if wallets is None:
         return 0, None, None
-    entry = wallets.get(discord_id, {})
-    bal = entry.get("sv_tickets", 0)
-    try:
-        bal = int(bal)
-    except Exception:
-        try:
-            bal = int(float(bal))
-        except Exception:
-            bal = 0
+    entry = wallets.get(discord_id, None)
+
+    if isinstance(entry, dict):
+        bal = entry.get("sv_tickets", entry.get("tickets", 0))
+    else:
+        bal = entry if entry is not None else 0
+
+    bal = _coerce_int(bal)
     return bal, wallets, path
 
 def _adjust_tickets(gid: int, discord_id: str, delta: int) -> Tuple[bool, int]:
@@ -190,7 +204,12 @@ def _adjust_tickets(gid: int, discord_id: str, delta: int) -> Tuple[bool, int]:
         return False, cur
 
     new_bal = cur + delta
-    wallets[discord_id]["sv_tickets"] = new_bal
+    # Write back preserving schema
+    if isinstance(wallets[discord_id], dict):
+        wallets[discord_id]["sv_tickets"] = new_bal
+    else:
+        wallets[discord_id] = new_bal
+
     if not _write_json_to_any(path, wallets):
         _log("wallet write failed", path=path)
         return False, cur
@@ -284,7 +303,6 @@ DISCONNECT_RE = re.compile(r'Player\s+"(?P<name>[^"]+)"\s*\(id=.*?\)\s+has been 
 # PlayerList block
 PL_HEADER_RE = re.compile(r'^(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+##### PlayerList log:\s+(?P<count>\d+)\s+players?', re.I)
 PL_PLAYER_RE = re.compile(
-    # allow optional whitespace before "pos=", and flexible comma spacing
     r'^\d\d:\d\d:\d\d\s+\|\s+Player\s+"(?P<name>[^"]+)"\s+\(id=[^)]*?\s+pos=<(?P<x>[-\d.]+)\s*,\s*(?P<z>[-\d.]+)\s*,\s*[-\d.]+>\)',
     re.I,
 )
@@ -411,7 +429,7 @@ class BountyUpdater:
                     if track and track.get("points"):
                         pt = track["points"][-1]
                         try:
-                            x, z = float(pt["x"]), float(pt["z"])
+                            x, z = float(pt["x"]), float(pt["z"])}
                             await self._send_map(ch, map_key, tgt, x, z, reason)
                             b["has_initial_posted"] = True
                             b["last_coords"] = {"x": x, "z": z}
@@ -609,8 +627,7 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
             lc = b.get("last_coords") or {}
             if "x" in lc and "z" in lc:
                 try:
-                    lx = float(lc["x"])
-                    lz = float(lc["z"])
+                    lx = float(lc["x"]); lz = float(lc["z"])
                 except Exception:
                     lx = lz = None
             if lx is None or lz is None:
