@@ -168,6 +168,40 @@ def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
         return {}, empty_path
     _log("No wallet file found", tried=", ".join(tried))
     return None, None
+    
+def _adm_candidate_paths_for_guild(gid: int) -> List[str]:
+    st = _guild_settings(gid) or {}
+    base = (st.get("external_data_base") or "").strip().rstrip("/")
+    # allow an explicit override if you ever add it to settings later
+    explicit = (st.get("external_adm_path") or "").strip()
+    candidates: List[str] = []
+    if explicit:
+        candidates.append(explicit)  # could be http(s)://.../latest_adm.log
+    if base:
+        candidates.append(f"{base}/latest_adm.log")
+    # local fallback inside this repo/container
+    candidates.append(ADM_LATEST_PATH)
+    return candidates
+
+def _load_text_from_any(path: str) -> Optional[str]:
+    # HTTP/HTTPS
+    if path.lower().startswith(("http://", "https://")):
+        try:
+            req = Request(path, headers={"User-Agent": "SV-Bounties/adm-fetch"})
+            with urlopen(req, timeout=8.0) as resp:  # nosec
+                charset = resp.headers.get_content_charset() or "utf-8"
+                return resp.read().decode(charset, errors="replace")
+        except Exception as e:
+            _log("ADM HTTP fetch failed", path=path, err=repr(e))
+            return None
+    # Local
+    try:
+        p = Path(path)
+        if p.is_file():
+            return p.read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        _log("ADM local read failed", path=path, err=repr(e))
+    return None
 
 def _coerce_int(val) -> int:
     try:
@@ -315,14 +349,21 @@ PL_PLAYER_RE = re.compile(
 )
 PL_FOOTER_RE = re.compile(r'^\d\d:\d\d:\d\d\s+\|\s+#####\s*$', re.I)
 
-def _read_adm_lines(limit: int = 5000) -> List[str]:
-    try:
-        txt = Path(ADM_LATEST_PATH).read_text(encoding="utf-8", errors="ignore")
-    except Exception as e:
-        _log("ADM read failed", path=ADM_LATEST_PATH, err=repr(e))
-        return []
-    lines = txt.splitlines()
-    return lines[-limit:]
+def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[str]:
+    """
+    Try external URL first (if settings provide it), then local fallback.
+    We keep logs quiet if nothing is found (treated as 'no update this tick').
+    """
+    paths = _adm_candidate_paths_for_guild(int(gid_hint or 0)) if gid_hint else [ADM_LATEST_PATH]
+    for p in paths:
+        txt = _load_text_from_any(p)
+        if txt is None:
+            continue
+        lines = txt.splitlines()
+        if lines:
+            return lines[-limit:]
+    # Nothing found; just return empty (no error spam)
+    return []
 
 def _latest_playerlist(lines: List[str]) -> Tuple[Optional[str], Dict[str, Tuple[float, float]]]:
     """
@@ -419,7 +460,7 @@ class BountyUpdater:
                 return
 
             # Read latest ADM once per tick
-            lines = _read_adm_lines()
+            lines = _read_adm_lines(gid_hint=gid)
             pl_ts, pl_players = _latest_playerlist(lines)
             _log("playerlist parsed", gid=gid, pl_ts=pl_ts, count=len(pl_players))
 
@@ -531,7 +572,7 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
     - Flip online/offline on connect/disconnect with announcements.
     - Map updates are handled by the updater (gated by PlayerList).
     """
-    lines = _read_adm_lines()
+    lines = _read_adm_lines(gid_hint=guild_id)
     if not lines:
         return
 
