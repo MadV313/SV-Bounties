@@ -146,6 +146,29 @@ def _load_json_from_any(path: str) -> Optional[dict]:
         _log("Local load failed", path=path, err=repr(e))
     return None
 
+def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Try the configured external wallet path, then base/wallet.json, then local fallbacks.
+    Returns (wallet_doc, source_path-or-url). If nothing is readable, (None, None).
+    If the file exists but is empty, returns ({}, path).
+    """
+    empty_path: Optional[str] = None
+    tried: List[str] = []
+    for p in _wallet_candidate_paths_for_guild(gid):
+        tried.append(p)
+        doc = _load_json_from_any(p)
+        if isinstance(doc, dict):
+            if doc:
+                _log("Using wallet file (non-empty)", path=p)
+                return doc, p
+            # empty dict is acceptable; remember path so we can write back
+            empty_path = empty_path or p
+    if empty_path is not None:
+        _log("Using wallet file (empty)", path=empty_path)
+        return {}, empty_path
+    _log("No wallet file found", tried=", ".join(tried))
+    return None, None
+
 def _coerce_int(val) -> int:
     try:
         return int(val)
