@@ -500,6 +500,7 @@ class BountyUpdater:
                     continue
                 coords = pl_players.get(_norm(tgt))
                 if not coords:
+                    _log("target not in latest playerlist", gid=gid, target=tgt, pl_ts=pl_ts, players=len(pl_players))
                     continue  # target not in latest PlayerList
 
                 if b.get("last_pl_ts") == pl_ts:
