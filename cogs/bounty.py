@@ -336,9 +336,15 @@ KILL_RE_NIT = re.compile(
     re.I,
 )
 
-# Connect / Disconnect
-CONNECT_RE = re.compile(r'Player\s+"(?P<name>[^"]+)"\s*\(id=.*?\)\s+is connected', re.I)
-DISCONNECT_RE = re.compile(r'Player\s+"(?P<name>[^"]+)"\s*\(id=.*?\)\s+has been disconnected', re.I)
+# Connect / Disconnect (capture timestamp now)
+CONNECT_RE = re.compile(
+    r'^(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+Player\s+"(?P<name>[^"]+)"\s*\(id=.*?\)\s+is connected',
+    re.I
+)
+DISCONNECT_RE = re.compile(
+    r'^(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+Player\s+"(?P<name>[^"]+)"\s*\(id=.*?\)\s+has been disconnected',
+    re.I
+)
 
 # PlayerList block
 PL_HEADER_RE = re.compile(r'^(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+##### PlayerList log:\s+(?P<count>\d+)\s+players?', re.I)
@@ -625,21 +631,26 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
     # 2) Connection status + announcements
     if not open_bounties:
         return
-
-    last_status: Dict[str, str] = {}  # norm(name) -> "connected"/"disconnected"
-    for ln in reversed(lines):
+    
+    last_status: Dict[str, str] = {}        # norm(name) -> "connected"/"disconnected"
+    last_status_ts: Dict[str, str] = {}     # norm(name) -> "HH:MM:SS"
+    
+    for ln in lines:  # scan in file order; keep the latest clock time per player
         mc = CONNECT_RE.search(ln)
         if mc:
             nm = _norm(mc.group("name"))
-            if nm not in last_status:
+            ts = mc.group("ts")
+            if ts >= last_status_ts.get(nm, "00:00:00"):
                 last_status[nm] = "connected"
+                last_status_ts[nm] = ts
+            continue
         md = DISCONNECT_RE.search(ln)
         if md:
             nm = _norm(md.group("name"))
-            if nm not in last_status:
+            ts = md.group("ts")
+            if ts >= last_status_ts.get(nm, "00:00:00"):
                 last_status[nm] = "disconnected"
-        if len(last_status) > 2000:
-            break
+                last_status_ts[nm] = ts
 
     changed = False
     for b in open_bounties:
@@ -647,9 +658,11 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
         if not tgt:
             continue
         prev_online = bool(b.get("online", True))
-        last_flag = b.get("last_state_announce")  # "online"/"offline"/None
+        last_flag = b.get("last_state_announce")
+    
         status = last_status.get(_norm(tgt))
-        _log("status resolved", gid=guild_id, target=tgt, status=status, prev_online=prev_online)
+        _dec_ts = last_status_ts.get(_norm(tgt))
+        _log("status decision", gid=guild_id, target=tgt, status=status, at=_dec_ts, prev_online=prev_online)
 
         now_online = prev_online
         if status == "connected":
