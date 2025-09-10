@@ -353,9 +353,16 @@ DISCONNECT_RE = re.compile(
 # PlayerList block
 PL_HEADER_RE = re.compile(r'^(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+##### PlayerList log:\s+(?P<count>\d+)\s+players?', re.I)
 PL_PLAYER_RE = re.compile(
-    r'^\d\d:\d\d:\d\d\s+\|\s+Player\s+"(?P<name>[^"]+)"\s+\(id=[^)]*?\s+pos=<(?P<x>[-\d.]+)\s*,\s*(?P<z>[-\d.]+)\s*,\s*[-\d.]+>\)',
-    re.I,
+    r'^\d\d:\d\d:\d\d\s+\|\s+Player\s+"(?P<name>[^"]+)"\s*\('
+    r'(?:id=[^)]*?)?\s*'                      # optional id=..., tolerant spacing
+    r'pos\s*=\s*<\s*'                         # pos = <
+    r'(?P<x>-?\d+(?:\.\d+)?)\s*,\s*'          # x
+    r'(?P<z>-?\d+(?:\.\d+)?)\s*,\s*'          # z
+    r'[-\d.]+\s*'                             # y (ignored)
+    r'>\)'                                    # >)
+    , re.I
 )
+
 PL_FOOTER_RE = re.compile(r'^\d\d:\d\d:\d\d\s+\|\s+#####\s*$', re.I)
 
 def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[str]:
@@ -473,6 +480,12 @@ class BountyUpdater:
             pl_ts, pl_players = _latest_playerlist(lines)
             _log("playerlist parsed", gid=gid, pl_ts=pl_ts, count=len(pl_players))
 
+            # Helper for tolerant name matching (ignores spaces/punct)
+            def _key(s: str) -> str:
+                return re.sub(r'[^a-z0-9]+', '', (s or '').casefold())
+
+            by_key = { _key(nm): xy for nm, xy in pl_players.items() } if pl_players else {}
+
             for b in targets:
                 tgt = (b.get("target_gamertag") or "").strip()
                 if not tgt:
@@ -480,6 +493,12 @@ class BountyUpdater:
                 norm_tgt = _norm(tgt)
                 map_key, _cfg = _canon_map_and_cfg(settings.get("active_map"))
                 reason = (b.get("reason") or "").strip() or None
+
+                # Ensure fields exist for stable logic
+                b.setdefault("pl_absent": 0,)
+                b.setdefault("last_pl_seen_ts": None,)
+                b.setdefault("online", True)
+                b.setdefault("last_state_announce", "online")
 
                 # 1) Seed initial post (once), regardless of PlayerList.
                 if not b.get("has_initial_posted"):
@@ -491,7 +510,6 @@ class BountyUpdater:
                             await self._send_map(ch, map_key, tgt, x, z, reason)
                             b["has_initial_posted"] = True
                             b["last_coords"] = {"x": x, "z": z}
-                            b.setdefault("pl_absent", 0)
                             _save_db(doc)
                             _log("initial map posted", gid=gid, target=tgt)
                         except Exception as e:
@@ -499,64 +517,83 @@ class BountyUpdater:
                     continue  # wait for PlayerList-gated loop next tick
 
                 # ---- PlayerList presence inference (fallback for conn/disc lines) ----
-                present = bool(pl_ts and pl_players.get(norm_tgt))
-                b.setdefault("pl_absent", 0)
+                # Consider presence & coords with tolerant key fallback
+                coords = pl_players.get(norm_tgt)
+                if coords is None and by_key:
+                    coords = by_key.get(_key(tgt))
 
-                # If target appears after being offline -> announce online
-                if present and not b.get("online", True):
-                    try:
-                        await _announce_online(self.bot, gid, tgt)
-                    except Exception:
-                        pass
-                    b["online"] = True
-                    b["last_state_announce"] = "online"
-                    b["pl_absent"] = 0
-                    _save_db(doc)
-                    _log("inferred ONLINE from PlayerList", gid=gid, target=tgt, pl_ts=pl_ts)
+                present = bool(pl_ts and coords)
+                snapshot_changed = bool(pl_ts and b.get("last_pl_seen_ts") != pl_ts)
 
-                # If target is missing from PlayerList several consecutive snapshots, infer offline
-                if not present and b.get("online", True) and pl_ts:
-                    b["pl_absent"] = int(b.get("pl_absent", 0)) + 1
-                    _log("PL absence tick", gid=gid, target=tgt, misses=b["pl_absent"])
-                    if b["pl_absent"] >= PL_ABSENCE_THRESHOLD and b.get("last_state_announce") != "offline":
-                        # Use last known coords for the offline announcement
-                        lc = b.get("last_coords") or {}
-                        lx = lc.get("x"); lz = lc.get("z")
+                # Only mutate counters when the snapshot actually changed
+                if snapshot_changed:
+                    b["last_pl_seen_ts"] = pl_ts
+                    if present:
+                        b["pl_absent"] = 0
+                        # If we had flipped offline earlier, announce coming back
+                        if not b.get("online", True):
+                            try:
+                                await _announce_online(self.bot, gid, tgt)
+                            except Exception:
+                                pass
+                            b["online"] = True
+                            b["last_state_announce"] = "online"
+                            _save_db(doc)
+                            _log("inferred ONLINE from PlayerList", gid=gid, target=tgt, pl_ts=pl_ts)
+                    else:
+                        b["pl_absent"] = int(b.get("pl_absent", 0)) + 1
+                        _log("PL absence tick", gid=gid, target=tgt, misses=b["pl_absent"])
+                        # Only announce offline once, after threshold
                         try:
-                            await _announce_offline(self.bot, gid, tgt, lx, lz)
-                        except Exception:
-                            pass
-                        b["online"] = False
-                        b["last_state_announce"] = "offline"
-                        _save_db(doc)
-                        _log("inferred OFFLINE from PlayerList", gid=gid, target=tgt, pl_ts=pl_ts)
-                if present:
-                    b["pl_absent"] = 0
+                            thr = PL_ABSENCE_THRESHOLD  # expect global
+                        except NameError:
+                            thr = 1  # sensible default
+                        if b.get("online", True) and b["pl_absent"] >= thr and b.get("last_state_announce") != "offline":
+                            lc = b.get("last_coords") or {}
+                            lx = lc.get("x"); lz = lc.get("z")
+                            try:
+                                await _announce_offline(self.bot, gid, tgt, lx, lz)
+                            except Exception:
+                                pass
+                            b["online"] = False
+                            b["last_state_announce"] = "offline"
+                            _save_db(doc)
+                            _log("inferred OFFLINE from PlayerList", gid=gid, target=tgt, pl_ts=pl_ts)
                 # ----------------------------------------------------------------------
 
                 # 2) Gated updates only when online AND present in latest PlayerList.
-                if not b.get("online", True):
+                if not b.get("online", True"):
                     continue
-                if not pl_ts or not pl_players:
+                if not present:
+                    # helpful debug the first few times
+                    if pl_players and snapshot_changed:
+                        _log("target not in latest playerlist",
+                             gid=gid, target=tgt, pl_ts=pl_ts,
+                             sample=list(pl_players.keys())[:5])
                     continue
-                coords = pl_players.get(norm_tgt)
-                if not coords:
-                    _log("target not in latest playerlist", gid=gid, target=tgt, pl_ts=pl_ts, players=len(pl_players))
-                    continue  # target not in latest PlayerList
 
-                if b.get("last_pl_ts") == pl_ts:
-                    continue  # already posted for this snapshot
-
+                # Post only if this is a new snapshot OR movement happened since last post
                 x, z = coords
-                try:
-                    await self._send_map(ch, map_key, tgt, x, z, reason)
-                    b["last_pl_ts"] = pl_ts
-                    b["last_coords"] = {"x": x, "z": z}
-                    b["last_state_announce"] = "online"
-                    _save_db(doc)
-                    _log("playerlist-gated map posted", gid=gid, target=tgt, pl_ts=pl_ts)
-                except Exception as e:
-                    _log("send failed", gid=gid, target=tgt, err=repr(e))
+                same_snapshot = (b.get("last_pl_ts") == pl_ts)
+                moved = True
+                if same_snapshot:
+                    last = b.get("last_coords") or {}
+                    last_x = float(last.get("x", 0) or 0)
+                    last_z = float(last.get("z", 0) or 0)
+                    moved = (abs(last_x - x) > 0.1) or (abs(last_z - z) > 0.1)
+
+                if snapshot_changed or moved:
+                    try:
+                        await self._send_map(ch, map_key, tgt, x, z, reason)
+                        b["last_pl_ts"] = pl_ts
+                        b["last_coords"] = {"x": x, "z": z}
+                        b["last_state_announce"] = "online"
+                        _save_db(doc)
+                        _log("playerlist-gated map posted",
+                             gid=gid, target=tgt, pl_ts=pl_ts,
+                             moved=moved, same_snapshot=same_snapshot)
+                    except Exception as e:
+                        _log("send failed", gid=gid, target=tgt, err=repr(e))
 
 # ---------------------------- Announce helpers --------------------------------
 async def _announce_online(bot: commands.Bot, gid: int, name: str):
@@ -671,6 +708,7 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
             open_bounties = [b for b in doc.get("open", []) if int(b.get("guild_id", 0)) == guild_id]
 
     # 2) Connection status + announcements (regex-based)
+    # Updated: 2025-09-10
     if not open_bounties:
         return
     
@@ -678,18 +716,19 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
     last_status_ts: Dict[str, str] = {}     # norm(name) -> "HH:MM:SS"
     
     for ln in lines:  # scan in file order; keep the latest clock time per player
-        mc = CONNECT_RE.search(ln)
-        if mc and "disconnected" not in ln.lower():  # extra safety
-            nm = _norm(mc.group("name"))
-            ts = mc.group("ts")
+        m = CONNECT_RE.search(ln)
+        if m:
+            nm = _norm(m.group("name"))
+            ts = m.group("ts")
             if ts >= last_status_ts.get(nm, "00:00:00"):
                 last_status[nm] = "connected"
                 last_status_ts[nm] = ts
             continue
-        md = DISCONNECT_RE.search(ln)
-        if md:
-            nm = _norm(md.group("name"))
-            ts = md.group("ts")
+    
+        m = DISCONNECT_RE.search(ln)
+        if m:
+            nm = _norm(m.group("name"))
+            ts = m.group("ts")
             if ts >= last_status_ts.get(nm, "00:00:00"):
                 last_status[nm] = "disconnected"
                 last_status_ts[nm] = ts
@@ -899,6 +938,7 @@ class BountyCog(commands.Cog):
             "last_state_announce": "online", # dedupe “online/offline” notices
             "last_coords": None,             # {"x": float, "z": float}
             "pl_absent": 0,                  # consecutive PlayerList misses
+            "last_pl_seen_ts": None,
         }
         bdoc = _db()
         for b in bdoc["open"]:
