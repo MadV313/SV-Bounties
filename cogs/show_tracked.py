@@ -203,6 +203,30 @@ def _izurvive_url(map_name: str, x: float, z: float) -> str:
     return f"https://www.izurvive.com/{slug}/#location={x:.2f};{z:.2f}"
 
 
+# ---------- pagination helpers (prevents 2,000-char crashes) ----------
+EMBED_DESC_LIMIT = 4096  # Discord embed description max
+CONTENT_LIMIT_SAFE = 1900  # if we ever use plain content
+
+def _chunk_lines_for_embed(header: str, lines: List[str]) -> List[str]:
+    """
+    Split a list of bullet lines into multiple embed description strings,
+    each <= EMBED_DESC_LIMIT (including header on first page).
+    """
+    pages: List[str] = []
+    cur = header.strip()
+    for ln in lines:
+        add = ("\n" if cur else "") + ln
+        if len(cur) + len(add) > EMBED_DESC_LIMIT:
+            pages.append(cur)
+            cur = ln  # start next page without header
+        else:
+            cur += add
+    if cur:
+        pages.append(cur)
+    return pages
+# ----------------------------------------------------------------------
+
+
 class ShowTracked(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -345,15 +369,30 @@ class ShowTracked(commands.Cog):
         header = f"**Tracked players — {active_map}**"
         if relaxed_used:
             header += "\n_(Note: map mismatch detected; showing all players returned by tracker.)_"
-        header += "\n" + "\n".join(lines)
 
-        # Save image to in-memory buffer
+        # ---- paginate into embeds so we never exceed message limits ----
+        pages = _chunk_lines_for_embed(header, lines)
+        total_pages = len(pages)
+
+        # Save image buffer once (used only on page 1)
         buf = io.BytesIO()
         base.save(buf, format="PNG")
         buf.seek(0)
         file = discord.File(buf, filename="tracked_map.png")
 
-        await interaction.followup.send(content=header, file=file, ephemeral=False)
+        # Send first page with the map image
+        embed0 = discord.Embed(description=pages[0], color=0x2f3136)
+        embed0.set_image(url="attachment://tracked_map.png")
+        if total_pages > 1:
+            embed0.set_footer(text=f"Page 1/{total_pages}")
+        await interaction.followup.send(embed=embed0, file=file, ephemeral=False)
+
+        # Send any remaining pages as additional embeds (no image to avoid reupload)
+        for idx in range(1, total_pages):
+            em = discord.Embed(description=pages[idx], color=0x2f3136)
+            em.set_footer(text=f"Page {idx+1}/{total_pages}")
+            await interaction.followup.send(embed=em, ephemeral=False)
+        # ----------------------------------------------------------------
 
 
 async def setup(bot: commands.Bot):
