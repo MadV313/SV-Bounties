@@ -34,6 +34,8 @@ ADM_LATEST_PATH = "data/latest_adm.log"
 # When a target is absent from PlayerList this many consecutive snapshots,
 # infer they're offline and announce once.
 PL_ABSENCE_THRESHOLD = 2  # ~2 snapshots ≈ a few minutes
+# Force a post at least every N seconds while target is online & present
+FORCE_POST_EVERY_SEC = 5 * 60
 
 # ----------------------------- Helper dataclasses ----------------------------
 @dataclass
@@ -367,18 +369,54 @@ PL_FOOTER_RE = re.compile(r'^\d\d:\d\d:\d\d\s+\|\s+#####\s*$', re.I)
 
 def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[str]:
     """
-    Try external URL first (if settings provide it), then local fallback.
-    We keep logs quiet if nothing is found (treated as 'no update this tick').
+    Read all viable ADM candidates, then pick the *best* one:
+      - prefers files with PlayerList/connect/disconnect/kill lines
+      - prefers the most recent in-file HH:MM:SS clock time
+      - falls back to longest file if times are tied
+    This avoids getting stuck on a placeholder file.
     """
     paths = _adm_candidate_paths_for_guild(int(gid_hint or 0)) if gid_hint else [ADM_LATEST_PATH]
+    best_lines: List[str] = []
+    best_score: int = -1
+
+    def _clock_score(ls: List[str]) -> int:
+        # Extract the max HH:MM:SS we can find to create a "recency-ish" score
+        hhmmss = 0
+        for ln in ls[-2000:]:
+            m = PL_HEADER_RE.search(ln) or CONNECT_RE.search(ln) or DISCONNECT_RE.search(ln)
+            if not m:
+                continue
+            ts = m.group("ts")
+            try:
+                h, mi, s = ts.split(":")
+                hhmmss = max(hhmmss, int(h) * 3600 + int(mi) * 60 + int(s))
+            except Exception:
+                pass
+        return hhmmss
+
     for p in paths:
         txt = _load_text_from_any(p)
-        if txt is None:
+        if not txt:
             continue
-        lines = txt.splitlines()
-        if lines:
-            return lines[-limit:]
-    return []
+        # Strip trailing empties and ignore trivial placeholders
+        lines = [l for l in txt.splitlines() if l.strip()]
+        if not lines:
+            continue
+        has_signal = any(
+            PL_HEADER_RE.search(l) or CONNECT_RE.search(l) or DISCONNECT_RE.search(l) or
+            KILL_RE.search(l) or KILL_RE_NIT.search(l)
+            for l in lines[-500:]
+        )
+        if not has_signal and len(lines) <= 5:
+            # Looks like a tiny placeholder; skip
+            continue
+
+        score = _clock_score(lines) * 100000 + min(len(lines), 100000)
+        if score > best_score:
+            best_score = score
+            best_lines = lines
+
+    return best_lines[-limit:] if best_lines else []
 
 def _latest_playerlist(lines: List[str]) -> Tuple[Optional[str], Dict[str, Tuple[float, float]]]:
     """
@@ -574,8 +612,9 @@ class BountyUpdater:
                              gid=gid, target=tgt, pl_sig=pl_sig,
                              sample=list(pl_players.keys())[:5])
                     continue
-
-                # Post only if this is a new snapshot OR movement happened since last post
+                
+                # Post only if this is a new snapshot OR movement happened since last post,
+                # OR our cadence timer demands it.
                 x, z = coords
                 same_snapshot = (b.get("last_pl_ts") == pl_sig)
                 moved = True
@@ -584,13 +623,21 @@ class BountyUpdater:
                     last_x = float(last.get("x", 0) or 0)
                     last_z = float(last.get("z", 0) or 0)
                     moved = (abs(last_x - x) > 0.1) or (abs(last_z - z) > 0.1)
-
-                if snapshot_changed or moved:
+                
+                # ensure default (for older records)
+                b.setdefault("last_post_ts", 0)
+                now_ts = datetime.now(timezone.utc).timestamp()
+                should_post = snapshot_changed or moved
+                if now_ts - float(b.get("last_post_ts") or 0) >= FORCE_POST_EVERY_SEC:
+                    should_post = True
+                
+                if should_post:
                     try:
                         await self._send_map(ch, map_key, tgt, x, z, reason)
                         b["last_pl_ts"] = pl_sig
                         b["last_coords"] = {"x": x, "z": z}
                         b["last_state_announce"] = "online"
+                        b["last_post_ts"] = now_ts
                         _save_db(doc)
                         _log("playerlist-gated map posted",
                              gid=gid, target=tgt, pl_sig=pl_sig,
@@ -942,6 +989,7 @@ class BountyCog(commands.Cog):
             "last_coords": None,             # {"x": float, "z": float}
             "pl_absent": 0,                  # consecutive PlayerList misses
             "last_pl_seen_ts": None,
+            "last_post_ts": 0,               # cadence guard
         }
         bdoc = _db()
         for b in bdoc["open"]:
