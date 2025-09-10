@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple, List
 from pathlib import Path  # ← needed by ADM parsing
-
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -495,8 +494,8 @@ class BountyUpdater:
                 reason = (b.get("reason") or "").strip() or None
 
                 # Ensure fields exist for stable logic
-                b.setdefault("pl_absent": 0,)
-                b.setdefault("last_pl_seen_ts": None,)
+                b.setdefault("pl_absent", 0)
+                b.setdefault("last_pl_seen_ts", None)
                 b.setdefault("online", True)
                 b.setdefault("last_state_announce", "online")
 
@@ -562,7 +561,7 @@ class BountyUpdater:
                 # ----------------------------------------------------------------------
 
                 # 2) Gated updates only when online AND present in latest PlayerList.
-                if not b.get("online", True"):
+                if not b.get("online", True):
                     continue
                 if not present:
                     # helpful debug the first few times
