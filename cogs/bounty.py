@@ -5,6 +5,7 @@ import io
 import re
 import json
 import asyncio
+import hashlib
 from urllib.request import Request, urlopen
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -382,33 +383,37 @@ def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[s
 def _latest_playerlist(lines: List[str]) -> Tuple[Optional[str], Dict[str, Tuple[float, float]]]:
     """
     Parse the most recent PlayerList block.
-    Returns (pl_ts, {normalized_name: (x,z)}).
+    Returns (pl_sig, {normalized_name: (x,z)}), where pl_sig is a stable content signature
+    that changes whenever the PlayerList block's contents change.
     """
-    pl_ts: Optional[str] = None
+    pl_sig: Optional[str] = None
     players: Dict[str, Tuple[float, float]] = {}
     i = len(lines) - 1
     while i >= 0:
         mhead = PL_HEADER_RE.search(lines[i])
         if mhead:
-            ts = mhead.group("ts")
+            ts = mhead.group("ts")  # kept for logging only
+            block_lines = [lines[i]]
             j = i + 1
             tmp_players: Dict[str, Tuple[float, float]] = {}
             while j < len(lines) and not PL_FOOTER_RE.search(lines[j]):
+                block_lines.append(lines[j])
                 pm = PL_PLAYER_RE.search(lines[j])
                 if pm:
                     nm = _norm(pm.group("name"))
                     try:
-                        x = float(pm.group("x"))
-                        z = float(pm.group("z"))
+                        x = float(pm.group("x")); z = float(pm.group("z"))
                         tmp_players[nm] = (x, z)
                     except Exception:
                         pass
                 j += 1
-            pl_ts = ts
+            # content signature: header index + player count + small hash of block text
+            h = hashlib.blake2b("\n".join(block_lines).encode("utf-8", "ignore"), digest_size=6).hexdigest()
+            pl_sig = f"{i}|{len(tmp_players)}|{h}"
             players = tmp_players
             break
         i -= 1
-    return pl_ts, players
+    return pl_sig, players
 
 # ----------------------- Renderer with PlayerList gating ----------------------
 class BountyUpdater:
@@ -476,8 +481,8 @@ class BountyUpdater:
 
             # Read latest ADM once per tick
             lines = _read_adm_lines(gid_hint=gid)
-            pl_ts, pl_players = _latest_playerlist(lines)
-            _log("playerlist parsed", gid=gid, pl_ts=pl_ts, count=len(pl_players))
+            pl_sig, pl_players = _latest_playerlist(lines)
+            _log("playerlist parsed", gid=gid, pl_sig=pl_sig, count=len(pl_players))
 
             # Helper for tolerant name matching (ignores spaces/punct)
             def _key(s: str) -> str:
@@ -521,12 +526,11 @@ class BountyUpdater:
                 if coords is None and by_key:
                     coords = by_key.get(_key(tgt))
 
-                present = bool(pl_ts and coords)
-                snapshot_changed = bool(pl_ts and b.get("last_pl_seen_ts") != pl_ts)
-
+                present = bool(pl_sig and coords)
+                snapshot_changed = bool(pl_sig and b.get("last_pl_seen_ts") != pl_sig)
                 # Only mutate counters when the snapshot actually changed
                 if snapshot_changed:
-                    b["last_pl_seen_ts"] = pl_ts
+                    b["last_pl_seen_ts"] = pl_sig
                     if present:
                         b["pl_absent"] = 0
                         # If we had flipped offline earlier, announce coming back
@@ -538,7 +542,7 @@ class BountyUpdater:
                             b["online"] = True
                             b["last_state_announce"] = "online"
                             _save_db(doc)
-                            _log("inferred ONLINE from PlayerList", gid=gid, target=tgt, pl_ts=pl_ts)
+                            _log("inferred ONLINE from PlayerList", gid=gid, target=tgt, pl_sig=pl_sig)
                     else:
                         b["pl_absent"] = int(b.get("pl_absent", 0)) + 1
                         _log("PL absence tick", gid=gid, target=tgt, misses=b["pl_absent"])
@@ -557,7 +561,7 @@ class BountyUpdater:
                             b["online"] = False
                             b["last_state_announce"] = "offline"
                             _save_db(doc)
-                            _log("inferred OFFLINE from PlayerList", gid=gid, target=tgt, pl_ts=pl_ts)
+                            _log("inferred OFFLINE from PlayerList", gid=gid, target=tgt, pl_sig=pl_sig)
                 # ----------------------------------------------------------------------
 
                 # 2) Gated updates only when online AND present in latest PlayerList.
@@ -567,13 +571,13 @@ class BountyUpdater:
                     # helpful debug the first few times
                     if pl_players and snapshot_changed:
                         _log("target not in latest playerlist",
-                             gid=gid, target=tgt, pl_ts=pl_ts,
+                             gid=gid, target=tgt, pl_sig=pl_sig,
                              sample=list(pl_players.keys())[:5])
                     continue
 
                 # Post only if this is a new snapshot OR movement happened since last post
                 x, z = coords
-                same_snapshot = (b.get("last_pl_ts") == pl_ts)
+                same_snapshot = (b.get("last_pl_ts") == pl_sig)
                 moved = True
                 if same_snapshot:
                     last = b.get("last_coords") or {}
@@ -584,12 +588,12 @@ class BountyUpdater:
                 if snapshot_changed or moved:
                     try:
                         await self._send_map(ch, map_key, tgt, x, z, reason)
-                        b["last_pl_ts"] = pl_ts
+                        b["last_pl_ts"] = pl_sig
                         b["last_coords"] = {"x": x, "z": z}
                         b["last_state_announce"] = "online"
                         _save_db(doc)
                         _log("playerlist-gated map posted",
-                             gid=gid, target=tgt, pl_ts=pl_ts,
+                             gid=gid, target=tgt, pl_sig=pl_sig,
                              moved=moved, same_snapshot=same_snapshot)
                     except Exception as e:
                         _log("send failed", gid=gid, target=tgt, err=repr(e))
@@ -1025,8 +1029,8 @@ class BountyCog(commands.Cog):
     async def _before_kw(self):
         await self.bot.wait_until_ready()
 
-    # Every 30 minutes, if no bounties online, say so (once per tick)
-    @tasks.loop(minutes=30.0)
+    # Every 15 minutes, if no bounties online, say so (once per tick)
+    @tasks.loop(minutes=15.0)
     async def idle_announcer(self):
         doc = _db()
         by_guild: Dict[int, List[dict]] = {}
