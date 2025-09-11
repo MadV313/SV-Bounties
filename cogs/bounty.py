@@ -335,37 +335,45 @@ def _set_online_state(guild_id: int, target: str, online: bool) -> bool:
     return changed
 
 # ----------------------------- ADM parsing -----------------------------------
+# Optional date prefix like "2025-09-10 " or "Sep 10 2025 "
+TS_PREFIX_OPT = r'(?:\d{4}-\d{2}-\d{2}\s+|[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\s+)?'
+
 # Kills (both common and Nitrado variants)
-KILL_RE = re.compile(r"^(?P<ts>\d\d:\d\d:\d\d).*?(?P<victim>.+?) was killed by (?P<killer>.+?)\b", re.I)
+KILL_RE = re.compile(
+    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d).*?(?P<victim>.+?) (?:was|has been)\s+killed by (?P<killer>.+?)\b',
+    re.I,
+)
 KILL_RE_NIT = re.compile(
     r'Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?.*?killed by Player\s+"(?P<killer>[^"]+)"',
     re.I,
 )
 
-# Connect / Disconnect — broader variants (avoid missing lines)
+# Connect / Disconnect — tolerant to "is connected", "has been disconnected", etc.
 CONNECT_RE = re.compile(
-    r'^(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+Player\s+"(?P<name>[^"]+)"[^\n]*?\b(?<!dis)connected\b',
-    re.I
+    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+Player\s+"(?P<name>[^"]+)"[^\n]*?\b(?<!dis|re)connected\b',
+    re.I,
 )
 DISCONNECT_RE = re.compile(
-    r'^(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+Player\s+"(?P<name>[^"]+)"[^\n]*?\bdisconnected\b',
-    re.I
+    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+Player\s+"(?P<name>[^"]+)"[^\n]*?\bdisconnected\b',
+    re.I,
 )
 
-# PlayerList block
-PL_HEADER_RE = re.compile(r'^(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+##### PlayerList log:\s+(?P<count>\d+)\s+players?', re.I)
+# PlayerList block (tolerant spacing/casing)
+PL_HEADER_RE = re.compile(
+    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s*#####\s*Player\s*List\s*log[^:]*:\s*(?P<count>\d+)\s+players?',
+    re.I,
+)
 PL_PLAYER_RE = re.compile(
-    r'^\d\d:\d\d:\d\d\s+\|\s+Player\s+"(?P<name>[^"]+)"\s*\('
-    r'(?:id=[^)]*?)?\s*'                      # optional id=..., tolerant spacing
-    r'pos\s*=\s*<\s*'                         # pos = <
-    r'(?P<x>-?\d+(?:\.\d+)?)\s*,\s*'          # x
-    r'(?P<z>-?\d+(?:\.\d+)?)\s*,\s*'          # z
-    r'[-\d.]+\s*'                             # y (ignored)
-    r'>\)'                                    # >)
-    , re.I
+    rf'^{TS_PREFIX_OPT}\d\d:\d\d:\d\d\s+\|\s+Player\s+"(?P<name>[^"]+)"\s*\('
+    r'(?:id=[^)]*?)?\s*'                       # optional id=..., tolerant spacing
+    r'pos\s*=\s*<\s*'                          # pos = <
+    r'(?P<x>-?\d+(?:\.\d+)?)\s*,\s*'           # x
+    r'(?P<z>-?\d+(?:\.\d+)?)\s*,\s*'           # z
+    r'[-\d.]+\s*'                              # y (ignored)
+    r'>\)',                                    # >)
+    re.I,
 )
-
-PL_FOOTER_RE = re.compile(r'^\d\d:\d\d:\d\d\s+\|\s+#####\s*$', re.I)
+PL_FOOTER_RE = re.compile(rf'^{TS_PREFIX_OPT}\d\d:\d\d:\d\d\s+\|\s*#####\s*$', re.I)
 
 def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[str]:
     """
@@ -376,22 +384,20 @@ def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[s
     This avoids getting stuck on a placeholder file.
     """
     paths = _adm_candidate_paths_for_guild(int(gid_hint or 0)) if gid_hint else [ADM_LATEST_PATH]
+    _log("adm_candidates", gid=gid_hint, candidates=paths)
     best_lines: List[str] = []
     best_score: int = -1
+    chosen_path: Optional[str] = None
+    TIME_RE = re.compile(r'(\d{2}):(\d{2}):(\d{2})')
 
     def _clock_score(ls: List[str]) -> int:
-        # Extract the max HH:MM:SS we can find to create a "recency-ish" score
+        # Extract the max HH:MM:SS seen anywhere to approximate "freshness"
         hhmmss = 0
         for ln in ls[-2000:]:
-            m = PL_HEADER_RE.search(ln) or CONNECT_RE.search(ln) or DISCONNECT_RE.search(ln)
-            if not m:
-                continue
-            ts = m.group("ts")
-            try:
-                h, mi, s = ts.split(":")
-                hhmmss = max(hhmmss, int(h) * 3600 + int(mi) * 60 + int(s))
-            except Exception:
-                pass
+            m = TIME_RE.search(ln)
+            if m:
+                h, mi, s = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                hhmmss = max(hhmmss, h * 3600 + mi * 60 + s)
         return hhmmss
 
     for p in paths:
@@ -415,7 +421,12 @@ def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[s
         if score > best_score:
             best_score = score
             best_lines = lines
+            chosen_path = p
 
+    if chosen_path:
+        _log("adm_source_chosen", path=chosen_path, lines=len(best_lines), score=best_score)
+    else:
+        _log("adm_no_viable_lines", candidates=paths)
     return best_lines[-limit:] if best_lines else []
 
 def _latest_playerlist(lines: List[str]) -> Tuple[Optional[str], Dict[str, Tuple[float, float]]]:
