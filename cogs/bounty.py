@@ -334,6 +334,14 @@ def _set_online_state(guild_id: int, target: str, online: bool) -> bool:
         _save_db(doc)
     return changed
 
+def _guild_meta(doc: dict, gid: int) -> dict:
+    """
+    Per-guild metadata (currently just the last combined post timestamp).
+    Returns a small dict you can mutate in-place.
+    """
+    meta = doc.setdefault("_guild_meta", {})
+    return meta.setdefault(str(gid), {"last_combined_post_ts": 0})
+
 # ----------------------------- ADM parsing -----------------------------------
 TS_PREFIX_OPT = r'(?:\d{4}-\d{2}-\d{2}\s+|[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\s+)?'
 
@@ -541,6 +549,60 @@ class BountyUpdater:
         msg = await ch.send(embed=embed, file=file)
         return msg.id
 
+    async def _send_combined_map(
+        self,
+        ch: discord.abc.Messageable,
+        map_key: str,
+        points: List[Tuple[str, float, float]],
+        reasons: Dict[str, Optional[str]],
+    ) -> int:
+        """
+        Draw one map with markers for all (name,x,z) points and post
+        a single embed listing each target with deep-linked coords.
+        Returns the message id (or 0 if nothing posted).
+        """
+        if not points:
+            return 0
+
+        img = _load_map_image(map_key)
+        draw = ImageDraw.Draw(img)
+        cfg = MAPS.get(map_key, MAPS["livonia"])
+
+        for name, x, z in points:
+            px, py = _world_to_px(cfg, x, z, img.width)
+            r = 9
+            draw.ellipse([px - r, py - r, px + r, py + r], outline=(255, 0, 0, 255), width=4)
+            draw.ellipse([px - 2, py - 2, px + 2, py + 2], fill=(255, 0, 0, 255))
+            try:
+                draw.text((px + 12, py - 12), f"{name} • {int(x)},{int(z)}", fill=(255, 255, 255, 255))
+            except Exception:
+                pass
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+
+        lines = []
+        for name, x, z in sorted(points, key=lambda t: t[0].casefold()):
+            coords_md = _coords_link_text(map_key, x, z)
+            rsn = reasons.get(name) or None
+            if rsn:
+                lines.append(f"• **{name}** — Last known: {coords_md}\n  └ **Reason:** {rsn[:280]}")
+            else:
+                lines.append(f"• **{name}** — Last known: {coords_md}")
+
+        embed = discord.Embed(
+            title=f"<:wanted:1414383833494847540> Active bounties ({len(points)})",
+            description="\n".join(lines) or "No locations available.",
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        fname = _safe_png_name("active_bounties_map")
+        embed.set_image(url=f"attachment://{fname}")
+
+        msg = await ch.send(embed=embed, file=discord.File(fp=buf, filename=fname))
+        return msg.id
+
     async def update_guild(self, gid: int):
         async with self._lock_for(gid):
             settings = _guild_settings(gid)
@@ -563,27 +625,30 @@ class BountyUpdater:
             pl_sig, pl_players = _latest_playerlist(lines)
             _log("playerlist parsed", gid=gid, pl_sig=pl_sig, count=len(pl_players))
 
-            # Helper for tolerant name matching (ignores spaces/punct)
             def _key(s: str) -> str:
                 return re.sub(r'[^a-z0-9]+', '', (s or '').casefold())
-
             by_key = { _key(nm): xy for nm, xy in pl_players.items() } if pl_players else {}
+
+            map_key, _cfg = _canon_map_and_cfg(settings.get("active_map"))
+            combined_points: List[Tuple[str, float, float]] = []
+            reasons: Dict[str, Optional[str]] = {}
+            any_moved = False
 
             for b in targets:
                 tgt = (b.get("target_gamertag") or "").strip()
                 if not tgt:
                     continue
                 norm_tgt = _norm(tgt)
-                map_key, _cfg = _canon_map_and_cfg(settings.get("active_map"))
-                reason = (b.get("reason") or "").strip() or None
+                reasons[tgt] = (b.get("reason") or "").strip() or None
 
                 # Ensure fields exist for stable logic
                 b.setdefault("pl_absent", 0)
                 b.setdefault("last_pl_seen_ts", None)
                 b.setdefault("online", True)
                 b.setdefault("last_state_announce", "online")
+                b.setdefault("last_post_ts", 0)
 
-                # ---------- NEW: explicit conn/disc check per tick ----------
+                # Explicit connect/disconnect lines override presence
                 latest_state, latest_ts = _latest_status_for(lines, norm_tgt)
                 if latest_state == "connected" and b.get("last_state_announce") != "online":
                     try:
@@ -594,9 +659,7 @@ class BountyUpdater:
                     b["last_state_announce"] = "online"
                     _save_db(doc)
                     _log("explicit ONLINE from conn line", gid=gid, target=tgt, at=latest_ts)
-
                 if latest_state == "disconnected" and b.get("last_state_announce") != "offline":
-                    # announce with best known coords
                     lx = lz = None
                     lc = b.get("last_coords") or {}
                     try:
@@ -619,35 +682,25 @@ class BountyUpdater:
                     b["last_state_announce"] = "offline"
                     _save_db(doc)
                     _log("explicit OFFLINE from disc line", gid=gid, target=tgt, at=latest_ts)
-                # ------------------------------------------------------------
 
-                # 1) Seed initial post (once), regardless of PlayerList.
+                # Seed coords for new bounty (no single-target seed post)
                 if not b.get("has_initial_posted"):
                     _, track = load_track(tgt, window_hours=48, max_points=1)
                     if track and track.get("points"):
                         pt = track["points"][-1]
                         try:
-                            x, z = float(pt["x"]), float(pt["z"])
-                            await self._send_map(ch, map_key, tgt, x, z, reason)
-                            b["has_initial_posted"] = True
-                            b["last_coords"] = {"x": x, "z": z}
+                            b["last_coords"] = {"x": float(pt["x"]), "z": float(pt["z"])}
                             _save_db(doc)
-                            _log("initial map posted", gid=gid, target=tgt)
-                        except Exception as e:
-                            _log("initial map failed", gid=gid, target=tgt, err=repr(e))
-                    continue  # wait for PlayerList-gated loop next tick
+                            _log("seeded coords from tracker", gid=gid, target=tgt, coords=b["last_coords"])
+                        except Exception:
+                            pass
+                    b["has_initial_posted"] = True
 
-                # ---- PlayerList presence inference (fallback when no conn/disc lines) ----
-                coords = pl_players.get(norm_tgt)
-                if coords is None and by_key:
-                    coords = by_key.get(_key(tgt))
-
-                present = bool(pl_sig and coords)
-                snapshot_changed = bool(pl_sig and b.get("last_pl_seen_ts") != pl_sig)
-                # Only mutate counters when the snapshot actually changed
-                if snapshot_changed:
+                # PlayerList presence → infer online/offline if no explicit lines
+                coords_from_pl = pl_players.get(norm_tgt) or (by_key.get(_key(tgt)) if by_key else None)
+                if pl_sig and b.get("last_pl_seen_ts") != pl_sig:
                     b["last_pl_seen_ts"] = pl_sig
-                    if present:
+                    if coords_from_pl:
                         b["pl_absent"] = 0
                         if not b.get("online", True):
                             try:
@@ -657,15 +710,11 @@ class BountyUpdater:
                             b["online"] = True
                             b["last_state_announce"] = "online"
                             _save_db(doc)
-                            _log("inferred ONLINE from PlayerList", gid=gid, target=tgt, pl_sig=pl_sig)
+                            _log("inferred ONLINE from PlayerList", gid=gid, target=tgt)
                     else:
                         b["pl_absent"] = int(b.get("pl_absent", 0)) + 1
                         _log("PL absence tick", gid=gid, target=tgt, misses=b["pl_absent"])
-                        try:
-                            thr = PL_ABSENCE_THRESHOLD
-                        except NameError:
-                            thr = 1
-                        if b.get("online", True) and b["pl_absent"] >= thr and b.get("last_state_announce") != "offline":
+                        if b.get("online", True) and b["pl_absent"] >= PL_ABSENCE_THRESHOLD and b.get("last_state_announce") != "offline":
                             lc = b.get("last_coords") or {}
                             lx = lc.get("x"); lz = lc.get("z")
                             try:
@@ -675,108 +724,71 @@ class BountyUpdater:
                             b["online"] = False
                             b["last_state_announce"] = "offline"
                             _save_db(doc)
-                            _log("inferred OFFLINE from PlayerList", gid=gid, target=tgt, pl_sig=pl_sig)
-                # --------------------------------------------------------------------------
 
-                # 2) Gated updates: only while ONLINE
                 if not b.get("online", True):
+                    continue  # offline targets are excluded from combined map
+
+                # Choose best coords to show: PL → tail single-line → last_coords → tracker
+                best_xy: Optional[Tuple[float, float]] = None
+                if coords_from_pl:
+                    best_xy = coords_from_pl
+                else:
+                    tail_xy = _last_pos_for(lines, norm_tgt)
+                    if tail_xy:
+                        best_xy = tail_xy
+                    else:
+                        lc = b.get("last_coords") or {}
+                        try:
+                            best_xy = (float(lc["x"]), float(lc["z"]))
+                        except Exception:
+                            best_xy = None
+                        if best_xy is None:
+                            _, track = load_track(tgt, window_hours=48, max_points=1)
+                            if track and track.get("points"):
+                                pt = track["points"][-1]
+                                try:
+                                    best_xy = (float(pt["x"]), float(pt["z"]))
+                                except Exception:
+                                    best_xy = None
+
+                if best_xy is None:
                     continue
 
-                if not present:
-                    # helpful debug the first few times
-                    if pl_players and snapshot_changed:
-                        _log("target not in latest playerlist",
-                             gid=gid, target=tgt, pl_sig=pl_sig,
-                             sample=list(pl_players.keys())[:5])
+                x, z = best_xy
+                last = b.get("last_coords") or {}
+                last_x = float(last.get("x", 0) or 0)
+                last_z = float(last.get("z", 0) or 0)
+                moved = (abs(last_x - x) > 0.1) or (abs(last_z - z) > 0.1)
+                any_moved = any_moved or moved
+                b["last_coords"] = {"x": x, "z": z}
 
-                    # Preferred fallback: single-line pos in ADM tail
-                    fallback_xy = _last_pos_for(lines, norm_tgt)
+                combined_points.append((tgt, x, z))
 
-                    # If still nothing, use last known coords from our record
-                    coords_to_use: Optional[Tuple[float, float]] = None
-                    src = None
-                    if fallback_xy:
-                        coords_to_use = fallback_xy
-                        src = "single_line"
-                    else:
-                        last = b.get("last_coords") or {}
-                        try:
-                            coords_to_use = (float(last["x"]), float(last["z"]))  # may raise
-                            src = "last_coords"
-                        except Exception:
-                            coords_to_use = None
+            # Post one combined embed if anything moved or cadence is due
+            if not combined_points:
+                _log("combined: nothing to show", gid=gid)
+                _save_db(doc)
+                return
 
-                    # If we don't even have last_coords, try tracker (48h)
-                    if coords_to_use is None:
-                        _, track = load_track(tgt, window_hours=48, max_points=1)
-                        if track and track.get("points"):
-                            pt = track["points"][-1]
-                            try:
-                                coords_to_use = (float(pt["x"]), float(pt["z"]))
-                                src = "tracker"
-                            except Exception:
-                                coords_to_use = None
+            meta = _guild_meta(doc, gid)
+            now_ts = datetime.now(timezone.utc).timestamp()
+            cadence_due = (now_ts - float(meta.get("last_combined_post_ts") or 0) >= FORCE_POST_EVERY_SEC)
 
-                    # If we have something to show, honor movement OR cadence
-                    if coords_to_use is not None:
-                        x, z = coords_to_use
-                        b.setdefault("last_post_ts", 0)
-                        last = b.get("last_coords") or {}
-                        last_x = float(last.get("x", 0) or 0)
-                        last_z = float(last.get("z", 0) or 0)
-                        moved = (abs(last_x - x) > 0.1) or (abs(last_z - z) > 0.1)
-                        now_ts = datetime.now(timezone.utc).timestamp()
-                        cadence_due = (now_ts - float(b.get("last_post_ts") or 0) >= FORCE_POST_EVERY_SEC)
-                        should_post = moved or cadence_due
-
-                        if should_post:
-                            try:
-                                await self._send_map(ch, map_key, tgt, x, z, reason)
-                                b["last_coords"] = {"x": x, "z": z}
-                                # Do NOT change last_state_announce here; presence is unknown.
-                                b["last_post_ts"] = now_ts
-                                _save_db(doc)
-                                _log("fallback/cadence map posted",
-                                     gid=gid, target=tgt, moved=moved, cadence_due=cadence_due, src=src)
-                            except Exception as e:
-                                _log("fallback send failed", gid=gid, target=tgt, err=repr(e))
-                    else:
-                        if snapshot_changed:
-                            _log("no PlayerList and no coords available to post",
-                                 gid=gid, target=tgt, pl_sig=pl_sig)
-
-                    continue  # not present branch ends here
-
-                # Present: post on new snapshot/movement or cadence.
-                x, z = coords
-                same_snapshot = (b.get("last_pl_ts") == pl_sig)
-                moved = True
-                if same_snapshot:
-                    last = b.get("last_coords") or {}
-                    last_x = float(last.get("x", 0) or 0)
-                    last_z = float(last.get("z", 0) or 0)
-                    moved = (abs(last_x - x) > 0.1) or (abs(last_z - z) > 0.1)
-
-                b.setdefault("last_post_ts", 0)
-                now_ts = datetime.now(timezone.utc).timestamp()
-                should_post = snapshot_changed or moved
-                if now_ts - float(b.get("last_post_ts") or 0) >= FORCE_POST_EVERY_SEC:
-                    should_post = True
-
-                if should_post:
-                    try:
-                        await self._send_map(ch, map_key, tgt, x, z, reason)
-                        b["last_pl_ts"] = pl_sig
-                        b["last_coords"] = {"x": x, "z": z}
-                        b["last_state_announce"] = "online"
-                        b["last_post_ts"] = now_ts
-                        b["online"] = True
-                        _save_db(doc)
-                        _log("playerlist-gated map posted",
-                             gid=gid, target=tgt, pl_sig=pl_sig,
-                             moved=moved, same_snapshot=same_snapshot)
-                    except Exception as e:
-                        _log("send failed", gid=gid, target=tgt, err=repr(e))
+            if any_moved or cadence_due:
+                try:
+                    await self._send_combined_map(ch, map_key, combined_points, reasons)
+                    for b in targets:
+                        if b.get("online", True):
+                            b["last_post_ts"] = now_ts
+                    meta["last_combined_post_ts"] = now_ts
+                    _save_db(doc)
+                    _log("combined map posted", gid=gid, count=len(combined_points),
+                         any_moved=any_moved, cadence_due=cadence_due)
+                except Exception as e:
+                    _log("combined send failed", gid=gid, err=repr(e))
+            else:
+                _log("combined: skip (no movement and cadence not due)", gid=gid)
+                _save_db(doc)
 
 # ---------------------------- Announce helpers --------------------------------
 async def _announce_online(bot: commands.Bot, gid: int, name: str):
