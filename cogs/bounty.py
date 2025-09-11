@@ -347,7 +347,7 @@ KILL_RE_NIT = re.compile(
     re.I,
 )
 
-# Connect / Disconnect — no look-behinds
+# Connect / Disconnect — no look-behinds that depend on words
 CONNECT_RE = re.compile(
     rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+Player\s+"(?P<name>[^"]+)"[^\n]*?(?<![A-Za-z])connected(?![A-Za-z])',
     re.I,
@@ -623,7 +623,10 @@ class BountyUpdater:
                             _log("inferred OFFLINE from PlayerList", gid=gid, target=tgt, pl_sig=pl_sig)
                 # ----------------------------------------------------------------------
 
-                # 2) First, if not present in PlayerList, try the fallback even if marked offline.
+                # 2) Gated updates only when online AND present in latest PlayerList.
+                if not b.get("online", True):
+                    continue
+
                 if not present:
                     # helpful debug the first few times
                     if pl_players and snapshot_changed:
@@ -631,36 +634,64 @@ class BountyUpdater:
                              gid=gid, target=tgt, pl_sig=pl_sig,
                              sample=list(pl_players.keys())[:5])
 
-                    fallback = _last_pos_for(lines, norm_tgt)
-                    if fallback:
-                        x, z = fallback
+                    # Preferred fallback: single-line pos in ADM tail
+                    fallback_xy = _last_pos_for(lines, norm_tgt)
+
+                    # If still nothing, use last known coords from our record
+                    coords_to_use: Optional[Tuple[float, float]] = None
+                    src = None
+                    if fallback_xy:
+                        coords_to_use = fallback_xy
+                        src = "single_line"
+                    else:
+                        last = b.get("last_coords") or {}
+                        try:
+                            coords_to_use = (float(last["x"]), float(last["z"]))  # may raise
+                            src = "last_coords"
+                        except Exception:
+                            coords_to_use = None
+
+                    # If we don't even have last_coords, try tracker (48h)
+                    if coords_to_use is None:
+                        _, track = load_track(tgt, window_hours=48, max_points=1)
+                        if track and track.get("points"):
+                            pt = track["points"][-1]
+                            try:
+                                coords_to_use = (float(pt["x"]), float(pt["z"]))
+                                src = "tracker"
+                            except Exception:
+                                coords_to_use = None
+
+                    # If we have something to show, honor movement OR cadence
+                    if coords_to_use is not None:
+                        x, z = coords_to_use
                         b.setdefault("last_post_ts", 0)
                         last = b.get("last_coords") or {}
                         last_x = float(last.get("x", 0) or 0)
                         last_z = float(last.get("z", 0) or 0)
                         moved = (abs(last_x - x) > 0.1) or (abs(last_z - z) > 0.1)
                         now_ts = datetime.now(timezone.utc).timestamp()
-                        should_post = moved or (now_ts - float(b.get("last_post_ts") or 0) >= FORCE_POST_EVERY_SEC)
+                        cadence_due = (now_ts - float(b.get("last_post_ts") or 0) >= FORCE_POST_EVERY_SEC)
+                        should_post = moved or cadence_due
+
                         if should_post:
                             try:
                                 await self._send_map(ch, map_key, tgt, x, z, reason)
                                 b["last_coords"] = {"x": x, "z": z}
                                 b["last_state_announce"] = "online"
                                 b["last_post_ts"] = now_ts
-                                b["online"] = True  # revive if we had inferred offline
                                 _save_db(doc)
-                                _log("fallback map posted (no PlayerList block)", gid=gid, target=tgt, moved=moved)
+                                _log("fallback/cadence map posted",
+                                     gid=gid, target=tgt, moved=moved, cadence_due=cadence_due, src=src)
                             except Exception as e:
                                 _log("fallback send failed", gid=gid, target=tgt, err=repr(e))
                     else:
-                        if not pl_sig:
-                            _log("no PlayerList block and no single-line pos", gid=gid, target=tgt)
-                    continue  # handled the 'not present' case
+                        if snapshot_changed:
+                            _log("no PlayerList and no coords available to post",
+                                 gid=gid, target=tgt, pl_sig=pl_sig)
 
-                # Only now gate on 'online' for PlayerList-driven posts
-                if not b.get("online", True):
-                    continue
-
+                    continue  # not present branch ends here
+                
                 # Post only if this is a new snapshot OR movement happened since last post,
                 # OR our cadence timer demands it.
                 x, z = coords
@@ -687,6 +718,7 @@ class BountyUpdater:
                         b["last_state_announce"] = "online"
                         b["last_post_ts"] = now_ts
                         b["online"] = True
+                        b["last_state_announce"] = "online"
                         _save_db(doc)
                         _log("playerlist-gated map posted",
                              gid=gid, target=tgt, pl_sig=pl_sig,
