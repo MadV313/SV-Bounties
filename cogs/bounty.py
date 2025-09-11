@@ -82,6 +82,10 @@ def _norm(name: str) -> str:
     """Normalize names for ADM matching."""
     return (name or "").strip().casefold()
 
+def _name_key(s: str) -> str:
+    """Strip spaces/punct; case-insensitive key for tolerant matching."""
+    return re.sub(r'[^a-z0-9]+', '', (s or '').casefold())
+
 # -------- Wallet helpers (use per-guild settings, then local fallbacks) -------
 def _wallet_candidate_paths_for_guild(gid: int) -> List[str]:
     st = _guild_settings(gid) or {}
@@ -355,25 +359,24 @@ KILL_RE_NIT = re.compile(
     re.I,
 )
 
-# Connect / Disconnect — no look-behinds that depend on words
+# Connect / Disconnect — tolerant to "is connected", "has been disconnected", etc.
 CONNECT_RE = re.compile(
-    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+Player\s+"(?P<name>[^"]+)"[^\n]*?(?<![A-Za-z])connected(?![A-Za-z])',
+    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s*Player\s+"(?P<name>[^"]+)"[^\n]*?\b(?:(?:is|has)\s+)?connected\b',
     re.I,
 )
 DISCONNECT_RE = re.compile(
-    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+Player\s+"(?P<name>[^"]+)"[^\n]*?\bdisconnected\b',
+    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s*Player\s+"(?P<name>[^"]+)"[^\n]*?\b(?:(?:has\s+been|is)\s+)?disconnected\b',
     re.I,
 )
-
-# PlayerList (tolerant)
 PL_HEADER_RE = re.compile(
     rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s*#####\s*Player\s*List\s*log[^:]*:\s*(?P<count>\d+)\s+players?',
     re.I,
 )
+# PlayerList entries — accept "pos" or "position"
 PL_PLAYER_RE = re.compile(
     rf'^{TS_PREFIX_OPT}\d\d:\d\d:\d\d\s+\|\s+Player\s+"(?P<name>[^"]+)"\s*\('
     r'(?:id=[^)]*?)?\s*'
-    r'pos\s*=\s*<\s*'
+    r'(?:pos|position)\s*=\s*<\s*'
     r'(?P<x>-?\d+(?:\.\d+)?)\s*,\s*'
     r'(?P<z>-?\d+(?:\.\d+)?)\s*,\s*'
     r'[-\d.]+\s*'
@@ -383,35 +386,33 @@ PL_PLAYER_RE = re.compile(
 PL_FOOTER_RE = re.compile(rf'^{TS_PREFIX_OPT}\d\d:\d\d:\d\d\s+\|\s*#####\s*$', re.I)
 
 def _last_pos_for(lines: List[str], name_norm: str) -> Optional[Tuple[float, float]]:
-    """Search the tail of ADM for the most recent single-line position for a player."""
-    for ln in reversed(lines[-2000:]):
+    wanted_key = _name_key(name_norm)
+    for ln in reversed(lines[-4000:]):
         pm = PL_PLAYER_RE.search(ln)
-        if pm and _norm(pm.group("name")) == name_norm:
+        if not pm:
+            continue
+        nm = _norm(pm.group("name"))
+        if nm == name_norm or _name_key(nm) == wanted_key:
             try:
-                return float(pm.group("x")), float(pm.group("z"))
+                x = float(pm.group("x")); z = float(pm.group("z"))
             except Exception:
-                pass
+                continue  # ← keep searching older lines instead of bailing
+            return x, z
     return None
 
 def _latest_status_for(lines: List[str], name_norm: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Return ('connected'|'disconnected'|None, 'HH:MM:SS'|None) for the given player,
-    based on the latest clock-time occurrence in the file.
+    Return ('connected'|'disconnected'|None, 'HH:MM:SS'|None) for name_norm,
+    taking the most recent occurrence by scanning from the file tail.
     """
-    last_state: Optional[str] = None
-    last_ts = "00:00:00"
-    for ln in lines:
-        m = CONNECT_RE.search(ln)
-        if m and _norm(m.group("name")) == name_norm:
-            ts = m.group("ts") or "00:00:00"
-            if ts >= last_ts:
-                last_state, last_ts = "connected", ts
+    for ln in reversed(lines[-4000:]):  # tail is enough & faster
         m = DISCONNECT_RE.search(ln)
         if m and _norm(m.group("name")) == name_norm:
-            ts = m.group("ts") or "00:00:00"
-            if ts >= last_ts:
-                last_state, last_ts = "disconnected", ts
-    return last_state, (None if last_state is None else last_ts)
+            return "disconnected", (m.group("ts") or None)
+        m = CONNECT_RE.search(ln)
+        if m and _norm(m.group("name")) == name_norm:
+            return "connected", (m.group("ts") or None)
+    return None, None
 
 def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[str]:
     """
@@ -625,9 +626,7 @@ class BountyUpdater:
             pl_sig, pl_players = _latest_playerlist(lines)
             _log("playerlist parsed", gid=gid, pl_sig=pl_sig, count=len(pl_players))
 
-            def _key(s: str) -> str:
-                return re.sub(r'[^a-z0-9]+', '', (s or '').casefold())
-            by_key = { _key(nm): xy for nm, xy in pl_players.items() } if pl_players else {}
+            by_key = { _name_key(nm): xy for nm, xy in pl_players.items() } if pl_players else {}
 
             map_key, _cfg = _canon_map_and_cfg(settings.get("active_map"))
             combined_points: List[Tuple[str, float, float]] = []
@@ -695,11 +694,14 @@ class BountyUpdater:
                         except Exception:
                             pass
                     b["has_initial_posted"] = True
+                    _save_db(doc)
 
                 # PlayerList presence → infer online/offline if no explicit lines
-                coords_from_pl = pl_players.get(norm_tgt) or (by_key.get(_key(tgt)) if by_key else None)
+                coords_from_pl = pl_players.get(norm_tgt) or by_key.get(_name_key(norm_tgt))
+                
                 if pl_sig and b.get("last_pl_seen_ts") != pl_sig:
-                    b["last_pl_seen_ts"] = pl_sig
+                    b["last_pl_seen_ts"] = pl_sig  # always bump snapshot marker
+                
                     if coords_from_pl:
                         b["pl_absent"] = 0
                         if not b.get("online", True):
@@ -714,7 +716,11 @@ class BountyUpdater:
                     else:
                         b["pl_absent"] = int(b.get("pl_absent", 0)) + 1
                         _log("PL absence tick", gid=gid, target=tgt, misses=b["pl_absent"])
-                        if b.get("online", True) and b["pl_absent"] >= PL_ABSENCE_THRESHOLD and b.get("last_state_announce") != "offline":
+                        if (
+                            b.get("online", True)
+                            and b["pl_absent"] >= PL_ABSENCE_THRESHOLD
+                            and b.get("last_state_announce") != "offline"
+                        ):
                             lc = b.get("last_coords") or {}
                             lx = lc.get("x"); lz = lc.get("z")
                             try:
@@ -724,7 +730,7 @@ class BountyUpdater:
                             b["online"] = False
                             b["last_state_announce"] = "offline"
                             _save_db(doc)
-
+                
                 if not b.get("online", True):
                     continue  # offline targets are excluded from combined map
 
