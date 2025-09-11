@@ -349,7 +349,7 @@ KILL_RE_NIT = re.compile(
 
 # Connect / Disconnect — no look-behinds
 CONNECT_RE = re.compile(
-    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+Player\s+"(?P<name>[^"]+)"[^\n]*?[^A-Za-z]connected(?![A-Za-z])',
+    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+Player\s+"(?P<name>[^"]+)"[^\n]*?(?<![A-Za-z])connected(?![A-Za-z])',
     re.I,
 )
 DISCONNECT_RE = re.compile(
@@ -374,6 +374,17 @@ PL_PLAYER_RE = re.compile(
 )
 PL_FOOTER_RE = re.compile(rf'^{TS_PREFIX_OPT}\d\d:\d\d:\d\d\s+\|\s*#####\s*$', re.I)
 
+def _last_pos_for(lines: List[str], name_norm: str) -> Optional[Tuple[float, float]]:
+    """Search the tail of ADM for the most recent single-line position for a player."""
+    for ln in reversed(lines[-2000:]):
+        pm = PL_PLAYER_RE.search(ln)
+        if pm and _norm(pm.group("name")) == name_norm:
+            try:
+                return float(pm.group("x")), float(pm.group("z"))
+            except Exception:
+                pass
+    return None
+    
 def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[str]:
     """
     Read all viable ADM candidates, then pick the *best* one:
@@ -612,17 +623,44 @@ class BountyUpdater:
                             _log("inferred OFFLINE from PlayerList", gid=gid, target=tgt, pl_sig=pl_sig)
                 # ----------------------------------------------------------------------
 
-                # 2) Gated updates only when online AND present in latest PlayerList.
-                if not b.get("online", True):
-                    continue
+                # 2) First, if not present in PlayerList, try the fallback even if marked offline.
                 if not present:
                     # helpful debug the first few times
                     if pl_players and snapshot_changed:
                         _log("target not in latest playerlist",
                              gid=gid, target=tgt, pl_sig=pl_sig,
                              sample=list(pl_players.keys())[:5])
+
+                    fallback = _last_pos_for(lines, norm_tgt)
+                    if fallback:
+                        x, z = fallback
+                        b.setdefault("last_post_ts", 0)
+                        last = b.get("last_coords") or {}
+                        last_x = float(last.get("x", 0) or 0)
+                        last_z = float(last.get("z", 0) or 0)
+                        moved = (abs(last_x - x) > 0.1) or (abs(last_z - z) > 0.1)
+                        now_ts = datetime.now(timezone.utc).timestamp()
+                        should_post = moved or (now_ts - float(b.get("last_post_ts") or 0) >= FORCE_POST_EVERY_SEC)
+                        if should_post:
+                            try:
+                                await self._send_map(ch, map_key, tgt, x, z, reason)
+                                b["last_coords"] = {"x": x, "z": z}
+                                b["last_state_announce"] = "online"
+                                b["last_post_ts"] = now_ts
+                                b["online"] = True  # revive if we had inferred offline
+                                _save_db(doc)
+                                _log("fallback map posted (no PlayerList block)", gid=gid, target=tgt, moved=moved)
+                            except Exception as e:
+                                _log("fallback send failed", gid=gid, target=tgt, err=repr(e))
+                    else:
+                        if not pl_sig:
+                            _log("no PlayerList block and no single-line pos", gid=gid, target=tgt)
+                    continue  # handled the 'not present' case
+
+                # Only now gate on 'online' for PlayerList-driven posts
+                if not b.get("online", True):
                     continue
-                
+
                 # Post only if this is a new snapshot OR movement happened since last post,
                 # OR our cadence timer demands it.
                 x, z = coords
@@ -648,6 +686,7 @@ class BountyUpdater:
                         b["last_coords"] = {"x": x, "z": z}
                         b["last_state_announce"] = "online"
                         b["last_post_ts"] = now_ts
+                        b["online"] = True
                         _save_db(doc)
                         _log("playerlist-gated map posted",
                              gid=gid, target=tgt, pl_sig=pl_sig,
