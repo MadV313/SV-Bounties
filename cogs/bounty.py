@@ -335,12 +335,11 @@ def _set_online_state(guild_id: int, target: str, online: bool) -> bool:
     return changed
 
 # ----------------------------- ADM parsing -----------------------------------
-# Optional date prefix like "2025-09-10 " or "Sep 10 2025 "
 TS_PREFIX_OPT = r'(?:\d{4}-\d{2}-\d{2}\s+|[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\s+)?'
 
 # Kills (both common and Nitrado variants)
 KILL_RE = re.compile(
-    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d).*?(?P<victim>.+?) (?:was|has been)\s+killed by (?P<killer>.+?)\b',
+    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d).*?(?P<victim>.+?) was killed by (?P<killer>.+?)\b',
     re.I,
 )
 KILL_RE_NIT = re.compile(
@@ -348,9 +347,9 @@ KILL_RE_NIT = re.compile(
     re.I,
 )
 
-# Connect / Disconnect — tolerant to "is connected", "has been disconnected", etc.
+# Connect / Disconnect — no look-behinds
 CONNECT_RE = re.compile(
-    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+Player\s+"(?P<name>[^"]+)"[^\n]*?\b(?<!dis|re)connected\b',
+    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s+Player\s+"(?P<name>[^"]+)"[^\n]*?[^A-Za-z]connected(?![A-Za-z])',
     re.I,
 )
 DISCONNECT_RE = re.compile(
@@ -358,19 +357,19 @@ DISCONNECT_RE = re.compile(
     re.I,
 )
 
-# PlayerList block (tolerant spacing/casing)
+# PlayerList (tolerant)
 PL_HEADER_RE = re.compile(
     rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s*#####\s*Player\s*List\s*log[^:]*:\s*(?P<count>\d+)\s+players?',
     re.I,
 )
 PL_PLAYER_RE = re.compile(
     rf'^{TS_PREFIX_OPT}\d\d:\d\d:\d\d\s+\|\s+Player\s+"(?P<name>[^"]+)"\s*\('
-    r'(?:id=[^)]*?)?\s*'                       # optional id=..., tolerant spacing
-    r'pos\s*=\s*<\s*'                          # pos = <
-    r'(?P<x>-?\d+(?:\.\d+)?)\s*,\s*'           # x
-    r'(?P<z>-?\d+(?:\.\d+)?)\s*,\s*'           # z
-    r'[-\d.]+\s*'                              # y (ignored)
-    r'>\)',                                    # >)
+    r'(?:id=[^)]*?)?\s*'
+    r'pos\s*=\s*<\s*'
+    r'(?P<x>-?\d+(?:\.\d+)?)\s*,\s*'
+    r'(?P<z>-?\d+(?:\.\d+)?)\s*,\s*'
+    r'[-\d.]+\s*'
+    r'>\)',
     re.I,
 )
 PL_FOOTER_RE = re.compile(rf'^{TS_PREFIX_OPT}\d\d:\d\d:\d\d\s+\|\s*#####\s*$', re.I)
