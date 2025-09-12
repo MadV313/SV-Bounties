@@ -361,11 +361,14 @@ KILL_RE_NIT = re.compile(
 
 # Connect / Disconnect — tolerant to "is connected", "has been disconnected", etc.
 CONNECT_RE = re.compile(
-    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s*Player\s+"(?P<name>[^"]+)"[^\n]*?\b(?:(?:is|has)\s+)?connected\b',
+    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s*Player\s+"(?P<name>[^"]+)"[^\n]*?'
+    r'\b(?:is\s+connected|has\s+connected|has\s+been\s+connected|connected)\b',
     re.I,
 )
+
 DISCONNECT_RE = re.compile(
-    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s*Player\s+"(?P<name>[^"]+)"[^\n]*?\b(?:(?:has\s+been|is)\s+)?disconnected\b',
+    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s*Player\s+"(?P<name>[^"]+)"[^\n]*?'
+    r'\b(?:has\s+been\s+|was\s+)?disconnected\b',
     re.I,
 )
 PL_HEADER_RE = re.compile(
@@ -647,6 +650,9 @@ class BountyUpdater:
                 b.setdefault("last_state_announce", "online")
                 b.setdefault("last_post_ts", 0)
 
+                # --- PlayerList presence (tolerant key) ---
+                coords_from_pl = pl_players.get(norm_tgt) or by_key.get(_name_key(norm_tgt))
+
                 # Explicit connect/disconnect lines override presence
                 latest_state, latest_ts = _latest_status_for(lines, norm_tgt)
                 if latest_state == "connected" and b.get("last_state_announce") != "online":
@@ -656,6 +662,7 @@ class BountyUpdater:
                         pass
                     b["online"] = True
                     b["last_state_announce"] = "online"
+                    b["pl_absent"] = 0  # reset on explicit connect
                     _save_db(doc)
                     _log("explicit ONLINE from conn line", gid=gid, target=tgt, at=latest_ts)
                 if latest_state == "disconnected" and b.get("last_state_announce") != "offline":
@@ -695,10 +702,40 @@ class BountyUpdater:
                             pass
                     b["has_initial_posted"] = True
                     _save_db(doc)
+                    
+                # --- Bootstrap: if the latest explicit status is "disconnected", or the
+                #     latest PlayerList does not include the target, mark them offline now.
+                #     This covers the case where a bounty is created after the target logged off.
+                if not b.get("bootstrapped_status"):
+                    should_bootstrap_offline = (
+                        b.get("last_state_announce") != "offline"
+                        and (
+                            latest_state == "disconnected"
+                            or (pl_sig is not None and coords_from_pl is None)
+                        )
+                    )
+                    if should_bootstrap_offline:
+                        lc = b.get("last_coords") or {}
+                        lx, lz = lc.get("x"), lc.get("z")
+                        try:
+                            await _announce_offline(self.bot, gid, tgt, lx, lz)
+                        except Exception:
+                            pass
+                        b["online"] = False
+                        b["last_state_announce"] = "offline"
+                        b["pl_absent"] = PL_ABSENCE_THRESHOLD  # so future logic is in-sync
+                        _save_db(doc)
+                        _log(
+                            "bootstrap OFFLINE (no PL presence / disc seen)",
+                            gid=gid, target=tgt, latest_state=latest_state, pl_sig=pl_sig
+                        )
+                    b["bootstrapped_status"] = True
+                    _save_db(doc)  # ← persist the flag even if no offline bootstrap happened
 
-                # PlayerList presence → infer online/offline if no explicit lines
-                coords_from_pl = pl_players.get(norm_tgt) or by_key.get(_name_key(norm_tgt))
-                
+                # (Optional) helpful one-line probe after everything is defined:
+                _log("status probe", gid=gid, target=tgt, latest_state=latest_state, latest_ts=latest_ts,
+                     in_latest_pl=bool(coords_from_pl), pl_sig=pl_sig, last_pl_seen=b.get("last_pl_seen_ts"))
+                                
                 if pl_sig and b.get("last_pl_seen_ts") != pl_sig:
                     b["last_pl_seen_ts"] = pl_sig  # always bump snapshot marker
                 
