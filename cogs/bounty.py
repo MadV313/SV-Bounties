@@ -349,35 +349,45 @@ def _guild_meta(doc: dict, gid: int) -> dict:
 # ----------------------------- ADM parsing -----------------------------------
 TS_PREFIX_OPT = r'(?:\d{4}-\d{2}-\d{2}\s+|[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\s+)?'
 
+# Accept player names in "double quotes", 'single quotes', or unquoted (up to the next '|')
+PLAYER_NAME_GROUP = r'(?:["\'](?P<name>[^"\']+)["\']|(?P<name2>[^\s|][^|]*?[^\s|]))'
+
+def _mname(m: re.Match) -> str:
+    """Return the captured player name from either 'name' or 'name2'."""
+    return (m.group("name") or m.group("name2") or "").strip()
+
 # Kills (both common and Nitrado variants)
 KILL_RE = re.compile(
     rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d).*?(?P<victim>.+?) was killed by (?P<killer>.+?)\b',
     re.I,
 )
 KILL_RE_NIT = re.compile(
-    r'Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?.*?killed by Player\s+"(?P<killer>[^"]+)"',
+    r'Player\s+["\'](?P<victim>[^"\']+)["\'](?:\s*\(DEAD\))?.*?killed by Player\s+["\'](?P<killer>[^"\']+)["\']',
     re.I,
 )
 
 # Connect / Disconnect — tolerant to "is connected", "has been disconnected", etc.
+# Also tolerant to "Player Name" with quotes, single quotes, or no quotes (up to '|').
 CONNECT_RE = re.compile(
-    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s*Player\s+"(?P<name>[^"]+)"[^\n]*?'
-    r'\b(?:is\s+connected|has\s+connected|has\s+been\s+connected|connected)\b',
+    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s*Player\s+{PLAYER_NAME_GROUP}[^\n]*?\b'
+    r'(?:is\s+connected|has\s+connected|has\s+been\s+connected|connected)\b',
     re.I,
 )
 
 DISCONNECT_RE = re.compile(
-    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s*Player\s+"(?P<name>[^"]+)"[^\n]*?'
-    r'\b(?:has\s+been\s+|was\s+)?disconnected\b',
+    rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s*Player\s+{PLAYER_NAME_GROUP}[^\n]*?\b'
+    r'(?:has\s+been\s+|was\s+)?disconnected\b',
     re.I,
 )
+
 PL_HEADER_RE = re.compile(
     rf'^{TS_PREFIX_OPT}(?P<ts>\d\d:\d\d:\d\d)\s+\|\s*#####\s*Player\s*List\s*log[^:]*:\s*(?P<count>\d+)\s+players?',
     re.I,
 )
-# PlayerList entries — accept "pos" or "position"
+
+# PlayerList entries — accept "pos" or "position"; tolerate either quote style on names.
 PL_PLAYER_RE = re.compile(
-    rf'^{TS_PREFIX_OPT}\d\d:\d\d:\d\d\s+\|\s+Player\s+"(?P<name>[^"]+)"\s*\('
+    rf'^{TS_PREFIX_OPT}\d\d:\d\d:\d\d\s+\|\s+Player\s+["\'](?P<name>[^"\']+)["\']\s*\('
     r'(?:id=[^)]*?)?\s*'
     r'(?:pos|position)\s*=\s*<\s*'
     r'(?P<x>-?\d+(?:\.\d+)?)\s*,\s*'
@@ -386,6 +396,7 @@ PL_PLAYER_RE = re.compile(
     r'>\)',
     re.I,
 )
+
 PL_FOOTER_RE = re.compile(rf'^{TS_PREFIX_OPT}\d\d:\d\d:\d\d\s+\|\s*#####\s*$', re.I)
 
 def _last_pos_for(lines: List[str], name_norm: str) -> Optional[Tuple[float, float]]:
@@ -410,10 +421,10 @@ def _latest_status_for(lines: List[str], name_norm: str) -> Tuple[Optional[str],
     """
     for ln in reversed(lines[-4000:]):  # tail is enough & faster
         m = DISCONNECT_RE.search(ln)
-        if m and _norm(m.group("name")) == name_norm:
+        if m and _norm(_mname(m)) == name_norm:
             return "disconnected", (m.group("ts") or None)
         m = CONNECT_RE.search(ln)
-        if m and _norm(m.group("name")) == name_norm:
+        if m and _norm(_mname(m)) == name_norm:
             return "connected", (m.group("ts") or None)
     return None, None
 
@@ -771,32 +782,52 @@ class BountyUpdater:
                 if not b.get("online", True):
                     continue  # offline targets are excluded from combined map
 
-                # Choose best coords to show: PL → tail single-line → last_coords → tracker
+                # Choose best coords to show: PlayerList > tracker > tail-of-ADM > last_coords
                 best_xy: Optional[Tuple[float, float]] = None
+                chosen_src = "none"
+                
+                # 1) PlayerList candidate (if present in latest PL)
                 if coords_from_pl:
                     best_xy = coords_from_pl
+                    chosen_src = "playerlist"
                 else:
-                    tail_xy = _last_pos_for(lines, norm_tgt)
-                    if tail_xy:
-                        best_xy = tail_xy
+                    # 2) Latest tracker point (always try)
+                    track_xy: Optional[Tuple[float, float]] = None
+                    try:
+                        _, _track = load_track(tgt, window_hours=48, max_points=1)
+                        if _track and _track.get("points"):
+                            _pt = _track["points"][-1]
+                            track_xy = (float(_pt["x"]), float(_pt["z"]))
+                    except Exception:
+                        track_xy = None
+                
+                    if track_xy is not None:
+                        best_xy = track_xy
+                        chosen_src = "tracker"
                     else:
-                        lc = b.get("last_coords") or {}
-                        try:
-                            best_xy = (float(lc["x"]), float(lc["z"]))
-                        except Exception:
-                            best_xy = None
-                        if best_xy is None:
-                            _, track = load_track(tgt, window_hours=48, max_points=1)
-                            if track and track.get("points"):
-                                pt = track["points"][-1]
-                                try:
-                                    best_xy = (float(pt["x"]), float(pt["z"]))
-                                except Exception:
-                                    best_xy = None
-
+                        # 3) Single-line tail from ADM (PlayerList entry outside the last block)
+                        tail_xy = _last_pos_for(lines, norm_tgt)
+                        if tail_xy:
+                            best_xy = tail_xy
+                            chosen_src = "adm_tail"
+                        else:
+                            # 4) Whatever we saved previously
+                            lc = b.get("last_coords") or {}
+                            try:
+                                best_xy = (float(lc["x"]), float(lc["z"]))
+                                chosen_src = "last_coords"
+                            except Exception:
+                                best_xy = None
+                                chosen_src = "none"
+                
+                # If nothing usable, skip this target for now
                 if best_xy is None:
+                    _log("coords skip (no sources)", gid=gid, target=tgt)
                     continue
-
+                
+                # Log which source we used (helps verify recency)
+                _log("coords chosen", gid=gid, target=tgt, src=chosen_src, x=best_xy[0], z=best_xy[1])
+                
                 x, z = best_xy
                 last = b.get("last_coords") or {}
                 last_x = float(last.get("x", 0) or 0)
@@ -804,7 +835,7 @@ class BountyUpdater:
                 moved = (abs(last_x - x) > 0.1) or (abs(last_z - z) > 0.1)
                 any_moved = any_moved or moved
                 b["last_coords"] = {"x": x, "z": z}
-
+                
                 combined_points.append((tgt, x, z))
 
             # Post one combined embed if anything moved or cadence is due
@@ -955,7 +986,7 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
     for ln in lines:  # scan in file order; keep the latest clock time per player
         m = CONNECT_RE.search(ln)
         if m:
-            nm = _norm(m.group("name"))
+            nm = _norm(_mname(m))
             ts = m.group("ts")
             if ts >= last_status_ts.get(nm, "00:00:00"):
                 last_status[nm] = "connected"
@@ -964,7 +995,7 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
 
         m = DISCONNECT_RE.search(ln)
         if m:
-            nm = _norm(m.group("name"))
+            nm = _norm(_mname(m))
             ts = m.group("ts")
             if ts >= last_status_ts.get(nm, "00:00:00"):
                 last_status[nm] = "disconnected"
