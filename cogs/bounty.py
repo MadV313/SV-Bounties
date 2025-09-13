@@ -197,15 +197,31 @@ def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
 def _adm_candidate_paths_for_guild(gid: int) -> List[str]:
     st = _guild_settings(gid) or {}
     base = (st.get("external_data_base") or "").strip().rstrip("/")
-    # allow an explicit override if you ever add it to settings later
     explicit = (st.get("external_adm_path") or "").strip()
+
     candidates: List[str] = []
     if explicit:
         candidates.append(explicit)  # could be http(s)://.../latest_adm.log
     if base:
         candidates.append(f"{base}/latest_adm.log")
-    # local fallback inside this repo/container
+
+    # Local fallbacks
     candidates.append(ADM_LATEST_PATH)
+
+    # NEW: include newest rotating ADM files produced by the fetcher (e.g. DayZServer_*.ADM)
+    try:
+        data_dir = Path("data")
+        if data_dir.is_dir():
+            # take a few freshest .ADM files; updater will score/pick the best
+            local_adms = sorted(
+                data_dir.glob("*.ADM"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )[:4]
+            candidates.extend(str(p) for p in local_adms)
+    except Exception as e:
+        _log("ADM discovery failed", err=repr(e))
+
     return candidates
 
 def _load_text_from_any(path: str) -> Optional[str]:
