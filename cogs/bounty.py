@@ -15,6 +15,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from PIL import Image, ImageDraw  # Pillow
+from urllib.parse import urljoin
 
 from utils.settings import load_settings
 from utils.storageClient import load_file, save_file
@@ -89,6 +90,66 @@ def _norm(name: str) -> str:
 def _name_key(s: str) -> str:
     """Strip spaces/punct; case-insensitive key for tolerant matching."""
     return re.sub(r'[^a-z0-9]+', '', (s or '').casefold())
+
+def _normalize_data_base(base: str) -> str:
+    """
+    Ensure the base points to the /data root so we can form URLs like
+    <base>/adm_state.json and <base>/<filename>.  Accept either the root
+    or a base that already ends with /data.
+    """
+    base = (base or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if base.lower().endswith("/data"):
+        return base
+    return f"{base}/data"
+
+def _remote_discover_adm_candidates(base: str) -> List[str]:
+    """
+    Try to discover rotating ADM file(s) on a remote container:
+      1) <base>/adm_state.json  (expects { "latest_file": "Foo.ADM", ... })
+      2) Fallback: parse directory listing HTML for *.ADM anchors.
+    Returns up to a handful of absolute URLs (most recent first).
+    """
+    urls: List[str] = []
+    if not base:
+        return urls
+    data_base = _normalize_data_base(base)
+
+    # Always include the traditional latest_adm.log if present
+    urls.append(f"{data_base}/latest_adm.log")
+
+    # 1) JSON state (preferred)
+    state = _load_json_from_any(f"{data_base}/adm_state.json")
+    if isinstance(state, dict):
+        for k in ("latest_file", "active_file", "latest", "file"):
+            fn = (state.get(k) or "").strip()
+            if fn and fn.lower().endswith(".adm"):
+                urls.insert(0, f"{data_base}/{fn}")  # prefer explicit latest
+                break
+
+    # 2) Directory listing (fallback)
+    try:
+        html = _load_text_from_any(data_base + "/")
+        if html:
+            names = re.findall(r'href="([^"]+\.ADM)"', html, flags=re.I)
+            # dedupe while preserving order; take a few newest-looking entries
+            seen = set()
+            cand = []
+            for n in names:
+                full = urljoin(data_base + "/", n)
+                if full not in seen:
+                    seen.add(full)
+                    cand.append(full)
+            # Heuristic: filenames include timestamps; reverse to bias latest
+            cand = list(reversed(cand))[:6]
+            for u in cand:
+                if u not in urls:
+                    urls.append(u)
+    except Exception as e:
+        _log("remote dir parse failed", base=data_base, err=repr(e))
+
+    return urls
 
 # -------- Wallet helpers (use per-guild settings, then local fallbacks) -------
 def _wallet_candidate_paths_for_guild(gid: int) -> List[str]:
@@ -196,23 +257,24 @@ def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
 
 def _adm_candidate_paths_for_guild(gid: int) -> List[str]:
     st = _guild_settings(gid) or {}
-    base = (st.get("external_data_base") or "").strip().rstrip("/")
+    base = (st.get("external_data_base") or "").strip()
     explicit = (st.get("external_adm_path") or "").strip()
 
     candidates: List[str] = []
+
+    # Explicit single file/URL (if configured)
     if explicit:
-        candidates.append(explicit)  # could be http(s)://.../latest_adm.log
+        candidates.append(explicit)
+
+    # Remote discovery (handles rotating .ADM in another container)
     if base:
-        candidates.append(f"{base}/latest_adm.log")
+        candidates.extend(_remote_discover_adm_candidates(base))
 
-    # Local fallbacks
+    # Local fallbacks in this container
     candidates.append(ADM_LATEST_PATH)
-
-    # NEW: include newest rotating ADM files produced by the fetcher (e.g. DayZServer_*.ADM)
     try:
         data_dir = Path("data")
         if data_dir.is_dir():
-            # take a few freshest .ADM files; updater will score/pick the best
             local_adms = sorted(
                 data_dir.glob("*.ADM"),
                 key=lambda p: p.stat().st_mtime,
@@ -222,7 +284,14 @@ def _adm_candidate_paths_for_guild(gid: int) -> List[str]:
     except Exception as e:
         _log("ADM discovery failed", err=repr(e))
 
-    return candidates
+    # Dedupe while preserving order
+    deduped: List[str] = []
+    seen = set()
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            deduped.append(c)
+    return deduped
 
 def _load_text_from_any(path: str) -> Optional[str]:
     path_str = str(path or "").strip()
