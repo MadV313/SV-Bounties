@@ -36,7 +36,7 @@ ADM_LATEST_PATH = "data/latest_adm.log"
 PL_ABSENCE_THRESHOLD = 2  # ~2 snapshots ≈ a few minutes
 # Force a post at least every N seconds while target is online & present
 FORCE_POST_EVERY_SEC = 5 * 60
-# When a target doesn't move for N fresh ADM scans (and isn't in PL),
+# When a target doesn't move for N fresh PlayerList scans (and isn't in PL),
 # infer they're offline. This is a fallback for missed disconnect lines.
 STALE_MOVEMENT_SCANS = 3      # ← your “3 scans” rule
 STALE_DISTANCE_EPS  = 1.0     # meters; <=1m counts as "no movement"
@@ -119,32 +119,39 @@ def _http_post_json(url: str, obj: dict) -> bool:
         return False
 
 def _write_json_to_any(path: str, obj: dict) -> bool:
-    if path.lower().startswith(("http://", "https://")):
-        return _http_post_json(path, obj)
+    path_str = str(path)
+    if re.match(r"^https?://", path_str, flags=re.I):
+        return _http_post_json(path_str, obj)
     try:
-        return bool(save_file(path, obj))
+        return bool(save_file(path_str, obj))
     except Exception as e:
-        _log("Local write failed", path=path, err=repr(e))
+        _log("Local write failed", path=path_str, err=repr(e))
         return False
 
-def _load_json_from_any(path: str) -> Optional[dict]:
-    if path.lower().startsWith(("http://", "https://")):  # type: ignore[attr-defined]
-        # Some Python envs don't have str.startsWith monkeypatch; keep the normal one below.
-        pass
-    if path.lower().startswith(("http://", "https://")):
+def _load_json_from_any(path) -> Optional[dict]:
+    """
+    Robust loader:
+    - Accepts http(s) URLs or filesystem paths.
+    - Coerces to str early to avoid attribute errors.
+    """
+    path_str = str(path or "").strip()
+
+    # HTTP/HTTPS
+    if re.match(r"^https?://", path_str, flags=re.I):
         try:
-            req = Request(path, headers={"User-Agent": "SV-Bounties/wallet-fetch"})
+            req = Request(path_str, headers={"User-Agent": "SV-Bounties/wallet-fetch"})
             with urlopen(req, timeout=8.0) as resp:  # nosec
                 charset = resp.headers.get_content_charset() or "utf-8"
                 raw = resp.read().decode(charset, errors="replace")
             doc = json.loads(raw)
             return doc if isinstance(doc, dict) else None
         except Exception as e:
-            _log("HTTP load failed", path=path, err=repr(e))
+            _log("HTTP load failed", path=path_str, err=repr(e))
             return None
 
+    # Embedded storage layer (Railway/file)
     try:
-        data = load_file(path)
+        data = load_file(path_str)
     except Exception:
         data = None
     if isinstance(data, dict):
@@ -155,12 +162,13 @@ def _load_json_from_any(path: str) -> Optional[dict]:
         except Exception:
             return None
 
+    # Fallback to direct file read
     try:
-        p = Path(path)
+        p = Path(path_str)
         if p.is_file():
             return json.loads(p.read_text(encoding="utf-8"))
     except Exception as e:
-        _log("Local load failed", path=path, err=repr(e))
+        _log("Local load failed", path=path_str, err=repr(e))
     return None
 
 def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
@@ -177,13 +185,13 @@ def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
         if isinstance(doc, dict):
             if doc:
                 _log("Using wallet file (non-empty)", path=p)
-                return doc, p
+                return doc, str(p)
             # empty dict is acceptable; remember path so we can write back
-            empty_path = empty_path or p
+            empty_path = empty_path or str(p)
     if empty_path is not None:
         _log("Using wallet file (empty)", path=empty_path)
         return {}, empty_path
-    _log("No wallet file found", tried=", ".join(tried))
+    _log("No wallet file found", tried=", ".join(map(str, tried)))
     return None, None
 
 def _adm_candidate_paths_for_guild(gid: int) -> List[str]:
@@ -201,23 +209,24 @@ def _adm_candidate_paths_for_guild(gid: int) -> List[str]:
     return candidates
 
 def _load_text_from_any(path: str) -> Optional[str]:
+    path_str = str(path or "").strip()
     # HTTP/HTTPS
-    if path.lower().startswith(("http://", "https://")):
+    if re.match(r"^https?://", path_str, flags=re.I):
         try:
-            req = Request(path, headers={"User-Agent": "SV-Bounties/adm-fetch"})
+            req = Request(path_str, headers={"User-Agent": "SV-Bounties/adm-fetch"})
             with urlopen(req, timeout=8.0) as resp:  # nosec
                 charset = resp.headers.get_content_charset() or "utf-8"
                 return resp.read().decode(charset, errors="replace")
         except Exception as e:
-            _log("ADM HTTP fetch failed", path=path, err=repr(e))
+            _log("ADM HTTP fetch failed", path=path_str, err=repr(e))
             return None
     # Local
     try:
-        p = Path(path)
+        p = Path(path_str)
         if p.is_file():
             return p.read_text(encoding="utf-8", errors="ignore")
     except Exception as e:
-        _log("ADM local read failed", path=path, err=repr(e))
+        _log("ADM local read failed", path=path_str, err=repr(e))
     return None
 
 def _coerce_int(val) -> int:
@@ -355,8 +364,6 @@ def _guild_meta(doc: dict, gid: int) -> dict:
 
 # ----------------------------- ADM parsing -----------------------------------
 TS_PREFIX_OPT = r'(?:\d{4}-\d{2}-\d{2}\s+|[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\s+)?'
-# Used to derive a "progress" key even when a full PlayerList block isn't present
-_TIME_RE = re.compile(r'(\d{2}):(\d{2}):(\d{2})')
 
 # Accept player names in "double quotes", 'single quotes', or unquoted (up to the next '|')
 PLAYER_NAME_GROUP = r'(?:["\'](?P<name>[^"\']+)["\']|(?P<name2>[^\s|][^|]*?[^\s|]))'
@@ -419,7 +426,7 @@ def _last_pos_for(lines: List[str], name_norm: str) -> Optional[Tuple[float, flo
             try:
                 x = float(pm.group("x")); z = float(pm.group("z"))
             except Exception:
-                continue  # ← keep searching older lines instead of bailing
+                continue
             return x, z
     return None
 
@@ -428,7 +435,7 @@ def _latest_status_for(lines: List[str], name_norm: str) -> Tuple[Optional[str],
     Return ('connected'|'disconnected'|None, 'HH:MM:SS'|None) for name_norm,
     taking the most recent occurrence by scanning from the file tail.
     """
-    for ln in reversed(lines[-4000:]):  # tail is enough & faster
+    for ln in reversed(lines[-4000:]):
         m = DISCONNECT_RE.search(ln)
         if m and _norm(_mname(m)) == name_norm:
             return "disconnected", (m.group("ts") or None)
@@ -436,23 +443,6 @@ def _latest_status_for(lines: List[str], name_norm: str) -> Tuple[Optional[str],
         if m and _norm(_mname(m)) == name_norm:
             return "connected", (m.group("ts") or None)
     return None, None
-
-def _tail_progress_sig(lines: List[str]) -> Optional[str]:
-    """
-    Produce a lightweight signature that *advances whenever the ADM file advances*,
-    even if there is no complete PlayerList block.
-    """
-    if not lines:
-        return None
-    # Max HH:MM:SS in the tail + tiny hash of last 50 lines
-    hhmmss = 0
-    for ln in lines[-1000:]:
-        m = _TIME_RE.search(ln)
-        if m:
-            h, mi, s = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            hhmmss = max(hhmmss, h * 3600 + mi * 60 + s)
-    tail_hash = hashlib.blake2b("\n".join(lines[-50:]).encode("utf-8", "ignore"), digest_size=4).hexdigest()
-    return f"{hhmmss}|{tail_hash}"
 
 def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[str]:
     """
@@ -467,11 +457,12 @@ def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[s
     best_lines: List[str] = []
     best_score: int = -1
     chosen_path: Optional[str] = None
+    TIME_RE = re.compile(r'(\d{2}):(\d{2}):(\d{2})')
 
     def _clock_score(ls: List[str]) -> int:
         hhmmss = 0
         for ln in ls[-2000:]:
-            m = _TIME_RE.search(ln)
+            m = TIME_RE.search(ln)
             if m:
                 h, mi, s = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
                 hhmmss = max(hhmmss, h * 3600 + mi * 60 + s)
@@ -496,7 +487,7 @@ def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[s
         if score > best_score:
             best_score = score
             best_lines = lines
-            chosen_path = p
+            chosen_path = str(p)
 
     if chosen_path:
         _log("adm_source_chosen", path=chosen_path, lines=len(best_lines), score=best_score)
@@ -507,34 +498,44 @@ def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[s
 def _latest_playerlist(lines: List[str]) -> Tuple[Optional[str], Dict[str, Tuple[float, float]]]:
     """
     Parse the most recent PlayerList block.
-    Returns (pl_sig, {normalized_name: (x,z)}), where pl_sig is a stable content signature
-    that changes whenever the PlayerList block's contents change.
+    Returns (pl_sig, {normalized_name: (x,z)}).
+
+    IMPORTANT: Nitrado sometimes omits a clear trailing footer. To be robust:
+    - Find the *last* header line.
+    - Collect entries until the next header OR an explicit footer OR EOF
+      (whichever comes first).
     """
-    pl_sig: Optional[str] = None
-    players: Dict[str, Tuple[float, float]] = {}
-    i = len(lines) - 1
-    while i >= 0:
-        mhead = PL_HEADER_RE.search(lines[i])
-        if mhead:
-            block_lines = [lines[i]]
-            j = i + 1
-            tmp_players: Dict[str, Tuple[float, float]] = {}
-            while j < len(lines) and not PL_FOOTER_RE.search(lines[j]):
-                block_lines.append(lines[j])
-                pm = PL_PLAYER_RE.search(lines[j])
-                if pm:
-                    nm = _norm(pm.group("name"))
-                    try:
-                        x = float(pm.group("x")); z = float(pm.group("z"))
-                        tmp_players[nm] = (x, z)
-                    except Exception:
-                        pass
-                j += 1
-            h = hashlib.blake2b("\n".join(block_lines).encode("utf-8", "ignore"), digest_size=6).hexdigest()
-            pl_sig = f"{i}|{len(tmp_players)}|{h}"
-            players = tmp_players
+    if not lines:
+        return None, {}
+
+    # Find the last header
+    last_head_idx = None
+    for i in range(len(lines) - 1, -1, -1):
+        if PL_HEADER_RE.search(lines[i]):
+            last_head_idx = i
             break
-        i -= 1
+    if last_head_idx is None:
+        return None, {}
+
+    block_lines = [lines[last_head_idx]]
+    players: Dict[str, Tuple[float, float]] = {}
+    j = last_head_idx + 1
+    while j < len(lines):
+        if PL_HEADER_RE.search(lines[j]) or PL_FOOTER_RE.search(lines[j]):
+            break
+        pm = PL_PLAYER_RE.search(lines[j])
+        if pm:
+            nm = _norm(pm.group("name"))
+            try:
+                x = float(pm.group("x")); z = float(pm.group("z"))
+                players[nm] = (x, z)
+            except Exception:
+                pass
+        block_lines.append(lines[j])
+        j += 1
+
+    h = hashlib.blake2b("\n".join(block_lines).encode("utf-8", "ignore"), digest_size=6).hexdigest()
+    pl_sig = f"{last_head_idx}|{len(players)}|{h}"
     return pl_sig, players
 
 # ----------------------- Renderer with PlayerList gating ----------------------
@@ -652,12 +653,8 @@ class BountyUpdater:
 
             # Read latest ADM once per tick
             lines = _read_adm_lines(gid_hint=gid)
-            if not lines:
-                return
-
             pl_sig, pl_players = _latest_playerlist(lines)
-            tick_sig = _tail_progress_sig(lines)  # ← NEW: advances if the ADM advances at all
-            _log("playerlist parsed", gid=gid, pl_sig=pl_sig, count=len(pl_players), tick_sig=tick_sig)
+            _log("playerlist parsed", gid=gid, pl_sig=pl_sig, count=len(pl_players))
 
             by_key = { _name_key(nm): xy for nm, xy in pl_players.items() } if pl_players else {}
 
@@ -676,7 +673,6 @@ class BountyUpdater:
                 # Ensure fields exist for stable logic
                 b.setdefault("pl_absent", 0)
                 b.setdefault("last_pl_seen_ts", None)
-                b.setdefault("last_tick_sig", None)      # ← NEW
                 b.setdefault("online", True)
                 b.setdefault("last_state_announce", "online")
                 b.setdefault("last_post_ts", 0)
@@ -687,8 +683,6 @@ class BountyUpdater:
 
                 # Explicit connect/disconnect override
                 latest_state, latest_ts = _latest_status_for(lines, norm_tgt)
-                _log("latest_state_probe", gid=gid, target=tgt, state=latest_state, at=latest_ts)
-
                 if latest_state == "connected" and b.get("last_state_announce") != "online":
                     try: await _announce_online(self.bot, gid, tgt)
                     except Exception: pass
@@ -750,18 +744,6 @@ class BountyUpdater:
                     else:
                         b["pl_absent"] = int(b.get("pl_absent", 0)) + 1
                         _log("PL absence tick", gid=gid, target=tgt, misses=b["pl_absent"])
-                        if (
-                            b.get("online", True)
-                            and b["pl_absent"] >= PL_ABSENCE_THRESHOLD
-                            and b.get("last_state_announce") != "offline"
-                        ):
-                            lc = b.get("last_coords") or {}
-                            lx = lc.get("x"); lz = lc.get("z")
-                            try: await _announce_offline(self.bot, gid, tgt, lx, lz)
-                            except Exception: pass
-                            b["online"] = False
-                            b["last_state_announce"] = "offline"
-                            _save_db(doc)
 
                 # ---- Choose best coords: PlayerList > tracker > ADM tail > last_coords
                 best_xy: Optional[Tuple[float, float]] = None
@@ -803,24 +785,12 @@ class BountyUpdater:
                 last_z = float(last.get("z", 0) or 0)
                 moved = (abs(last_x - best_xy[0]) > STALE_DISTANCE_EPS) or (abs(last_z - best_xy[1]) > STALE_DISTANCE_EPS)
 
-                # NEW: generic ADM progress key for stale detection, even without PlayerList
-                tick_advanced = bool(tick_sig and b.get("last_tick_sig") != tick_sig)
-                if tick_advanced:
-                    b["last_tick_sig"] = tick_sig
-
-                # Stale/offline heuristic:
-                # count only when:
-                #  - ADM advanced (tick_advanced) AND no new PL block, OR
-                #  - PL advanced but target is not in PL (your original path)
-                stale_gate = (pl_advanced and not coords_from_pl) or ((not pl_sig) and tick_advanced and not coords_from_pl)
-                if stale_gate:
+                # Stale/offline heuristic: only counts when the PL advanced and the player is NOT in PL
+                if pl_advanced and not coords_from_pl:
                     if not moved:
                         b["stale_scans"] = int(b.get("stale_scans", 0)) + 1
-                        _log("stale_scan++", gid=gid, target=tgt, stale_scans=b["stale_scans"],
-                             pl_advanced=pl_advanced, tick_advanced=tick_advanced, src=chosen_src)
                     else:
                         b["stale_scans"] = 0
-                        _log("stale_reset_moved", gid=gid, target=tgt)
 
                     if (
                         b.get("online", True)
@@ -833,8 +803,7 @@ class BountyUpdater:
                         b["online"] = False
                         b["last_state_announce"] = "offline"
                         _save_db(doc)
-                        _log("OFFLINE (stale movement heuristic)", gid=gid, target=tgt,
-                             scans=b["stale_scans"], src=chosen_src, pl_sig_bool=bool(pl_sig))
+                        _log("OFFLINE (stale movement heuristic)", gid=gid, target=tgt, scans=b["stale_scans"], src=chosen_src)
 
                 # If they appeared in PL, clear stale counter
                 if coords_from_pl:
@@ -846,9 +815,33 @@ class BountyUpdater:
                 # Update last coords *after* stale logic
                 b["last_coords"] = {"x": float(best_xy[0]), "z": float(best_xy[1])}
 
-                # Skip adding to combined map if we’ve just marked them offline
-                if not b.get("online", True):
+                # --- Bootstrap: If explicit 'disconnected' or (latest PL exists & target not in it),
+                #     mark offline *before* adding to combined map so we don't draw them.
+                if not b.get("bootstrapped_status"):
+                    should_bootstrap_offline = (
+                        b.get("last_state_announce") != "offline"
+                        and (
+                            latest_state == "disconnected"
+                            or (pl_sig is not None and coords_from_pl is None)
+                        )
+                    )
+                    if should_bootstrap_offline:
+                        lc = b.get("last_coords") or {}
+                        lx, lz = lc.get("x"), lc.get("z")
+                        try:
+                            await _announce_offline(self.bot, gid, tgt, lx, lz)
+                        except Exception:
+                            pass
+                        b["online"] = False
+                        b["last_state_announce"] = "offline"
+                        b["pl_absent"] = max(b.get("pl_absent", 0), PL_ABSENCE_THRESHOLD)
+                        _save_db(doc)
+                        _log("bootstrap OFFLINE (disc seen or not in latest PL)", gid=gid, target=tgt, latest_state=latest_state, pl_sig=pl_sig)
+                    b["bootstrapped_status"] = True
                     _save_db(doc)
+
+                # Skip adding to combined map if we’ve just marked them offline (or already offline)
+                if not b.get("online", True):
                     continue
 
                 any_moved = any_moved or moved
@@ -1046,7 +1039,6 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
             except Exception:
                 pass
             b["last_state_announce"] = "online"
-            # reset PL absence if we got an explicit connect
             b["pl_absent"] = 0
             changed = True
 
@@ -1216,16 +1208,15 @@ class BountyCog(commands.Cog):
             "reason": (reason or "").strip() or None,
             "message": None,
             # Tracking fields for gating + announcements
-            "online": True,                  # default true until watcher/updater flips
-            "has_initial_posted": False,     # first seed image regardless of PlayerList
-            "last_pl_ts": None,              # last PlayerList timestamp we posted for
-            "last_state_announce": "online", # dedupe “online/offline” notices
-            "last_coords": None,             # {"x": float, "z": float}
-            "pl_absent": 0,                  # consecutive PlayerList misses
+            "online": True,
+            "has_initial_posted": False,
+            "last_pl_ts": None,
+            "last_state_announce": "online",
+            "last_coords": None,
+            "pl_absent": 0,
             "last_pl_seen_ts": None,
-            "last_post_ts": 0,               # cadence guard
+            "last_post_ts": 0,
             "stale_scans": 0,
-            "last_tick_sig": None,           # ← NEW: ADM progress signature
         }
         bdoc = _db()
         for b in bdoc["open"]:
