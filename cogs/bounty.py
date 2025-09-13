@@ -36,6 +36,10 @@ ADM_LATEST_PATH = "data/latest_adm.log"
 PL_ABSENCE_THRESHOLD = 2  # ~2 snapshots ≈ a few minutes
 # Force a post at least every N seconds while target is online & present
 FORCE_POST_EVERY_SEC = 5 * 60
+# When a target doesn't move for N fresh PlayerList scans (and isn't in PL),
+# infer they're offline. This is a fallback for missed disconnect lines.
+STALE_MOVEMENT_SCANS = 3      # ← your “3 scans” rule
+STALE_DISTANCE_EPS  = 1.0     # meters; <=1m counts as "no movement"
 
 # ----------------------------- Helper dataclasses ----------------------------
 @dataclass
@@ -660,6 +664,7 @@ class BountyUpdater:
                 b.setdefault("online", True)
                 b.setdefault("last_state_announce", "online")
                 b.setdefault("last_post_ts", 0)
+                b.setdefault("stale_scans", 0)
 
                 # --- PlayerList presence (tolerant key) ---
                 coords_from_pl = pl_players.get(norm_tgt) or by_key.get(_name_key(norm_tgt))
@@ -674,8 +679,10 @@ class BountyUpdater:
                     b["online"] = True
                     b["last_state_announce"] = "online"
                     b["pl_absent"] = 0  # reset on explicit connect
+                    b["stale_scans"] = 0
                     _save_db(doc)
                     _log("explicit ONLINE from conn line", gid=gid, target=tgt, at=latest_ts)
+
                 if latest_state == "disconnected" and b.get("last_state_announce") != "offline":
                     lx = lz = None
                     lc = b.get("last_coords") or {}
@@ -713,10 +720,8 @@ class BountyUpdater:
                             pass
                     b["has_initial_posted"] = True
                     _save_db(doc)
-                    
-                # --- Bootstrap: if the latest explicit status is "disconnected", or the
-                #     latest PlayerList does not include the target, mark them offline now.
-                #     This covers the case where a bounty is created after the target logged off.
+
+                # --- Bootstrap status (moved earlier)
                 if not b.get("bootstrapped_status"):
                     should_bootstrap_offline = (
                         b.get("last_state_announce") != "offline"
@@ -727,7 +732,7 @@ class BountyUpdater:
                     )
                     if should_bootstrap_offline:
                         lc = b.get("last_coords") or {}
-                        lx, lz = lc.get("x"), lc.get("z")
+                        lx = lc.get("x"); lz = lc.get("z")
                         try:
                             await _announce_offline(self.bot, gid, tgt, lx, lz)
                         except Exception:
@@ -741,17 +746,15 @@ class BountyUpdater:
                             gid=gid, target=tgt, latest_state=latest_state, pl_sig=pl_sig
                         )
                     b["bootstrapped_status"] = True
-                    _save_db(doc)  # ← persist the flag even if no offline bootstrap happened
+                    _save_db(doc)
 
-                # (Optional) helpful one-line probe after everything is defined:
-                _log("status probe", gid=gid, target=tgt, latest_state=latest_state, latest_ts=latest_ts,
-                     in_latest_pl=bool(coords_from_pl), pl_sig=pl_sig, last_pl_seen=b.get("last_pl_seen_ts"))
-                                
-                if pl_sig and b.get("last_pl_seen_ts") != pl_sig:
-                    b["last_pl_seen_ts"] = pl_sig  # always bump snapshot marker
-                
+                # Did the PlayerList advance this tick?
+                pl_advanced = bool(pl_sig and b.get("last_pl_seen_ts") != pl_sig)
+                if pl_advanced:
+                    b["last_pl_seen_ts"] = pl_sig
                     if coords_from_pl:
                         b["pl_absent"] = 0
+                        b["stale_scans"] = 0
                         if not b.get("online", True):
                             try:
                                 await _announce_online(self.bot, gid, tgt)
@@ -778,21 +781,15 @@ class BountyUpdater:
                             b["online"] = False
                             b["last_state_announce"] = "offline"
                             _save_db(doc)
-                
-                if not b.get("online", True):
-                    continue  # offline targets are excluded from combined map
 
-                # Choose best coords to show: PlayerList > tracker > tail-of-ADM > last_coords
+                # ---- Choose best coords: PlayerList > tracker > ADM tail > last_coords
                 best_xy: Optional[Tuple[float, float]] = None
                 chosen_src = "none"
-                
-                # 1) PlayerList candidate (if present in latest PL)
+
                 if coords_from_pl:
-                    best_xy = coords_from_pl
-                    chosen_src = "playerlist"
+                    best_xy = coords_from_pl; chosen_src = "playerlist"
                 else:
-                    # 2) Latest tracker point (always try)
-                    track_xy: Optional[Tuple[float, float]] = None
+                    track_xy = None
                     try:
                         _, _track = load_track(tgt, window_hours=48, max_points=1)
                         if _track and _track.get("points"):
@@ -800,43 +797,70 @@ class BountyUpdater:
                             track_xy = (float(_pt["x"]), float(_pt["z"]))
                     except Exception:
                         track_xy = None
-                
+
                     if track_xy is not None:
-                        best_xy = track_xy
-                        chosen_src = "tracker"
+                        best_xy = track_xy; chosen_src = "tracker"
                     else:
-                        # 3) Single-line tail from ADM (PlayerList entry outside the last block)
                         tail_xy = _last_pos_for(lines, norm_tgt)
                         if tail_xy:
-                            best_xy = tail_xy
-                            chosen_src = "adm_tail"
+                            best_xy = tail_xy; chosen_src = "adm_tail"
                         else:
-                            # 4) Whatever we saved previously
                             lc = b.get("last_coords") or {}
                             try:
                                 best_xy = (float(lc["x"]), float(lc["z"]))
                                 chosen_src = "last_coords"
                             except Exception:
-                                best_xy = None
-                                chosen_src = "none"
-                
-                # If nothing usable, skip this target for now
+                                best_xy = None; chosen_src = "none"
+
                 if best_xy is None:
                     _log("coords skip (no sources)", gid=gid, target=tgt)
                     continue
-                
-                # Log which source we used (helps verify recency)
-                _log("coords chosen", gid=gid, target=tgt, src=chosen_src, x=best_xy[0], z=best_xy[1])
-                
-                x, z = best_xy
+
+                # Movement check vs previous saved coords
                 last = b.get("last_coords") or {}
                 last_x = float(last.get("x", 0) or 0)
                 last_z = float(last.get("z", 0) or 0)
-                moved = (abs(last_x - x) > 0.1) or (abs(last_z - z) > 0.1)
+                moved = (abs(last_x - best_xy[0]) > STALE_DISTANCE_EPS) or (abs(last_z - best_xy[1]) > STALE_DISTANCE_EPS)
+
+                # Stale/offline heuristic: counts only when PL advanced and player NOT in PL
+                if pl_advanced and not coords_from_pl:
+                    if not moved:
+                        b["stale_scans"] = int(b.get("stale_scans", 0)) + 1
+                    else:
+                        b["stale_scans"] = 0
+
+                    if (
+                        b.get("online", True)
+                        and b["stale_scans"] >= STALE_MOVEMENT_SCANS
+                        and b.get("last_state_announce") != "offline"
+                    ):
+                        lx, lz = best_xy
+                        try:
+                            await _announce_offline(self.bot, gid, tgt, lx, lz)
+                        except Exception:
+                            pass
+                        b["online"] = False
+                        b["last_state_announce"] = "offline"
+                        _save_db(doc)
+                        _log("OFFLINE (stale movement heuristic)", gid=gid, target=tgt, scans=b["stale_scans"], src=chosen_src)
+
+                # If they appeared in PL, clear stale counter
+                if coords_from_pl:
+                    b["stale_scans"] = 0
+
+                _log("coords chosen", gid=gid, target=tgt, src=chosen_src, x=best_xy[0], z=best_xy[1], moved=moved,
+                     stale_scans=b.get("stale_scans", 0), in_pl=bool(coords_from_pl), pl_advanced=pl_advanced)
+
+                # Update last coords *after* stale logic
+                b["last_coords"] = {"x": float(best_xy[0]), "z": float(best_xy[1])}
+
+                # Exclude offline targets from combined map
+                if not b.get("online", True):
+                    continue
+
+                # For posting cadence, a smaller epsilon keeps the map lively
                 any_moved = any_moved or moved
-                b["last_coords"] = {"x": x, "z": z}
-                
-                combined_points.append((tgt, x, z))
+                combined_points.append((tgt, best_xy[0], best_xy[1]))
 
             # Post one combined embed if anything moved or cadence is due
             if not combined_points:
@@ -1208,6 +1232,7 @@ class BountyCog(commands.Cog):
             "pl_absent": 0,                  # consecutive PlayerList misses
             "last_pl_seen_ts": None,
             "last_post_ts": 0,               # cadence guard
+            "stale_scans": 0,
         }
         bdoc = _db()
         for b in bdoc["open"]:
