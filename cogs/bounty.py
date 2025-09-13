@@ -654,7 +654,19 @@ class BountyUpdater:
             # Read latest ADM once per tick
             lines = _read_adm_lines(gid_hint=gid)
             pl_sig, pl_players = _latest_playerlist(lines)
-            _log("playerlist parsed", gid=gid, pl_sig=pl_sig, count=len(pl_players))
+            
+            # NEW: also compute an ADM signature so “stale scans” progress even when
+            # Nitrado doesn’t emit a new PlayerList header but the log is advancing.
+            adm_sig = hashlib.blake2b("\n".join(lines[-2000:]).encode("utf-8","ignore"),
+                                      digest_size=8).hexdigest() if lines else None
+            # persist per-guild to avoid bouncing between targets
+            meta = doc.setdefault("meta", {})
+            gmeta = meta.setdefault(str(gid), {})
+            adm_advanced = bool(adm_sig and gmeta.get("last_adm_sig") != adm_sig)
+            if adm_advanced:
+                gmeta["last_adm_sig"] = adm_sig
+                _save_db(doc)
+                _log("adm_advanced", gid=gid, pl_sig=pl_sig, pl_count=len(pl_players))
 
             by_key = { _name_key(nm): xy for nm, xy in pl_players.items() } if pl_players else {}
 
@@ -741,9 +753,11 @@ class BountyUpdater:
                             b["last_state_announce"] = "online"
                             _save_db(doc)
                             _log("inferred ONLINE from PlayerList", gid=gid, target=tgt)
-                    else:
-                        b["pl_absent"] = int(b.get("pl_absent", 0)) + 1
-                        _log("PL absence tick", gid=gid, target=tgt, misses=b["pl_absent"])
+                
+                # Count absence when either the PlayerList OR the ADM advanced (even if PL didn't)
+                if (pl_advanced or adm_advanced) and not coords_from_pl:
+                    b["pl_absent"] = int(b.get("pl_absent", 0)) + 1
+                    _log("PL absence tick", gid=gid, target=tgt, misses=b["pl_absent"])
 
                 # ---- Choose best coords: PlayerList > tracker > ADM tail > last_coords
                 best_xy: Optional[Tuple[float, float]] = None
@@ -785,8 +799,11 @@ class BountyUpdater:
                 last_z = float(last.get("z", 0) or 0)
                 moved = (abs(last_x - best_xy[0]) > STALE_DISTANCE_EPS) or (abs(last_z - best_xy[1]) > STALE_DISTANCE_EPS)
 
-                # Stale/offline heuristic: only counts when the PL advanced and the player is NOT in PL
-                if pl_advanced and not coords_from_pl:
+                # Stale/offline heuristic:
+                # previously this only counted when *PlayerList* advanced, which fails when the
+                # ADM grows without a fresh PL header (common on Nitrado).  Now we also advance
+                # the stale counter when the overall ADM advanced.
+                if (pl_advanced or adm_advanced) and not coords_from_pl:
                     if not moved:
                         b["stale_scans"] = int(b.get("stale_scans", 0)) + 1
                     else:
@@ -810,7 +827,7 @@ class BountyUpdater:
                     b["stale_scans"] = 0
 
                 _log("coords chosen", gid=gid, target=tgt, src=chosen_src, x=best_xy[0], z=best_xy[1], moved=moved,
-                     stale_scans=b.get("stale_scans", 0), in_pl=bool(coords_from_pl), pl_advanced=pl_advanced)
+                    stale_scans=b.get("stale_scans", 0), in_pl=bool(coords_from_pl), pl_advanced=pl_advanced, adm_advanced=adm_advanced)
 
                 # Update last coords *after* stale logic
                 b["last_coords"] = {"x": float(best_xy[0]), "z": float(best_xy[1])}
