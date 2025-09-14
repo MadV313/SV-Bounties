@@ -15,7 +15,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from PIL import Image, ImageDraw  # Pillow
-from urllib.parse import urljoin
 
 from utils.settings import load_settings
 from utils.storageClient import load_file, save_file
@@ -37,9 +36,8 @@ ADM_LATEST_PATH = "data/latest_adm.log"
 PL_ABSENCE_THRESHOLD = 2  # ~2 snapshots ≈ a few minutes
 # Force a post at least every N seconds while target is online & present
 FORCE_POST_EVERY_SEC = 5 * 60
-# When a target doesn't move for N fresh PlayerList scans (and isn't in PL),
-# infer they're offline. This is a fallback for missed disconnect lines.
-STALE_MOVEMENT_SCANS = 3      # ← your “3 scans” rule
+# Strict rule: when a target is not in PL for N **bot scans**, mark offline.
+STALE_MOVEMENT_SCANS = 3
 STALE_DISTANCE_EPS  = 1.0     # meters; <=1m counts as "no movement"
 
 # ----------------------------- Helper dataclasses ----------------------------
@@ -91,97 +89,6 @@ def _name_key(s: str) -> str:
     """Strip spaces/punct; case-insensitive key for tolerant matching."""
     return re.sub(r'[^a-z0-9]+', '', (s or '').casefold())
 
-def _normalize_base(base: str) -> str:
-    # Trust the config. If your files live at /, set the base to that root.
-    # If they live under /data, set the base to ".../data".
-    return (base or "").strip().rstrip("/")
-
-def _remote_discover_adm_candidates(base: str) -> List[str]:
-    """
-    Try to discover rotating ADM files in another container:
-      1) <base>/adm_state.json   ({"latest_url": "..."} or {"latest_file": "Foo.ADM"})
-      2) <base>/latest_adm.log   (classic alias if maintained)
-         <base>/latest.adm.log   (alt alias some stacks use)
-      3) Parse directory listing for *.ADM (if the host exposes one)
-    Returns absolute URLs (most recent first when we can infer).
-    """
-    urls: List[str] = []
-    if not base:
-        return urls
-    base = _normalize_base(base)
-
-    # 1) State JSON (preferred)
-    state = _load_json_from_any(f"{base}/adm_state.json")
-    if isinstance(state, dict):
-        latest_url = (state.get("latest_url") or "").strip()
-        latest_file = (state.get("latest_file") or "").strip()
-        if latest_url:
-            urls.append(latest_url)
-        elif latest_file:
-            urls.append(f"{base}/{latest_file}")
-
-    # 2) Classic/alt aliases
-    urls.append(f"{base}/latest_adm.log")
-    urls.append(f"{base}/latest.adm.log")
-
-    # 3) Directory listing fallback
-    try:
-        html = _load_text_from_any(base + "/")
-        if html:
-            names = re.findall(r'href="([^"]+\.ADM)"', html, flags=re.I)
-            seen = set()
-            cand = []
-            for n in names:
-                full = urljoin(base + "/", n)
-                if full not in seen:
-                    seen.add(full); cand.append(full)
-            # Filenames usually include timestamps; reverse tends to bias newest
-            for u in list(reversed(cand))[:6]:
-                if u not in urls:
-                    urls.append(u)
-    except Exception as e:
-        _log("remote dir parse failed", base=base, err=repr(e))
-
-    return urls
-
-def _local_discover_adm_candidates() -> List[str]:
-    """
-    Discover ADM files downloaded by the fetcher in *this* container.
-    Prefer data/adm_state.json if present; otherwise glob *.ADM newest first.
-    """
-    out: List[str] = []
-    # Prefer a local state file the fetcher writes
-    try:
-        st = _load_json_from_any("data/adm_state.json")
-        if isinstance(st, dict):
-            for k in ("latest_file", "active_file", "latest", "file"):
-                fn = (st.get(k) or "").strip()
-                if fn and fn.lower().endswith(".adm"):
-                    p = Path("data") / fn
-                    if p.is_file():
-                        out.append(str(p))
-                        break
-    except Exception:
-        pass
-
-    # Add newest *.ADM as fallback
-    try:
-        d = Path("data")
-        if d.is_dir():
-            adms = sorted(d.glob("*.ADM"), key=lambda p: p.stat().st_mtime, reverse=True)[:6]
-            out.extend(str(p) for p in adms)
-    except Exception as e:
-        _log("ADM local discovery failed", err=repr(e))
-
-    # Always include the historical alias last
-    out.append(ADM_LATEST_PATH)
-    # Dedup
-    seen = set(); dedup = []
-    for c in out:
-        if c and c not in seen:
-            seen.add(c); dedup.append(c)
-    return dedup
-
 # -------- Wallet helpers (use per-guild settings, then local fallbacks) -------
 def _wallet_candidate_paths_for_guild(gid: int) -> List[str]:
     st = _guild_settings(gid) or {}
@@ -222,9 +129,7 @@ def _write_json_to_any(path: str, obj: dict) -> bool:
 
 def _load_json_from_any(path) -> Optional[dict]:
     """
-    Robust loader:
-    - Accepts http(s) URLs or filesystem paths.
-    - Coerces to str early to avoid attribute errors.
+    Robust loader: accepts http(s) URLs or filesystem paths. Coerces to str.
     """
     path_str = str(path or "").strip()
 
@@ -264,11 +169,6 @@ def _load_json_from_any(path) -> Optional[dict]:
     return None
 
 def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
-    """
-    Try the configured external wallet path, then base/wallet.json, then local fallbacks.
-    Returns (wallet_doc, source_path-or-url). If nothing is readable, (None, None).
-    If the file exists but is empty, returns ({}, path).
-    """
     empty_path: Optional[str] = None
     tried: List[str] = []
     for p in _wallet_candidate_paths_for_guild(gid):
@@ -278,7 +178,6 @@ def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
             if doc:
                 _log("Using wallet file (non-empty)", path=p)
                 return doc, str(p)
-            # empty dict is acceptable; remember path so we can write back
             empty_path = empty_path or str(p)
     if empty_path is not None:
         _log("Using wallet file (empty)", path=empty_path)
@@ -288,57 +187,18 @@ def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
 
 def _adm_candidate_paths_for_guild(gid: int) -> List[str]:
     st = _guild_settings(gid) or {}
-    base = (st.get("external_data_base") or "").strip()
+    base = (st.get("external_data_base") or "").strip().rstrip("/")
     explicit = (st.get("external_adm_path") or "").strip()
-
-    prefer_external = bool(
-        st.get("prefer_external")
-        or st.get("prefer_externals")
-        or st.get("prefer_external_data")
-    )
-    disable_local = bool(
-        st.get("disable_local")
-        or st.get("disable_local_adm")
-        or st.get("disable_local_files")
-    )
-
-    # Build lists
-    remote: List[str] = []
-    local: List[str] = []
-
-    # 1) Explicit override (single URL/path)
+    candidates: List[str] = []
     if explicit:
-        remote.append(explicit)
-
-    # 2) Remote discovery (handles rotating files in another container)
+        candidates.append(explicit)  # http(s) allowed
     if base:
-        remote.extend(_remote_discover_adm_candidates(base))
-
-    # 3) Local discovery (handles rotating files pulled by the fetcher here)
-    if not disable_local:
-        local.extend(_local_discover_adm_candidates())
-    else:
-        _log("local ADM disabled via settings", gid=gid)
-
-    # Compose based on preference
-    candidates: List[str] = (remote + local) if prefer_external else (remote + local if remote else local)
-
-    # If nothing at all, still fall back to the legacy local alias once
-    if not candidates and not disable_local:
-        candidates = [ADM_LATEST_PATH]
-
-    # Deduplicate while preserving order
-    deduped: List[str] = []
-    seen = set()
-    for c in candidates:
-        if c and c not in seen:
-            seen.add(c); deduped.append(c)
-    _log("adm_candidate_build", gid=gid, prefer_external=prefer_external, disable_local=disable_local, candidates=deduped)
-    return deduped
+        candidates.append(f"{base}/latest_adm.log")
+    candidates.append(ADM_LATEST_PATH)
+    return candidates
 
 def _load_text_from_any(path: str) -> Optional[str]:
     path_str = str(path or "").strip()
-    # HTTP/HTTPS
     if re.match(r"^https?://", path_str, flags=re.I):
         try:
             req = Request(path_str, headers={"User-Agent": "SV-Bounties/adm-fetch"})
@@ -348,7 +208,6 @@ def _load_text_from_any(path: str) -> Optional[str]:
         except Exception as e:
             _log("ADM HTTP fetch failed", path=path_str, err=repr(e))
             return None
-    # Local
     try:
         p = Path(path_str)
         if p.is_file():
@@ -367,12 +226,6 @@ def _coerce_int(val) -> int:
             return 0
 
 def _get_user_balance(gid: int, discord_id: str) -> Tuple[int, Optional[dict], Optional[str]]:
-    """
-    Support wallet schemas:
-      A) {"<id>": {"sv_tickets": 5, ...}}
-      B) {"<id>": 5}
-      C) {"<id>": "5"}
-    """
     wallets, path = _load_wallet_doc_and_path(gid)
     if wallets is None:
         return 0, None, None
@@ -398,7 +251,6 @@ def _adjust_tickets(gid: int, discord_id: str, delta: int) -> Tuple[bool, int]:
         return False, cur
 
     new_bal = cur + delta
-    # Preserve schema on writeback
     if isinstance(wallets[discord_id], dict):
         wallets[discord_id]["sv_tickets"] = new_bal
     else:
@@ -469,18 +321,6 @@ def _db() -> dict:
 
 def _save_db(doc: dict):
     save_file(BOUNTIES_DB, doc)
-
-def _set_online_state(guild_id: int, target: str, online: bool) -> bool:
-    doc = _db()
-    changed = False
-    for b in doc["open"]:
-        if int(b.get("guild_id", 0)) == guild_id and _norm(b.get("target_gamertag", "")) == _norm(target):
-            if b.get("online", True) != online:
-                b["online"] = online
-                changed = True
-    if changed:
-        _save_db(doc)
-    return changed
 
 def _guild_meta(doc: dict, gid: int) -> dict:
     """
@@ -554,7 +394,7 @@ def _last_pos_for(lines: List[str], name_norm: str) -> Optional[Tuple[float, flo
             try:
                 x = float(pm.group("x")); z = float(pm.group("z"))
             except Exception:
-                continue
+                continue  # ← keep searching older lines instead of bailing
             return x, z
     return None
 
@@ -563,7 +403,7 @@ def _latest_status_for(lines: List[str], name_norm: str) -> Tuple[Optional[str],
     Return ('connected'|'disconnected'|None, 'HH:MM:SS'|None) for name_norm,
     taking the most recent occurrence by scanning from the file tail.
     """
-    for ln in reversed(lines[-4000:]):
+    for ln in reversed(lines[-4000:]):  # tail is enough & faster
         m = DISCONNECT_RE.search(ln)
         if m and _norm(_mname(m)) == name_norm:
             return "disconnected", (m.group("ts") or None)
@@ -588,6 +428,7 @@ def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[s
     TIME_RE = re.compile(r'(\d{2}):(\d{2}):(\d{2})')
 
     def _clock_score(ls: List[str]) -> int:
+        # Extract the max HH:MM:SS seen anywhere to approximate "freshness"
         hhmmss = 0
         for ln in ls[-2000:]:
             m = TIME_RE.search(ln)
@@ -599,22 +440,18 @@ def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[s
     for p in paths:
         txt = _load_text_from_any(p)
         if not txt:
-            _log("adm_skip: unreadable", path=p)
             continue
-    
+        # Strip trailing empties and ignore trivial placeholders
         lines = [l for l in txt.splitlines() if l.strip()]
         if not lines:
-            _log("adm_skip: empty", path=p)
             continue
-    
-        tail = lines[-2:] if len(lines) >= 2 else lines
         has_signal = any(
             PL_HEADER_RE.search(l) or CONNECT_RE.search(l) or DISCONNECT_RE.search(l) or
             KILL_RE.search(l) or KILL_RE_NIT.search(l)
             for l in lines[-500:]
         )
         if not has_signal and len(lines) <= 5:
-            _log("adm_skip: no signals in tiny file", path=p, lines=len(lines), tail=tail)
+            # Looks like a tiny placeholder; skip
             continue
 
         score = _clock_score(lines) * 100000 + min(len(lines), 100000)
@@ -632,44 +469,36 @@ def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[s
 def _latest_playerlist(lines: List[str]) -> Tuple[Optional[str], Dict[str, Tuple[float, float]]]:
     """
     Parse the most recent PlayerList block.
-    Returns (pl_sig, {normalized_name: (x,z)}).
-
-    IMPORTANT: Nitrado sometimes omits a clear trailing footer. To be robust:
-    - Find the *last* header line.
-    - Collect entries until the next header OR an explicit footer OR EOF
-      (whichever comes first).
+    Returns (pl_sig, {normalized_name: (x,z)}), where pl_sig is a stable content signature
+    that changes whenever the PlayerList block's contents change.
     """
-    if not lines:
-        return None, {}
-
-    # Find the last header
-    last_head_idx = None
-    for i in range(len(lines) - 1, -1, -1):
-        if PL_HEADER_RE.search(lines[i]):
-            last_head_idx = i
-            break
-    if last_head_idx is None:
-        return None, {}
-
-    block_lines = [lines[last_head_idx]]
+    pl_sig: Optional[str] = None
     players: Dict[str, Tuple[float, float]] = {}
-    j = last_head_idx + 1
-    while j < len(lines):
-        if PL_HEADER_RE.search(lines[j]) or PL_FOOTER_RE.search(lines[j]):
+    i = len(lines) - 1
+    while i >= 0:
+        mhead = PL_HEADER_RE.search(lines[i])
+        if mhead:
+            ts = mhead.group("ts")  # kept for logging only
+            block_lines = [lines[i]]
+            j = i + 1
+            tmp_players: Dict[str, Tuple[float, float]] = {}
+            while j < len(lines) and not PL_FOOTER_RE.search(lines[j]) and not PL_HEADER_RE.search(lines[j]):
+                block_lines.append(lines[j])
+                pm = PL_PLAYER_RE.search(lines[j])
+                if pm:
+                    nm = _norm(pm.group("name"))
+                    try:
+                        x = float(pm.group("x")); z = float(pm.group("z"))
+                        tmp_players[nm] = (x, z)
+                    except Exception:
+                        pass
+                j += 1
+            # content signature: header index + player count + small hash of block text
+            h = hashlib.blake2b("\n".join(block_lines).encode("utf-8", "ignore"), digest_size=6).hexdigest()
+            pl_sig = f"{i}|{len(tmp_players)}|{h}"
+            players = tmp_players
             break
-        pm = PL_PLAYER_RE.search(lines[j])
-        if pm:
-            nm = _norm(pm.group("name"))
-            try:
-                x = float(pm.group("x")); z = float(pm.group("z"))
-                players[nm] = (x, z)
-            except Exception:
-                pass
-        block_lines.append(lines[j])
-        j += 1
-
-    h = hashlib.blake2b("\n".join(block_lines).encode("utf-8", "ignore"), digest_size=6).hexdigest()
-    pl_sig = f"{last_head_idx}|{len(players)}|{h}"
+        i -= 1
     return pl_sig, players
 
 # ----------------------- Renderer with PlayerList gating ----------------------
@@ -726,6 +555,11 @@ class BountyUpdater:
         points: List[Tuple[str, float, float]],
         reasons: Dict[str, Optional[str]],
     ) -> int:
+        """
+        Draw one map with markers for all (name,x,z) points and post
+        a single embed listing each target with deep-linked coords.
+        Returns the message id (or 0 if nothing posted).
+        """
         if not points:
             return 0
 
@@ -788,19 +622,7 @@ class BountyUpdater:
             # Read latest ADM once per tick
             lines = _read_adm_lines(gid_hint=gid)
             pl_sig, pl_players = _latest_playerlist(lines)
-            
-            # NEW: also compute an ADM signature so “stale scans” progress even when
-            # Nitrado doesn’t emit a new PlayerList header but the log is advancing.
-            adm_sig = hashlib.blake2b("\n".join(lines[-2000:]).encode("utf-8","ignore"),
-                                      digest_size=8).hexdigest() if lines else None
-            # persist per-guild to avoid bouncing between targets
-            meta = doc.setdefault("meta", {})
-            gmeta = meta.setdefault(str(gid), {})
-            adm_advanced = bool(adm_sig and gmeta.get("last_adm_sig") != adm_sig)
-            if adm_advanced:
-                gmeta["last_adm_sig"] = adm_sig
-                _save_db(doc)
-                _log("adm_advanced", gid=gid, pl_sig=pl_sig, pl_count=len(pl_players))
+            _log("playerlist parsed", gid=gid, pl_sig=pl_sig, count=len(pl_players))
 
             by_key = { _name_key(nm): xy for nm, xy in pl_players.items() } if pl_players else {}
 
@@ -823,6 +645,7 @@ class BountyUpdater:
                 b.setdefault("last_state_announce", "online")
                 b.setdefault("last_post_ts", 0)
                 b.setdefault("stale_scans", 0)
+                b.setdefault("bootstrapped_status", False)
 
                 # --- PlayerList presence (tolerant key) ---
                 coords_from_pl = pl_players.get(norm_tgt) or by_key.get(_name_key(norm_tgt))
@@ -887,11 +710,9 @@ class BountyUpdater:
                             b["last_state_announce"] = "online"
                             _save_db(doc)
                             _log("inferred ONLINE from PlayerList", gid=gid, target=tgt)
-                
-                # Count absence when either the PlayerList OR the ADM advanced (even if PL didn't)
-                if (pl_advanced or adm_advanced) and not coords_from_pl:
-                    b["pl_absent"] = int(b.get("pl_absent", 0)) + 1
-                    _log("PL absence tick", gid=gid, target=tgt, misses=b["pl_absent"])
+                    else:
+                        b["pl_absent"] = int(b.get("pl_absent", 0)) + 1
+                        _log("PL absence tick", gid=gid, target=tgt, misses=b["pl_absent"])
 
                 # ---- Choose best coords: PlayerList > tracker > ADM tail > last_coords
                 best_xy: Optional[Tuple[float, float]] = None
@@ -927,47 +748,45 @@ class BountyUpdater:
                     _log("coords skip (no sources)", gid=gid, target=tgt)
                     continue
 
-                # Movement check vs previous saved coords
+                # Movement (used only for deciding to redraw; NOT for stale count anymore)
                 last = b.get("last_coords") or {}
                 last_x = float(last.get("x", 0) or 0)
                 last_z = float(last.get("z", 0) or 0)
                 moved = (abs(last_x - best_xy[0]) > STALE_DISTANCE_EPS) or (abs(last_z - best_xy[1]) > STALE_DISTANCE_EPS)
 
-                # Stale/offline heuristic:
-                # previously this only counted when *PlayerList* advanced, which fails when the
-                # ADM grows without a fresh PL header (common on Nitrado).  Now we also advance
-                # the stale counter when the overall ADM advanced.
-                if (pl_advanced or adm_advanced) and not coords_from_pl:
-                    if not moved:
-                        b["stale_scans"] = int(b.get("stale_scans", 0)) + 1
-                    else:
-                        b["stale_scans"] = 0
+                # STRICT 3-SCAN RULE (your requested behavior):
+                # Count EVERY updater tick when the target is NOT in the latest PlayerList.
+                if not coords_from_pl:
+                    b["stale_scans"] = int(b.get("stale_scans", 0)) + 1
+                else:
+                    b["stale_scans"] = 0
 
-                    if (
-                        b.get("online", True)
-                        and b["stale_scans"] >= STALE_MOVEMENT_SCANS
-                        and b.get("last_state_announce") != "offline"
-                    ):
-                        lx, lz = best_xy
-                        try: await _announce_offline(self.bot, gid, tgt, lx, lz)
-                        except Exception: pass
-                        b["online"] = False
-                        b["last_state_announce"] = "offline"
-                        _save_db(doc)
-                        _log("OFFLINE (stale movement heuristic)", gid=gid, target=tgt, scans=b["stale_scans"], src=chosen_src)
+                # Flip offline when the counter hits threshold
+                if (
+                    b.get("online", True)
+                    and b["stale_scans"] >= STALE_MOVEMENT_SCANS
+                    and b.get("last_state_announce") != "offline"
+                ):
+                    lx, lz = best_xy
+                    try: await _announce_offline(self.bot, gid, tgt, lx, lz)
+                    except Exception: pass
+                    b["online"] = False
+                    b["last_state_announce"] = "offline"
+                    _save_db(doc)
+                    _log("OFFLINE (strict 3-scan rule)", gid=gid, target=tgt, scans=b["stale_scans"], src=chosen_src)
 
-                # If they appeared in PL, clear stale counter
+                # If they appeared in PL, clear stale counter (extra safety)
                 if coords_from_pl:
                     b["stale_scans"] = 0
 
-                _log("coords chosen", gid=gid, target=tgt, src=chosen_src, x=best_xy[0], z=best_xy[1], moved=moved,
-                    stale_scans=b.get("stale_scans", 0), in_pl=bool(coords_from_pl), pl_advanced=pl_advanced, adm_advanced=adm_advanced)
+                _log("coords chosen", gid=gid, target=tgt, src=chosen_src, x=best_xy[0], z=best_xy[1],
+                     moved=moved, stale_scans=b.get("stale_scans", 0), in_pl=bool(coords_from_pl),
+                     pl_advanced=pl_advanced)
 
-                # Update last coords *after* stale logic
+                # Update last coords after logic
                 b["last_coords"] = {"x": float(best_xy[0]), "z": float(best_xy[1])}
 
-                # --- Bootstrap: If explicit 'disconnected' or (latest PL exists & target not in it),
-                #     mark offline *before* adding to combined map so we don't draw them.
+                # Bootstrap: if explicit 'disconnected' or (we have a PL snapshot and target not in it)
                 if not b.get("bootstrapped_status"):
                     should_bootstrap_offline = (
                         b.get("last_state_announce") != "offline"
@@ -987,11 +806,11 @@ class BountyUpdater:
                         b["last_state_announce"] = "offline"
                         b["pl_absent"] = max(b.get("pl_absent", 0), PL_ABSENCE_THRESHOLD)
                         _save_db(doc)
-                        _log("bootstrap OFFLINE (disc seen or not in latest PL)", gid=gid, target=tgt, latest_state=latest_state, pl_sig=pl_sig)
+                        _log("bootstrap OFFLINE (disc or not in latest PL)", gid=gid, target=tgt, latest_state=latest_state, pl_sig=pl_sig)
                     b["bootstrapped_status"] = True
                     _save_db(doc)
 
-                # Skip adding to combined map if we’ve just marked them offline (or already offline)
+                # Skip drawing if offline
                 if not b.get("online", True):
                     continue
 
@@ -1190,7 +1009,9 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
             except Exception:
                 pass
             b["last_state_announce"] = "online"
+            # reset PL absence if we got an explicit connect
             b["pl_absent"] = 0
+            b["stale_scans"] = 0
             changed = True
 
         if status == "disconnected" and last_flag != "offline":
@@ -1206,8 +1027,7 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
                 if track and track.get("points"):
                     pt = track["points"][-1]
                     try:
-                        lx, lz = float(pt["x"]); 
-                        lz = float(pt["z"])
+                        lx, lz = float(pt["x"]), float(pt["z"])
                     except Exception:
                         lx = lz = None
             try:
@@ -1360,15 +1180,16 @@ class BountyCog(commands.Cog):
             "reason": (reason or "").strip() or None,
             "message": None,
             # Tracking fields for gating + announcements
-            "online": True,
-            "has_initial_posted": False,
-            "last_pl_ts": None,
-            "last_state_announce": "online",
-            "last_coords": None,
-            "pl_absent": 0,
+            "online": True,                  # default true until watcher/updater flips
+            "has_initial_posted": False,     # first seed image regardless of PlayerList
+            "last_pl_ts": None,              # last PlayerList timestamp we posted for
+            "last_state_announce": "online", # dedupe “online/offline” notices
+            "last_coords": None,             # {"x": float, "z": float}
+            "pl_absent": 0,                  # consecutive PlayerList misses
             "last_pl_seen_ts": None,
-            "last_post_ts": 0,
-            "stale_scans": 0,
+            "last_post_ts": 0,               # cadence guard
+            "stale_scans": 0, 
+            "bootstrapped_status": False,
         }
         bdoc = _db()
         for b in bdoc["open"]:
