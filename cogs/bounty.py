@@ -29,7 +29,7 @@ from tracer.tracker import load_track
 BOUNTIES_DB = "data/bounties.json"        # list of open/closed bounties
 LOCAL_WALLET_PATHS = ["data/wallet.json", "wallet.json"]
 LINKS_DB = "data/linked_players.json"
-ADM_LATEST_PATH = "data/latest_adm.log"
+ADM_LATEST_PATH = "data/latest_adm.log"   # global mirror (also keep per-guild)
 
 # When a target is absent from PlayerList this many consecutive snapshots,
 # infer they're offline and announce once.
@@ -185,17 +185,32 @@ def _load_wallet_doc_and_path(gid: int) -> Tuple[Optional[dict], Optional[str]]:
     _log("No wallet file found", tried=", ".join(map(str, tried)))
     return None, None
 
+# ====== IMPORTANT: include per-guild mirror produced by log_fetcher ==========
 def _adm_candidate_paths_for_guild(gid: int) -> List[str]:
+    """
+    Resolution order (first wins):
+      1) per-guild mirror: data/latest_adm_<guild>.log
+      2) explicit external_adm_path (http(s) or file path)
+      3) external_data_base/latest_adm.log
+      4) global mirror: data/latest_adm.log
+    """
     st = _guild_settings(gid) or {}
     base = (st.get("external_data_base") or "").strip().rstrip("/")
     explicit = (st.get("external_adm_path") or "").strip()
+
     candidates: List[str] = []
+    # (1) per-guild mirror
+    candidates.append(f"data/latest_adm_{gid}.log")
+    # (2) explicit path
     if explicit:
         candidates.append(explicit)  # http(s) allowed
+    # (3) external base
     if base:
         candidates.append(f"{base}/latest_adm.log")
+    # (4) global mirror
     candidates.append(ADM_LATEST_PATH)
     return candidates
+# ============================================================================
 
 def _load_text_from_any(path: str) -> Optional[str]:
     path_str = str(path or "").strip()
@@ -754,8 +769,7 @@ class BountyUpdater:
                 last_z = float(last.get("z", 0) or 0)
                 moved = (abs(last_x - best_xy[0]) > STALE_DISTANCE_EPS) or (abs(last_z - best_xy[1]) > STALE_DISTANCE_EPS)
 
-                # STRICT 3-SCAN RULE (your requested behavior):
-                # Count EVERY updater tick when the target is NOT in the latest PlayerList.
+                # STRICT 3-SCAN RULE (counts **every** updater tick if NOT in PL)
                 if not coords_from_pl:
                     b["stale_scans"] = int(b.get("stale_scans", 0)) + 1
                 else:
@@ -779,7 +793,8 @@ class BountyUpdater:
                 if coords_from_pl:
                     b["stale_scans"] = 0
 
-                _log("coords chosen", gid=gid, target=tgt, src=chosen_src, x=best_xy[0], z=best_xy[1],
+                _log("coords chosen",
+                     gid=gid, target=tgt, src=chosen_src, x=best_xy[0], z=best_xy[1],
                      moved=moved, stale_scans=b.get("stale_scans", 0), in_pl=bool(coords_from_pl),
                      pl_advanced=pl_advanced)
 
@@ -1188,10 +1203,12 @@ class BountyCog(commands.Cog):
             "pl_absent": 0,                  # consecutive PlayerList misses
             "last_pl_seen_ts": None,
             "last_post_ts": 0,               # cadence guard
-            "stale_scans": 0, 
+            "stale_scans": 0,
             "bootstrapped_status": False,
         }
         bdoc = _db()
+        for b in bdoc["open"] as list:
+            pass
         for b in bdoc["open"]:
             if int(b.get("guild_id", 0)) == gid and _norm(b.get("target_gamertag","")) == _norm(target_gt or ""):
                 _adjust_tickets(gid, inv_id, +tickets)
