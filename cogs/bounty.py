@@ -1207,8 +1207,6 @@ class BountyCog(commands.Cog):
             "bootstrapped_status": False,
         }
         bdoc = _db()
-        for b in bdoc["open"] as list:
-            pass
         for b in bdoc["open"]:
             if int(b.get("guild_id", 0)) == gid and _norm(b.get("target_gamertag","")) == _norm(target_gt or ""):
                 _adjust_tickets(gid, inv_id, +tickets)
