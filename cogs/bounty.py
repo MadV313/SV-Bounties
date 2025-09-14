@@ -101,6 +101,7 @@ def _remote_discover_adm_candidates(base: str) -> List[str]:
     Try to discover rotating ADM files in another container:
       1) <base>/adm_state.json   ({"latest_url": "..."} or {"latest_file": "Foo.ADM"})
       2) <base>/latest_adm.log   (classic alias if maintained)
+         <base>/latest.adm.log   (alt alias some stacks use)
       3) Parse directory listing for *.ADM (if the host exposes one)
     Returns absolute URLs (most recent first when we can infer).
     """
@@ -119,8 +120,9 @@ def _remote_discover_adm_candidates(base: str) -> List[str]:
         elif latest_file:
             urls.append(f"{base}/{latest_file}")
 
-    # 2) Classic alias
+    # 2) Classic/alt aliases
     urls.append(f"{base}/latest_adm.log")
+    urls.append(f"{base}/latest.adm.log")
 
     # 3) Directory listing fallback
     try:
@@ -289,25 +291,49 @@ def _adm_candidate_paths_for_guild(gid: int) -> List[str]:
     base = (st.get("external_data_base") or "").strip()
     explicit = (st.get("external_adm_path") or "").strip()
 
-    candidates: List[str] = []
+    prefer_external = bool(
+        st.get("prefer_external")
+        or st.get("prefer_externals")
+        or st.get("prefer_external_data")
+    )
+    disable_local = bool(
+        st.get("disable_local")
+        or st.get("disable_local_adm")
+        or st.get("disable_local_files")
+    )
+
+    # Build lists
+    remote: List[str] = []
+    local: List[str] = []
 
     # 1) Explicit override (single URL/path)
     if explicit:
-        candidates.append(explicit)
+        remote.append(explicit)
 
     # 2) Remote discovery (handles rotating files in another container)
     if base:
-        candidates.extend(_remote_discover_adm_candidates(base))
+        remote.extend(_remote_discover_adm_candidates(base))
 
     # 3) Local discovery (handles rotating files pulled by the fetcher here)
-    candidates.extend(_local_discover_adm_candidates())
+    if not disable_local:
+        local.extend(_local_discover_adm_candidates())
+    else:
+        _log("local ADM disabled via settings", gid=gid)
 
-    # Deduplicate (preserve order)
+    # Compose based on preference
+    candidates: List[str] = (remote + local) if prefer_external else (remote + local if remote else local)
+
+    # If nothing at all, still fall back to the legacy local alias once
+    if not candidates and not disable_local:
+        candidates = [ADM_LATEST_PATH]
+
+    # Deduplicate while preserving order
     deduped: List[str] = []
     seen = set()
     for c in candidates:
         if c and c not in seen:
             seen.add(c); deduped.append(c)
+    _log("adm_candidate_build", gid=gid, prefer_external=prefer_external, disable_local=disable_local, candidates=deduped)
     return deduped
 
 def _load_text_from_any(path: str) -> Optional[str]:
@@ -1180,7 +1206,8 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
                 if track and track.get("points"):
                     pt = track["points"][-1]
                     try:
-                        lx, lz = float(pt["x"]), float(pt["z"])
+                        lx, lz = float(pt["x"]); 
+                        lz = float(pt["z"])
                     except Exception:
                         lx = lz = None
             try:
