@@ -36,6 +36,34 @@ def _line_fingerprint(s: str) -> int:
 # -----------------------------------------------------------------------------
 
 
+# -------- Mirror (write accepted ADM lines to a local rolling file) ----------
+MIRROR_MAX_LINES = 8000
+MIRROR_PATH_DEFAULT = "data/latest_adm.log"
+
+def _atomic_write_text(path: str, text: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+def _load_tail_into_deque(path: str, dq: deque, max_lines: int) -> None:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            # Read & keep only the last max_lines lines
+            # (avoid loading a huge file if it ever grows)
+            lines = f.read().splitlines()
+        for ln in lines[-max_lines:]:
+            dq.append(ln.rstrip("\r\n"))
+    except Exception:
+        # ok if file doesn't exist yet
+        pass
+# -----------------------------------------------------------------------------
+
+
 # Nitrado-style ADM names: DayZServer_X1_x64_YYYY-MM-DD_HH-MM-SS.ADM
 ADM_NAME_TS = re.compile(
     r"dayzserver_x1_x64_(\d{4})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})[-_](\d{2})\.adm$",
@@ -360,6 +388,16 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
     last_seen_line: Optional[str] = None
     last_seen_hash: Optional[int] = None
 
+    # ---- local mirror (rolling tail of accepted lines) ----------------------
+    mirror_tail: deque[str] = deque(maxlen=MIRROR_MAX_LINES)
+    mirror_dirty = False
+    # prime from existing default mirror if present (best-effort)
+    _load_tail_into_deque(MIRROR_PATH_DEFAULT, mirror_tail, MIRROR_MAX_LINES)
+    # also prime from per-guild mirror if present (overrides / appends)
+    mirror_per_guild = f"data/latest_adm_{guild_id}.log"
+    _load_tail_into_deque(mirror_per_guild, mirror_tail, MIRROR_MAX_LINES)
+    # ------------------------------------------------------------------------
+
     def _remember_line(line: str) -> bool:
         nonlocal last_seen_line, last_seen_hash
         fp = _line_fingerprint(line)
@@ -406,6 +444,16 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 await _to_thread(ftp.quit)
                 if last_seen_hash is not None:
                     logger.info(f"[Guild {guild_id}] Last line hash #{last_seen_hash}: {last_seen_line[:160]}")
+                # attempt to keep mirror current even if no new data (no-op if not dirty)
+                if mirror_dirty:
+                    try:
+                        text = "\n".join(mirror_tail) + "\n"
+                        _atomic_write_text(MIRROR_PATH_DEFAULT, text)
+                        _atomic_write_text(mirror_per_guild, text)
+                        mirror_dirty = False
+                        logger.info(f"[Guild {guild_id}] Mirror written (no data branch).")
+                    except Exception as e2:
+                        logger.debug(f"[Guild {guild_id}] Mirror write failed: {e2}")
                 await asyncio.sleep(interval)
                 continue
 
@@ -439,6 +487,16 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 await _to_thread(ftp.quit)
                 if last_seen_hash is not None:
                     logger.info(f"[Guild {guild_id}] Last line hash #{last_seen_hash}: {last_seen_line[:160]}")
+                # write mirror if we had pending lines
+                if mirror_dirty:
+                    try:
+                        text = "\n".join(mirror_tail) + "\n"
+                        _atomic_write_text(MIRROR_PATH_DEFAULT, text)
+                        _atomic_write_text(mirror_per_guild, text)
+                        mirror_dirty = False
+                        logger.info(f"[Guild {guild_id}] Mirror written (no files branch).")
+                    except Exception as e2:
+                        logger.debug(f"[Guild {guild_id}] Mirror write failed: {e2}")
                 await asyncio.sleep(interval)
                 continue
 
@@ -447,8 +505,6 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                 latest_name, latest_size_guess, latest_mtime = _choose_latest_adm(files)
 
             # === CHOOSER: Prefer API newest whenever present ===
-            # Old behavior sometimes stuck to FTP "newest" even when API showed a newer active ADM.
-            # Here we *always* choose the API file if available; otherwise we fall back to FTP.
             chosen_name = None
             chosen_mtime = None
             chosen_api_url = None
@@ -480,6 +536,16 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
 
             if not chosen_name:
                 await _to_thread(ftp.quit)
+                # write mirror if needed
+                if mirror_dirty:
+                    try:
+                        text = "\n".join(mirror_tail) + "\n"
+                        _atomic_write_text(MIRROR_PATH_DEFAULT, text)
+                        _atomic_write_text(mirror_per_guild, text)
+                        mirror_dirty = False
+                        logger.info(f"[Guild {guild_id}] Mirror written (no chosen file).")
+                    except Exception as e2:
+                        logger.debug(f"[Guild {guild_id}] Mirror write failed: {e2}")
                 await asyncio.sleep(interval)
                 continue
 
@@ -568,8 +634,22 @@ async def poll_guild(guild_id: int, cb: LineCallback, stop_event: asyncio.Event)
                     if not _remember_line(line):
                         continue
                     if buffer.accept(line):
+                        # append to local rolling mirror
+                        mirror_tail.append(line.rstrip("\r\n"))
+                        mirror_dirty = True
                         source = f"{src_prefix}:{latest_file}#~{prev_offset}+{idx}"
                         await cb(guild_id, line, source, now)
+
+            # After processing this cycle, write mirror if dirty
+            if mirror_dirty:
+                try:
+                    text = "\n".join(mirror_tail) + "\n"
+                    _atomic_write_text(MIRROR_PATH_DEFAULT, text)
+                    _atomic_write_text(mirror_per_guild, text)
+                    mirror_dirty = False
+                    logger.info(f"[Guild {guild_id}] Mirror written: {MIRROR_PATH_DEFAULT} (+ per-guild).")
+                except Exception as e:
+                    logger.debug(f"[Guild {guild_id}] Mirror write failed: {e}")
 
         except Exception as e:
             logger.error(f"[Guild {guild_id}] FTP poll error: {e}", exc_info=True)
