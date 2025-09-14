@@ -1315,7 +1315,7 @@ class BountyCog(commands.Cog):
         await interaction.followup.send("Provide `user` or `gamertag`.", ephemeral=True)
 
     # ------------------ Background loops owned by the Cog ------------------
-    @tasks.loop(minutes=5.0)
+    @tasks.loop(minutes=10.0)
     async def bounty_updater(self):
         doc = _db()
         gids = {int(b["guild_id"]) for b in doc.get("open", []) if b.get("guild_id")}
@@ -1346,7 +1346,7 @@ class BountyCog(commands.Cog):
         await self.bot.wait_until_ready()
 
     # Every 15 minutes, if no bounties online, say so (once per tick)
-    @tasks.loop(minutes=15.0)
+    @tasks.loop(minutes=30.0)
     async def idle_announcer(self):
         doc = _db()
         by_guild: Dict[int, List[dict]] = {}
