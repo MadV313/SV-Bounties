@@ -448,15 +448,11 @@ def _last_pos_for(lines: List[str], name_norm: str) -> Optional[Tuple[float, flo
             try:
                 x = float(pm.group("x")); z = float(pm.group("z"))
             except Exception:
-                continue  # ← keep searching older lines instead of bailing
+                continue
             return x, z
     return None
 
 def _latest_status_for(lines: List[str], name_norm: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Return ('connected'|'disconnected'|None, 'HH:MM:SS'|None) for name_norm,
-    taking the most recent occurrence by scanning from the file tail.
-    """
     for ln in reversed(lines[-4000:]):  # tail is enough & faster
         m = DISCONNECT_RE.search(ln)
         if m and _norm(_mname(m)) == name_norm:
@@ -467,17 +463,12 @@ def _latest_status_for(lines: List[str], name_norm: str) -> Tuple[Optional[str],
     return None, None
 
 def _last_generic_action_xy(lines: List[str], name_norm: str) -> Optional[Tuple[float, float]]:
-    """
-    Find latest generic pos/teleport/action line for the player (search tail → head).
-    Used only to infer ONLINE presence (no announcement).
-    """
     for ln in reversed(lines[-4000:]):
         m = RE_POS.search(ln) or RE_TP.search(ln)
         nm = None
         if m:
             nm = _norm(m.group("name"))
         else:
-            # More conservative fallback: only consider if action keywords present
             if any(k in ln.lower() for k in ("performed", "placed", "teleport", "was teleported", "connected")):
                 mf = RE_FALLBACK.search(ln)
                 if mf:
@@ -493,14 +484,34 @@ def _last_generic_action_xy(lines: List[str], name_norm: str) -> Optional[Tuple[
                 continue
     return None
 
+def _xy_before_index(lines: List[str], idx: int, name_norm: str) -> Optional[Tuple[float, float]]:
+    """Find the latest coords for name_norm strictly BEFORE line index idx.
+       Prefer PlayerList coords, then generic pos/tp lines."""
+    wanted_key = _name_key(name_norm)
+    j = idx
+    while j >= 0 and idx - j <= 4000:
+        ln = lines[j]
+        pm = PL_PLAYER_RE.search(ln)
+        if pm:
+            nm = _norm(pm.group("name"))
+            if nm == name_norm or _name_key(nm) == wanted_key:
+                try:
+                    return float(pm.group("x")), float(pm.group("z"))
+                except Exception:
+                    pass
+        # generic presence lines as fallback
+        gm = RE_POS.search(ln) or RE_TP.search(ln) or RE_FALLBACK.search(ln)
+        if gm:
+            nm = _norm(gm.group("name"))
+            if nm == name_norm or _name_key(nm) == wanted_key:
+                try:
+                    return float(gm.group("x")), float(gm.group("z"))
+                except Exception:
+                    pass
+        j -= 1
+    return None
+
 def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[str]:
-    """
-    Read all viable ADM candidates, then pick the *best* one:
-      - prefers files with PlayerList/connect/disconnect/kill lines
-      - prefers the most recent in-file HH:MM:SS clock time
-      - falls back to longest file if times are tied
-    This avoids getting stuck on a placeholder file.
-    """
     paths = _adm_candidate_paths_for_guild(int(gid_hint or 0)) if gid_hint else [ADM_LATEST_PATH]
     _log("adm_candidates", gid=gid_hint, candidates=paths)
     best_lines: List[str] = []
@@ -508,7 +519,6 @@ def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[s
     chosen_path: Optional[str] = None
 
     def _clock_score(ls: List[str]) -> int:
-        # Extract the max HH:MM:SS seen anywhere to approximate "freshness"
         hhmmss = 0
         for ln in ls[-2000:]:
             m = _TIME_RE.search(ln)
@@ -521,7 +531,6 @@ def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[s
         txt = _load_text_from_any(p)
         if not txt:
             continue
-        # Strip trailing empties and ignore trivial placeholders
         lines = [l for l in txt.splitlines() if l.strip()]
         if not lines:
             continue
@@ -531,7 +540,6 @@ def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[s
             for l in lines[-500:]
         )
         if not has_signal and len(lines) <= 5:
-            # Looks like a tiny placeholder; skip
             continue
 
         score = _clock_score(lines) * 100000 + min(len(lines), 100000)
@@ -547,18 +555,12 @@ def _read_adm_lines(limit: int = 5000, gid_hint: Optional[int] = None) -> List[s
     return best_lines[-limit:] if best_lines else []
 
 def _latest_playerlist(lines: List[str]) -> Tuple[Optional[str], Dict[str, Tuple[float, float]]]:
-    """
-    Parse the most recent PlayerList block.
-    Returns (pl_sig, {normalized_name: (x,z)}), where pl_sig is a stable content signature
-    that changes whenever the PlayerList block's contents change.
-    """
     pl_sig: Optional[str] = None
     players: Dict[str, Tuple[float, float]] = {}
     i = len(lines) - 1
     while i >= 0:
         mhead = PL_HEADER_RE.search(lines[i])
         if mhead:
-            ts = mhead.group("ts")  # kept for logging only
             block_lines = [lines[i]]
             j = i + 1
             tmp_players: Dict[str, Tuple[float, float]] = {}
@@ -573,7 +575,6 @@ def _latest_playerlist(lines: List[str]) -> Tuple[Optional[str], Dict[str, Tuple
                     except Exception:
                         pass
                 j += 1
-            # content signature: header index + player count + small hash of block text
             h = hashlib.blake2b("\n".join(block_lines).encode("utf-8", "ignore"), digest_size=6).hexdigest()
             pl_sig = f"{i}|{len(tmp_players)}|{h}"
             players = tmp_players
@@ -635,11 +636,6 @@ class BountyUpdater:
         points: List[Tuple[str, float, float]],
         reasons: Dict[str, Optional[str]],
     ) -> int:
-        """
-        Draw one map with markers for all (name,x,z) points and post
-        a single embed listing each target with deep-linked coords.
-        Returns the message id (or 0 if nothing posted).
-        """
         if not points:
             return 0
 
@@ -710,7 +706,7 @@ class BountyUpdater:
             combined_points: List[Tuple[str, float, float]] = []     # PL-gated points
             initial_points: List[Tuple[str, float, float]] = []      # for new-bounty first snapshot
             reasons: Dict[str, Optional[str]] = {}
-            any_moved_on_map = False  # movement counted only for those we will draw (PL-gated)
+            any_moved_on_map = False
 
             for b in targets:
                 tgt = (b.get("target_gamertag") or "").strip()
@@ -719,7 +715,7 @@ class BountyUpdater:
                 norm_tgt = _norm(tgt)
                 reasons[tgt] = (b.get("reason") or "").strip() or None
 
-                # Ensure fields exist for stable logic
+                # Ensure fields exist
                 b.setdefault("pl_absent", 0)
                 b.setdefault("last_pl_seen_ts", None)
                 b.setdefault("online", True)
@@ -727,14 +723,14 @@ class BountyUpdater:
                 b.setdefault("last_post_ts", 0)
                 b.setdefault("stale_scans", 0)
                 b.setdefault("bootstrapped_status", False)
-                b.setdefault("needs_first_snapshot", False)  # may be set on creation
+                b.setdefault("needs_first_snapshot", False)
 
-                # --- Signals harvested from this snapshot ---
+                # --- Signals for this tick ---
                 coords_from_pl = pl_players.get(norm_tgt) or by_key.get(_name_key(norm_tgt))
                 latest_state, latest_ts = _latest_status_for(lines, norm_tgt)
-                action_xy = _last_generic_action_xy(lines, norm_tgt)  # presence-only signal
+                action_xy = _last_generic_action_xy(lines, norm_tgt)
 
-                # PlayerList progress bookkeeping (used for "appeared now" heuristics)
+                # PlayerList progress bookkeeping
                 pl_advanced = bool(pl_sig and b.get("last_pl_seen_ts") != pl_sig)
                 if pl_advanced:
                     b["last_pl_seen_ts"] = pl_sig
@@ -744,14 +740,9 @@ class BountyUpdater:
                         b["pl_absent"] = int(b.get("pl_absent", 0)) + 1
                     _log("PL tick", gid=gid, target=tgt, in_pl=bool(coords_from_pl), misses=b["pl_absent"])
 
-                # ---------- PRESENCE PRECEDENCE (strict) ----------
-                # 1) last state line disconnected → offline now (wins over everything)
-                # 2) else last state line connected → online, no announcement needed if already online
-                # 3) else last generic pos/tp/action line → online (no announcement)
-                # 4) else no signals → increment stale_scans; when >= 6 → offline once
+                # ---------- PRESENCE PRECEDENCE ----------
                 if latest_state == "disconnected":
                     if b.get("last_state_announce") != "offline":
-                        # choose best coords for the disconnect post
                         lx = lz = None
                         lc = b.get("last_coords") or {}
                         try:
@@ -771,7 +762,6 @@ class BountyUpdater:
                     b["stale_scans"] = 0
                     _save_db(doc)
                     _log("presence: DISCONNECTED", gid=gid, target=tgt, at=latest_ts)
-                    # offline → skip drawing & movement
                     continue
 
                 elif latest_state == "connected":
@@ -783,12 +773,10 @@ class BountyUpdater:
                     b["stale_scans"] = 0
 
                 elif action_xy is not None:
-                    # Generic action/pos seen → assume online silently
                     b["online"] = True
                     b["stale_scans"] = 0
 
                 else:
-                    # No signals at all this tick → count toward offline
                     b["stale_scans"] = int(b.get("stale_scans", 0)) + 1
                     if (
                         b.get("online", True)
@@ -813,10 +801,9 @@ class BountyUpdater:
                         b["last_state_announce"] = "offline"
                         _save_db(doc)
                         _log("presence: OFFLINE by stale scans", gid=gid, target=tgt, scans=b["stale_scans"])
-                        continue  # offline → skip drawing
+                        continue
 
-                # --------- Choose coords for display (PL-gated map later) ----------
-                # Priority: PlayerList > tracker > ADM PL tail > last_coords
+                # --------- Choose coords (PL-gated for map) ----------
                 best_xy: Optional[Tuple[float, float]] = None
                 chosen_src = "none"
 
@@ -850,7 +837,6 @@ class BountyUpdater:
                     _log("coords skip (no sources)", gid=gid, target=tgt)
                     continue
 
-                # Movement (only used for draw decision; **not** for offline logic)
                 last = b.get("last_coords") or {}
                 last_x = float(last.get("x", 0) or 0)
                 last_z = float(last.get("z", 0) or 0)
@@ -861,10 +847,8 @@ class BountyUpdater:
                      moved=moved, stale_scans=b.get("stale_scans", 0), in_pl=bool(coords_from_pl),
                      pl_advanced=pl_advanced)
 
-                # Update last coords after logic
                 b["last_coords"] = {"x": float(best_xy[0]), "z": float(best_xy[1])}
 
-                # Bootstrap: if explicit 'disconnected' or (we have a PL snapshot and target not in it)
                 if not b.get("bootstrapped_status"):
                     should_bootstrap_offline = (
                         b.get("last_state_announce") != "offline"
@@ -888,21 +872,17 @@ class BountyUpdater:
                     b["bootstrapped_status"] = True
                     _save_db(doc)
 
-                # Skip drawing if offline
                 if not b.get("online", True):
                     continue
 
-                # STRICT PL-GATING for routine map: only draw if present in the latest PlayerList
                 if coords_from_pl:
                     combined_points.append((tgt, best_xy[0], best_xy[1]))
                     if moved:
                         any_moved_on_map = True
 
-                # But for **first snapshot** of a newly created bounty, draw even if not in PL yet.
                 if b.get("needs_first_snapshot"):
                     initial_points.append((tgt, best_xy[0], best_xy[1]))
 
-            # Decide what we will post
             if not combined_points and not initial_points:
                 _log("combined: nothing to show", gid=gid)
                 _save_db(doc)
@@ -915,10 +895,8 @@ class BountyUpdater:
             cadence_due = (now_ts - last_ts >= FORCE_POST_EVERY_SEC)
             force_initial = any(b.get("needs_first_snapshot") for b in targets if b.get("online", True))
 
-            # Points to post: union initial points with PL-gated combined points when initial is forced.
             points_to_post = combined_points[:]
             if force_initial:
-                # add any initial points that aren't already present
                 existing = { (n.lower(), int(x), int(z)) for (n,x,z) in points_to_post }
                 for n,x,z in initial_points:
                     key = (n.lower(), int(x), int(z))
@@ -929,7 +907,6 @@ class BountyUpdater:
             if force_initial or is_first_post:
                 should_post = True
             elif cadence_due or any_moved_on_map:
-                # keep at least every 10 minutes OR on movement
                 should_post = True
 
             if should_post and points_to_post:
@@ -939,7 +916,7 @@ class BountyUpdater:
                         if b.get("online", True):
                             b["last_post_ts"] = now_ts
                         if b.get("needs_first_snapshot"):
-                            b["needs_first_snapshot"] = False  # one-shot
+                            b["needs_first_snapshot"] = False
                     meta["last_combined_post_ts"] = now_ts
                     _save_db(doc)
                     _log("combined map posted", gid=gid, count=len(points_to_post),
@@ -1007,6 +984,79 @@ async def _announce_offline(bot: commands.Bot, gid: int, name: str, x: Optional[
     except Exception:
         pass
 
+async def _announce_claim_with_map(
+    bot: commands.Bot,
+    gid: int,
+    victim: str,
+    killer: str,
+    tickets: int,
+    x: Optional[float],
+    z: Optional[float],
+):
+    """Claim announcement, optionally with a kill-location map."""
+    ch_id = _guild_settings(gid).get("bounty_channel_id")
+    ch = bot.get_channel(int(ch_id)) if ch_id else None
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return
+
+    # Fallback: plain text when coords are unknown
+    if x is None or z is None:
+        try:
+            await ch.send(
+                "📢 **Attention survivors!**\n"
+                f"The bounty for **{victim}** has been claimed by **{killer}** and they have been "
+                f"duly awarded **{tickets} SV tickets**.\n"
+                "Keep your eyes peeled for more bounties!"
+            )
+        except Exception:
+            pass
+        return
+
+    map_key, _ = _canon_map_and_cfg(_guild_settings(gid).get("active_map"))
+    coords_md = _coords_link_text(map_key, x, z)
+
+    try:
+        img = _load_map_image(map_key)
+        draw = ImageDraw.Draw(img)
+        cfg = MAPS.get(map_key, MAPS["livonia"])
+        px, py = _world_to_px(cfg, x, z, img.width)
+        r = 9
+        draw.ellipse([px - r, py - r, px + r, py + r], outline=(255, 0, 0, 255), width=4)
+        draw.ellipse([px - 2, py - 2, px + 2, py + 2], fill=(255, 0, 0, 255))
+        try:
+            draw.text((px + 12, py - 12), f"{victim} • {int(x)},{int(z)}", fill=(255, 255, 255, 255))
+        except Exception:
+            pass
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        fname = _safe_png_name(f"{victim}_kill_location")
+
+        embed = discord.Embed(
+            title=f"🏆 Bounty claimed!",
+            description=(
+                f"The bounty for **{victim}** has been claimed by **{killer}** "
+                f"(**{tickets} SV tickets**).\n"
+                f"**Kill location:** {coords_md}"
+            ),
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_image(url=f"attachment://{fname}")
+        await ch.send(file=discord.File(fp=buf, filename=fname), embed=embed)
+    except Exception as e:
+        _log("claim map send failed", gid=gid, err=repr(e))
+        try:
+            await ch.send(
+                "📢 **Attention survivors!**\n"
+                f"The bounty for **{victim}** has been claimed by **{killer}** and they have been "
+                f"duly awarded **{tickets} SV tickets**.\n"
+                "Keep your eyes peeled for more bounties!"
+            )
+        except Exception:
+            pass
+
 # ---------------------------- Kill + status watcher --------------------------
 async def check_kills_and_status(bot: commands.Bot, guild_id: int):
     """
@@ -1023,26 +1073,34 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
     if not open_bounties:
         return
 
-    # 1) Kills (with timestamps so we can ignore retroactive lines)
-    kills: List[Tuple[str, str, Optional[str]]] = []  # victim, killer, hh:mm:ss
-    for ln in lines[-2000:]:
+    # 1) Kills (keep index + timestamp so we can find location before the kill and ignore retro kills)
+    kills: List[Tuple[int, str, str, Optional[str]]] = []  # (idx, victim, killer, ts)
+    for idx, ln in enumerate(lines[-2000:], start=len(lines) - min(len(lines), 2000)):
         m = KILL_RE.search(ln)
         if m:
-            kills.append((m.group("victim").strip(), m.group("killer").strip(), m.group("ts")))
+            kills.append((idx, m.group("victim").strip(), m.group("killer").strip(), m.group("ts")))
             continue
         m = KILL_RE_NIT.search(ln)
         if m:
-            kills.append((m.group("victim").strip(), m.group("killer").strip(), _extract_hhmmss(ln)))
+            kills.append((idx, m.group("victim").strip(), m.group("killer").strip(), _extract_hhmmss(ln)))
+
     if kills:
         changed = False
-        for victim, killer, ts in kills:
+        for idx, victim, killer, ts in kills:
             for b in list(open_bounties):
                 if _norm(b.get("target_gamertag", "")) != _norm(victim):
                     continue
-                # Block retroactive claims: require a timestamp and ensure it's at/after bounty's floor
                 floor = b.get("kill_floor_ts") or "00:00:00"
                 if not ts or ts < floor:
+                    # Retroactive kill (before the bounty was created) — ignore
                     continue
+
+                # Try to locate kill position: walk backward from the kill line.
+                xy = _xy_before_index(lines, idx, _norm(victim))
+                if xy is None:
+                    # as a soft fallback, use latest known coords anywhere in the file
+                    xy = _last_pos_for(lines, _norm(victim))
+
                 tickets = int(b.get("tickets", 0))
                 did, _ = resolve_from_any(guild_id, gamertag=killer)
                 if not did:
@@ -1056,18 +1114,12 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
                     pass
                 changed = True
 
-                ch_id = _guild_settings(guild_id).get("bounty_channel_id")
-                ch = bot.get_channel(int(ch_id)) if ch_id else None
-                if isinstance(ch, (discord.TextChannel, discord.Thread)):
-                    try:
-                        await ch.send(
-                            "📢 **Attention survivors!**\n"
-                            f"The bounty for **{victim}** has been claimed by **{killer}** and they have been "
-                            f"duly awarded **{tickets} SV tickets**.\n"
-                            "Keep your eyes peeled for more bounties!"
-                        )
-                    except Exception:
-                        pass
+                # Announce with map (if we have coords)
+                x = y = None
+                if xy:
+                    x, y = xy
+                await _announce_claim_with_map(bot, guild_id, victim, killer, tickets, x, y)
+
         if changed:
             _save_db(doc)
             open_bounties = [b for b in doc.get("open", []) if int(b.get("guild_id", 0)) == guild_id]
@@ -1126,7 +1178,6 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
             except Exception:
                 pass
             b["last_state_announce"] = "online"
-            # reset PL absence if we got an explicit connect
             b["pl_absent"] = 0
             b["stale_scans"] = 0
             changed = True
@@ -1286,7 +1337,7 @@ class BountyCog(commands.Cog):
                 ephemeral=True
             )
 
-        # Capture the current ADM "clock floor" so retroactive kills don't claim this bounty
+        # Capture ADM "clock floor" so retroactive kills don't claim this bounty
         lines_now = _read_adm_lines(gid_hint=gid)
         floor_ts = _max_clock(lines_now) or "00:00:00"
 
@@ -1301,18 +1352,18 @@ class BountyCog(commands.Cog):
             "reason": (reason or "").strip() or None,
             "message": None,
             # Tracking fields for gating + announcements
-            "online": True,                  # default true until watcher/updater flips
-            "has_initial_posted": False,     # first seed image regardless of PlayerList
-            "last_pl_ts": None,              # last PlayerList timestamp we posted for
-            "last_state_announce": "online", # dedupe “online/offline” notices
-            "last_coords": None,             # {"x": float, "z": float}
-            "pl_absent": 0,                  # consecutive PlayerList misses
+            "online": True,
+            "has_initial_posted": False,
+            "last_pl_ts": None,
+            "last_state_announce": "online",
+            "last_coords": None,
+            "pl_absent": 0,
             "last_pl_seen_ts": None,
-            "last_post_ts": 0,               # cadence guard
+            "last_post_ts": 0,
             "stale_scans": 0,
             "bootstrapped_status": False,
             # New bits:
-            "needs_first_snapshot": True,    # force one immediate combined map post for this bounty
+            "needs_first_snapshot": True,    # force one combined post including this target
             "kill_floor_ts": floor_ts,       # kills must be at/after this HH:MM:SS
         }
         bdoc = _db()
@@ -1401,7 +1452,7 @@ class BountyCog(commands.Cog):
     async def _before_kw(self):
         await self.bot.wait_until_ready()
 
-    # Every 15 minutes, if no bounties online, say so (once per tick)
+    # Every 30 minutes, if no bounties online, say so (once per tick)
     @tasks.loop(minutes=30.0)
     async def idle_announcer(self):
         doc = _db()
