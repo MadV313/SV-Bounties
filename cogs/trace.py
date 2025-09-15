@@ -47,19 +47,6 @@ def _log(gid: int | None, msg: str, extra: Dict[str, Any] | None = None) -> None
 # -----------------------------------------------------------
 
 
-def _parse_dt(s: str) -> datetime | None:
-    if not s:
-        return None
-    s = s.strip()
-    fmts = ["%Y-%m-%d %H:%M", "%Y-%m-%d", "%m/%d/%Y %H:%M", "%m/%d/%Y"]
-    for f in fmts:
-        try:
-            return datetime.strptime(s, f).replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-    return None
-
-
 # ---- Map + iZurvive helpers -----------------------------------------------
 WORLD_SIZE = {
     "chernarus+": 15360,
@@ -490,17 +477,13 @@ class TraceCog(commands.Cog):
     @app_commands.describe(
         user="Discord user (optional if you provide gamertag)",
         gamertag="Gamertag (optional if you select a user)",
-        start="Start datetime (e.g., 2025-09-04 13:30, UTC assumed)",
-        end="End datetime (optional). Default: now",
-        window_hours="Alternative to start/end. Default 24h."
+        window_hours="How far back to look (hours). Default 24."
     )
     async def trace(
         self,
         interaction: discord.Interaction,
         user: discord.User | None = None,
         gamertag: str | None = None,
-        start: str | None = None,
-        end: str | None = None,
         window_hours: int | None = 24
     ):
         gid = interaction.guild_id
@@ -517,8 +500,6 @@ class TraceCog(commands.Cog):
             "args": {
                 "user": getattr(user, "id", None),
                 "gamertag": gamertag,
-                "start": start,
-                "end": end,
                 "window_hours": window_hours,
             }
         })
@@ -552,19 +533,10 @@ class TraceCog(commands.Cog):
                 ephemeral=True
             )
 
-        # ---------------- time window logic ------------------
-        dt_start = _parse_dt(start) if start else None
-        dt_end = _parse_dt(end) if end else datetime.now(timezone.utc)
-
-        if dt_start:
-            if not dt_end or dt_end <= dt_start:
-                dt_end = dt_start + timedelta(hours=1)
-            window_hours = None
-            _log(gid, "explicit time range", {"start": dt_start.isoformat(), "end": dt_end.isoformat()})
-        else:
-            if not window_hours:
-                window_hours = 24
-            _log(gid, "window mode", {"window_hours": window_hours})
+        # ---------------- window mode only -------------------
+        if not window_hours:
+            window_hours = 24
+        _log(gid, "window mode", {"window_hours": window_hours})
 
         # ---------------- load track points ------------------
         try:
@@ -576,43 +548,28 @@ class TraceCog(commands.Cog):
                 ephemeral=True
             )
 
-        # Ensure gamertag present for caption
-        if isinstance(doc, dict) and not doc.get("gamertag"):
-            doc["gamertag"] = resolved_tag
+        # Ensure gamertag present for caption and drawing
+        player_name = resolved_tag
+        if isinstance(doc, dict):
+            if not doc.get("gamertag"):
+                doc["gamertag"] = player_name
 
         points = (doc or {}).get("points") if doc else None
         if not doc or not points:
             return await interaction.followup.send(
-                f"ℹ️ No track points found for `{resolved_tag}` in that window.",
+                f"ℹ️ No track points found for `{player_name}` in that window.",
                 ephemeral=True
             )
-
-        if dt_start:
-            pts: List[Dict[str, Any]] = []
-            for p in points:
-                try:
-                    ts = datetime.fromisoformat(p["ts"].replace("Z", "+00:00"))
-                except Exception:
-                    continue
-                if dt_start <= ts <= dt_end:
-                    pts.append(p)
-            if not pts:
-                return await interaction.followup.send(
-                    f"ℹ️ No points for `{resolved_tag}` in that time range.",
-                    ephemeral=True
-                )
-            doc = {**doc, "points": pts}
-            points = pts
 
         # -------------------- load actions --------------------
         actions: List[Dict[str, Any]] = []
         if load_actions is not None:
             try:
                 actions = load_actions(
-                    resolved_tag,
-                    start=dt_start,
-                    end=dt_end if dt_start else None,
-                    window_hours=window_hours if not dt_start else None,
+                    player_name,
+                    start=None,
+                    end=None,
+                    window_hours=window_hours,
                 ) or []
             except Exception as e:
                 _log(gid, "load_actions raised", {"error": repr(e)})
@@ -622,10 +579,10 @@ class TraceCog(commands.Cog):
         if not actions:
             actions = _fallback_load_actions(
                 gid=gid,
-                gamertag=resolved_tag,
-                start=dt_start,
-                end=dt_end if dt_start else None,
-                window_hours=window_hours if not dt_start else None,
+                gamertag=player_name,
+                start=None,
+                end=None,
+                window_hours=window_hours,
                 guild_settings=st or {},
             )
 
@@ -639,7 +596,7 @@ class TraceCog(commands.Cog):
                 ephemeral=True
             )
 
-        map_file = discord.File(img_buf, filename=f"trace_{doc.get('gamertag','player')}.png")
+        map_file = discord.File(img_buf, filename=f"trace_{player_name}.png")
 
         # ------- caption and link to last point ---------------
         last = points[-1]
@@ -662,13 +619,10 @@ class TraceCog(commands.Cog):
 
         count = len(points)
         caption = (
-            f"**{doc.get('gamertag','?')}** — {count} points\n"
-            f"Last: [({lx:.1f}, {lz:.1f})]({izu_last}) {when_last}"
+            f"**{player_name}** — {count} points\n"
+            f"Last: [({lx:.1f}, {lz:.1f})]({izu_last}) {when_last}\n"
+            f"Range: last {window_hours}h"
         )
-        if dt_start:
-            caption += f"\nRange: `{dt_start.isoformat()}` to `{dt_end.isoformat()}`"
-        else:
-            caption += f"\nRange: last {window_hours}h"
 
         # --------- Embeds: Points only (no actions embed) ----
         embeds: List[discord.Embed] = []
@@ -749,11 +703,8 @@ class TraceCog(commands.Cog):
 
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         hdr = f"***** ADM Snapshot — {now_utc} *****\n"
-        if dt_start:
-            hdr += f"Range: {dt_start.isoformat()} .. {dt_end.isoformat()}\n"
-        else:
-            hdr += f"Range: last {window_hours}h\n"
-        hdr += f"Player: {doc.get('gamertag','player')}\n"
+        hdr += f"Range: last {window_hours}h\n"
+        hdr += f"Player: {player_name}\n"
         hdr += "----------------------------------------------\n"
         snapshot_text = hdr + "\n".join(snapshot_lines) + "\n"
 
