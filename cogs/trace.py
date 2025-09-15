@@ -349,7 +349,6 @@ def _fallback_load_actions(
 _EMBED_TOTAL_BUDGET = 5500
 _EMBED_FIELD_BUDGET = 950
 _EMBED_MAX_FIELDS = 20
-_ACTIONS_MAX_LINES = 30            # show at most this many action lines in the embed
 _POINTS_MAX_LINES = 200            # cap points lines to avoid overflow
 
 def _add_lines_with_budget(embed: discord.Embed, title_prefix: str, lines: List[str],
@@ -614,7 +613,7 @@ class TraceCog(commands.Cog):
                     start=dt_start,
                     end=dt_end if dt_start else None,
                     window_hours=window_hours if not dt_start else None,
-                ) | []  # type: ignore
+                ) or []
             except Exception as e:
                 _log(gid, "load_actions raised", {"error": repr(e)})
                 actions = []
@@ -671,10 +670,9 @@ class TraceCog(commands.Cog):
         else:
             caption += f"\nRange: last {window_hours}h"
 
-        # --------- Embeds: Points and Actions ----------------
+        # --------- Embeds: Points only (no actions embed) ----
         embeds: List[discord.Embed] = []
 
-        # points list (cap lines to stay small)
         points_embed = discord.Embed(title="Trace points (click to open in iZurvive)")
         point_lines: List[str] = []
         n = len(points)
@@ -701,41 +699,10 @@ class TraceCog(commands.Cog):
         _add_lines_with_budget(points_embed, "Points", point_lines)
         embeds.append(points_embed)
 
-        # actions list + snapshot
+        # -------- Build the .txt attachment content ----------
         snapshot_lines: List[str] = []
         if actions:
-            action_lines: List[str] = []
-            # show the *last* N actions in the embed, but write ALL into the txt snapshot
-            show_actions = min(len(actions), _ACTIONS_MAX_LINES)
-            visible_actions = actions[-show_actions:]
-
-            for a in visible_actions:
-                kind = str(a.get("type") or a.get("kind") or "event")
-                raw = str(a.get("raw") or "").strip()
-                desc = str(a.get("desc") or a.get("message") or a.get("detail") or "").strip()
-                use_desc = raw if raw else desc
-
-                x = a.get("x")
-                z = a.get("z")
-                link = ""
-                try:
-                    if x is not None and z is not None:
-                        link = f"[({float(x):.1f}, {float(z):.1f})]({_izurvive_url(map_name, float(x), float(z))}) "
-                except Exception:
-                    link = ""
-                tss = ""
-                try:
-                    ts_raw = a.get("ts")
-                    if ts_raw:
-                        tss = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
-                            .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
-                except Exception:
-                    pass
-
-                pretty = kind.capitalize()
-                action_lines.append(f"• {pretty}: {link}{use_desc} {tss}".strip())
-
-            # full snapshot lines: prefer verbatim ADM when available
+            # Prefer verbatim ADM lines
             for a in actions:
                 tss = ""
                 try:
@@ -761,14 +728,7 @@ class TraceCog(commands.Cog):
                     desc = str(a.get("desc") or a.get("message") or a.get("detail") or "").strip()
                     snapshot_lines.append(f"{hhmmss} | {kind:<12} | {desc or '-'}{coord_txt}")
 
-            if show_actions < len(actions):
-                action_lines.append(f"…and {len(actions) - show_actions} more (see adm_snapshot.txt).")
-
-            actions_embed = discord.Embed(title=f"Actions snapshot ({len(actions)})")
-            _add_lines_with_budget(actions_embed, "Actions", action_lines)
-            embeds.append(actions_embed)
-
-        # If still nothing actionable, fall back to POS list for snapshot txt
+        # If still nothing actionable, fall back to POS list
         if not snapshot_lines:
             for p in points:
                 tss = ""
@@ -787,7 +747,6 @@ class TraceCog(commands.Cog):
                 hhmmss = tss.split(" ")[0] if tss else "--:--:--"
                 snapshot_lines.append(f"{hhmmss} | {'POS':<12} | position update{coord_txt}")
 
-        # Build the .txt attachment content (always complete; embeds may be truncated)
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         hdr = f"***** ADM Snapshot — {now_utc} *****\n"
         if dt_start:
