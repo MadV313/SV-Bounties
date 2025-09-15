@@ -76,25 +76,6 @@ class AdminAssign(commands.Cog):
             ephemeral=True
         )
 
-    @app_commands.command(name="setmap", description="Switch the active map")
-    @app_commands.describe(map_choice="Map to activate")
-    @app_commands.choices(
-        map_choice=[app_commands.Choice(name=cfg.get("name", key), value=key) for key, cfg in MAPS.items()]
-    )
-    @admin_check()
-    async def setmap(self, interaction: discord.Interaction, map_choice: app_commands.Choice[str]):
-        gid = interaction.guild_id
-
-        # Ensure we store the canonical MAPS key (not lowercased blindly, not a display name)
-        chosen_key = _resolve_map_key(map_choice.value) or map_choice.value
-        # If resolve failed (shouldn't happen via Choices), keep original but don't lowercase
-        save_settings(gid, {"active_map": chosen_key})
-
-        await interaction.response.send_message(
-            f"🗺️ Active map set to **{_map_display_name(chosen_key)}**.",
-            ephemeral=True
-        )
-
     @app_commands.command(name="settings", description="Show current bot settings")
     @admin_check()
     async def settings(self, interaction: discord.Interaction):
