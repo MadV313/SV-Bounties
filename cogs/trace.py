@@ -22,7 +22,7 @@ try:
 except Exception:  # pragma: no cover
     load_actions = None
 
-# Optional storage client (supports local/remote)
+# Optional storage client (supports local/remote reads like S3/FS)
 try:
     from utils.storageClient import load_file  # type: ignore
 except Exception:
@@ -198,6 +198,7 @@ ADM_CANDIDATES = [
     "logs/latest_adm.log",
 ]
 
+# Time like "15:07:49 | ..."
 _TIME_RE = re.compile(r"^\s*(?:\d+\s+)?(\d{2}:\d{2}:\d{2})\s*\|\s*", re.I)
 _POS_RE = re.compile(
     r'pos\s*=\s*<\s*(?P<x>-?\d+(?:\.\d+)?)[,\s]+(?P<z>-?\d+(?:\.\d+)?)[,\s]+(?P<y>-?\d+(?:\.\d+)?)\s*>',
@@ -239,19 +240,22 @@ def _extract_coords(line: str) -> Tuple[Optional[float], Optional[float]]:
 def _read_text_candidates(gid: int | None, guild_settings: dict) -> str:
     """Read ADM mirror. Prefer per-guild mirror, then global."""
     paths: List[str] = []
-    if gid:
-        paths.append(f"data/latest_adm_{gid}.log")  # per-guild mirror from fetcher
+    if gid:  # **per-guild mirror written by the fetcher**
+        paths.append(f"data/latest_adm_{gid}.log")
 
+    # optional override from settings
     custom = (guild_settings or {}).get("adm_latest_path")
     if custom:
         paths.append(custom)
 
+    # global mirrors (fallbacks)
     for p in ADM_CANDIDATES:
         if p not in paths:
             paths.append(p)
 
     # Try storageClient first, then local disk
     for p in paths:
+        # storageClient
         if load_file is not None:
             try:
                 blob = load_file(p)
@@ -262,6 +266,7 @@ def _read_text_candidates(gid: int | None, guild_settings: dict) -> str:
             except Exception as e:
                 _log(gid, "storageClient load failed", {"path": p, "error": repr(e)})
 
+        # local disk
         try:
             fp = Path(p)
             if fp.exists() and fp.is_file():
@@ -292,7 +297,7 @@ def _fallback_load_actions(
         _log(gid, "no ADM text available for fallback scan")
         return []
 
-    # Player "Name" ... OR Player Name ...
+    # matches: Player "Majoreq2208" ...  OR  Player Majoreq2208 ...
     esc = re.escape(gamertag)
     name_pat = re.compile(rf'Player\s+(?:"{esc}"|{esc})(?!\w)', re.I)
 
@@ -336,6 +341,69 @@ def _fallback_load_actions(
     _log(gid, "fallback actions parsed", {"count": len(actions)})
     return actions
 # -----------------------------------------------------------
+
+
+# -------------------- Embed helpers (hard caps) --------------------
+# Discord hard limit for a single embed is 6000 chars total (title+fields).
+# We'll keep a safety margin.
+_EMBED_TOTAL_BUDGET = 5500
+_EMBED_FIELD_BUDGET = 950
+_EMBED_MAX_FIELDS = 20
+_ACTIONS_MAX_LINES = 30            # show at most this many action lines in the embed
+_POINTS_MAX_LINES = 200            # cap points lines to avoid overflow
+
+def _add_lines_with_budget(embed: discord.Embed, title_prefix: str, lines: List[str],
+                           total_budget: int = _EMBED_TOTAL_BUDGET,
+                           field_budget: int = _EMBED_FIELD_BUDGET,
+                           max_fields: int = _EMBED_MAX_FIELDS) -> None:
+    """
+    Add lines into fields without exceeding Discord's 6k embed limit.
+    """
+    used = len(embed.title or "") + len(embed.description or "")
+    fields_added = 0
+
+    chunk: List[str] = []
+    chunk_len = 0
+    part = 1
+
+    def flush():
+        nonlocal used, fields_added, chunk, chunk_len, part
+        if not chunk:
+            return
+        if fields_added >= max_fields:
+            return
+        value = "\n".join(chunk)
+        name = f"{title_prefix} {part}"
+        # rough accounting
+        addition = len(name) + len(value) + 8
+        if used + addition > total_budget:
+            # add a small truncated note if possible
+            if used + len("(truncated)") + 25 <= total_budget and fields_added < max_fields:
+                embed.add_field(name="(truncated)", value="…see adm_snapshot.txt", inline=False)
+            chunk = []
+            chunk_len = 0
+            return
+        embed.add_field(name=name, value=value, inline=False)
+        used += addition
+        fields_added += 1
+        part += 1
+        chunk = []
+        chunk_len = 0
+
+    for ln in lines:
+        if len(ln) > field_budget:
+            ln = ln[:field_budget - 1] + "…"
+        if chunk_len + len(ln) + 1 > field_budget:
+            flush()
+            if fields_added >= max_fields:
+                break
+        if fields_added >= max_fields:
+            break
+        chunk.append(ln)
+        chunk_len += len(ln) + 1
+    if fields_added < max_fields:
+        flush()
+# -------------------------------------------------------------------
 
 
 def _render_trace_png(
@@ -411,73 +479,6 @@ def _render_trace_png(
     base.save(buf, format="PNG")
     buf.seek(0)
     return buf
-# -----------------------------------------------------------------------------
-
-
-# ---------------- Discord embed-safe helpers (byte-aware) --------------------
-def _utf8_len(s: str) -> int:
-    return len(s.encode("utf-8", "ignore"))
-
-def _embed_bytes(e: discord.Embed) -> int:
-    total = _utf8_len(e.title or "") + _utf8_len(e.description or "") + _utf8_len(e.url or "")
-    for f in e.fields:
-        total += _utf8_len(f.name or "") + _utf8_len(f.value or "")
-    return total
-
-def _add_chunked_bytes(
-    embed: discord.Embed,
-    title_prefix: str,
-    lines: List[str],
-    *,
-    max_total_bytes: int = 4800,   # ~80% of Discord 6k limit for headroom
-    max_field_bytes: int = 720,    # conservative per-field cap (<= 1024 hard limit)
-    max_fields: int = 24
-) -> None:
-    """
-    Split `lines` across multiple fields without exceeding Discord limits.
-    If we run out of space, append a '(truncated)' notice.
-    """
-    def can_add(name: str, value: str) -> bool:
-        return _embed_bytes(embed) + _utf8_len(name) + _utf8_len(value) <= max_total_bytes
-
-    part = 1
-    chunk: List[str] = []
-    chunk_bytes = 0
-
-    def flush_chunk() -> bool:
-        nonlocal part, chunk, chunk_bytes
-        if not chunk:
-            return True
-        name = f"{title_prefix} {part}"
-        value = "\n".join(chunk)
-        if len(embed.fields) >= max_fields or not can_add(name, value):
-            remaining = len(lines_iter)
-            embed.add_field(
-                name="(truncated)",
-                value=f"…{remaining} more lines — see adm_snapshot.txt",
-                inline=False
-            )
-            return False
-        embed.add_field(name=name, value=value, inline=False)
-        part += 1
-        chunk, chunk_bytes = [], 0
-        return True
-
-    # iterate with an indexable view for “remaining” count on truncation
-    lines_iter = list(lines)
-    i = 0
-    while i < len(lines_iter):
-        ln = lines_iter[i]
-        ln_b = _utf8_len(ln) + 1  # + newline
-        if chunk and (chunk_bytes + ln_b > max_field_bytes):
-            if not flush_chunk():
-                return
-            continue
-        chunk.append(ln)
-        chunk_bytes += ln_b
-        i += 1
-
-    flush_chunk()
 # -----------------------------------------------------------------------------
 
 
@@ -576,6 +577,10 @@ class TraceCog(commands.Cog):
                 ephemeral=True
             )
 
+        # Ensure gamertag present for caption
+        if isinstance(doc, dict) and not doc.get("gamertag"):
+            doc["gamertag"] = resolved_tag
+
         points = (doc or {}).get("points") if doc else None
         if not doc or not points:
             return await interaction.followup.send(
@@ -609,9 +614,10 @@ class TraceCog(commands.Cog):
                     start=dt_start,
                     end=dt_end if dt_start else None,
                     window_hours=window_hours if not dt_start else None,
-                ) or []
+                ) | []  # type: ignore
             except Exception as e:
                 _log(gid, "load_actions raised", {"error": repr(e)})
+                actions = []
 
         # Fallback to direct ADM scan if none found
         if not actions:
@@ -634,9 +640,7 @@ class TraceCog(commands.Cog):
                 ephemeral=True
             )
 
-        # Prefer resolved_tag if doc lacks gamertag (prevents "unknown")
-        player_name = (doc.get("gamertag") or resolved_tag or "player")
-        map_file = discord.File(img_buf, filename=f"trace_{player_name}.png")
+        map_file = discord.File(img_buf, filename=f"trace_{doc.get('gamertag','player')}.png")
 
         # ------- caption and link to last point ---------------
         last = points[-1]
@@ -659,7 +663,7 @@ class TraceCog(commands.Cog):
 
         count = len(points)
         caption = (
-            f"**{player_name}** — {count} points\n"
+            f"**{doc.get('gamertag','?')}** — {count} points\n"
             f"Last: [({lx:.1f}, {lz:.1f})]({izu_last}) {when_last}"
         )
         if dt_start:
@@ -667,11 +671,16 @@ class TraceCog(commands.Cog):
         else:
             caption += f"\nRange: last {window_hours}h"
 
-        # --------- Embeds: Points and Actions (byte-safe) ---------------
+        # --------- Embeds: Points and Actions ----------------
+        embeds: List[discord.Embed] = []
+
+        # points list (cap lines to stay small)
         points_embed = discord.Embed(title="Trace points (click to open in iZurvive)")
         point_lines: List[str] = []
         n = len(points)
-        for idx, p in enumerate(points, start=1):
+        show_points = min(n, _POINTS_MAX_LINES)
+        start_index = n - show_points + 1  # last N points
+        for idx, p in enumerate(points[-show_points:], start=start_index):
             try:
                 x, z = float(p.get("x", 0.0)), float(p.get("z", 0.0))
             except Exception:
@@ -687,16 +696,20 @@ class TraceCog(commands.Cog):
                 pass
             url = _izurvive_url(map_name, x, z)
             point_lines.append(f"{idx}. [{x:.1f}, {z:.1f}]({url}) — {tag} {ts_s}")
+        if show_points < n:
+            point_lines.append(f"…and {n - show_points} older points.")
+        _add_lines_with_budget(points_embed, "Points", point_lines)
+        embeds.append(points_embed)
 
-        _add_chunked_bytes(points_embed, "Points", point_lines)
-
-        embeds: List[discord.Embed] = [points_embed]
-
-        # actions list + snapshot (prefer raw ADM lines)
+        # actions list + snapshot
         snapshot_lines: List[str] = []
         if actions:
             action_lines: List[str] = []
-            for a in actions:
+            # show the *last* N actions in the embed, but write ALL into the txt snapshot
+            show_actions = min(len(actions), _ACTIONS_MAX_LINES)
+            visible_actions = actions[-show_actions:]
+
+            for a in visible_actions:
                 kind = str(a.get("type") or a.get("kind") or "event")
                 raw = str(a.get("raw") or "").strip()
                 desc = str(a.get("desc") or a.get("message") or a.get("detail") or "").strip()
@@ -720,27 +733,42 @@ class TraceCog(commands.Cog):
                     pass
 
                 pretty = kind.capitalize()
-                # Use ASCII dash instead of bullet to save bytes
-                action_lines.append(f"- {pretty}: {link}{use_desc} {tss}".strip())
+                action_lines.append(f"• {pretty}: {link}{use_desc} {tss}".strip())
 
-                # Snapshot prefers verbatim ADM line
+            # full snapshot lines: prefer verbatim ADM when available
+            for a in actions:
+                tss = ""
+                try:
+                    ts_raw = a.get("ts")
+                    if ts_raw:
+                        tss = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
+                              .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+                except Exception:
+                    pass
                 hhmmss = tss.split(" ")[0] if tss else "--:--:--"
+                raw = str(a.get("raw") or "").strip()
                 if raw:
                     snapshot_lines.append(f"{hhmmss} | {raw}")
                 else:
+                    kind = str(a.get("type") or a.get("kind") or "event").capitalize()
+                    x = a.get("x"); z = a.get("z")
                     coord_txt = ""
                     try:
                         if x is not None and z is not None:
                             coord_txt = f" ({float(x):.1f},{float(z):.1f})"
                     except Exception:
                         coord_txt = ""
-                    snapshot_lines.append(f"{hhmmss} | {pretty:<12} | {use_desc or '-'}{coord_txt}")
+                    desc = str(a.get("desc") or a.get("message") or a.get("detail") or "").strip()
+                    snapshot_lines.append(f"{hhmmss} | {kind:<12} | {desc or '-'}{coord_txt}")
 
-            actions_embed = discord.Embed(title=f"Actions snapshot ({len(actions)}) — full details in file")
-            _add_chunked_bytes(actions_embed, "Actions", action_lines)
+            if show_actions < len(actions):
+                action_lines.append(f"…and {len(actions) - show_actions} more (see adm_snapshot.txt).")
+
+            actions_embed = discord.Embed(title=f"Actions snapshot ({len(actions)})")
+            _add_lines_with_budget(actions_embed, "Actions", action_lines)
             embeds.append(actions_embed)
 
-        # If still nothing actionable, fall back to POS
+        # If still nothing actionable, fall back to POS list for snapshot txt
         if not snapshot_lines:
             for p in points:
                 tss = ""
@@ -759,14 +787,14 @@ class TraceCog(commands.Cog):
                 hhmmss = tss.split(" ")[0] if tss else "--:--:--"
                 snapshot_lines.append(f"{hhmmss} | {'POS':<12} | position update{coord_txt}")
 
-        # Build the txt attachment content (always complete)
+        # Build the .txt attachment content (always complete; embeds may be truncated)
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         hdr = f"***** ADM Snapshot — {now_utc} *****\n"
         if dt_start:
             hdr += f"Range: {dt_start.isoformat()} .. {dt_end.isoformat()}\n"
         else:
             hdr += f"Range: last {window_hours}h\n"
-        hdr += f"Player: {player_name}\n"
+        hdr += f"Player: {doc.get('gamertag','player')}\n"
         hdr += "----------------------------------------------\n"
         snapshot_text = hdr + "\n".join(snapshot_lines) + "\n"
 
@@ -789,6 +817,7 @@ class TraceCog(commands.Cog):
                 except Exception as e:
                     _log(gid, "failed posting to admin channel", {"error": repr(e)})
 
+        # Fallback to replying where invoked
         await interaction.followup.send(caption, files=[map_file, snapshot_file], embeds=embeds, ephemeral=True)
 
 
