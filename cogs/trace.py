@@ -298,10 +298,8 @@ def _fallback_load_actions(
 
     # Build tolerant name matcher:
     # matches: Player "Majoreq2208" ...  OR  Player Majoreq2208 ...
-    name_pat = re.compile(
-        rf'Player\s+(?:"{re.escape(gamertag)}"|{re.escape(gamertag)})\b',
-        re.I,
-    )
+    esc = re.escape(gamertag)
+    name_pat = re.compile(rf'Player\s+(?:"{esc}"|{esc})(?!\w)', re.I)
 
     now = datetime.now(timezone.utc)
     if start and end:
