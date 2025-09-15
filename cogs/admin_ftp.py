@@ -57,6 +57,23 @@ def _sanitize_segment(s: str) -> str:
     return s or "user"
 
 
+def _norm_console_folder(value: str | None) -> str | None:
+    """
+    Normalize console input to the Nitrado folder segment:
+      Xbox      -> 'dayzxb'
+      PlayStation -> 'dayzps'
+    Accepts: 'xbox', 'x', 'xb', 'dayzxb', 'playstation', 'ps', 'ps4', 'ps5', 'dayzps'
+    """
+    if not value:
+        return None
+    v = value.strip().lower()
+    if v in {"x", "xb", "xbox", "dayzxb"}:
+        return "dayzxb"
+    if v in {"ps", "ps4", "ps5", "playstation", "dayzps"}:
+        return "dayzps"
+    return None
+
+
 class AdminFTP(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -73,7 +90,8 @@ class AdminFTP(commands.Cog):
         username="FTP username",
         password="FTP password (use a dedicated account)",
         port="FTP port (default 21)",
-        console="Console platform (chooses ADM folder + API prefix automatically)",
+        console="Console platform (dropdown). Chooses ADM folder + API prefix automatically",
+        consol="Console platform (text alias). Use 'xbox' or 'ps' if you prefer",
         interval_sec="Polling interval seconds (default 10)",
         map_choice="(Optional) Set the active map",
     )
@@ -93,27 +111,36 @@ class AdminFTP(commands.Cog):
         username: str = "",
         password: str = "",
         port: int = 21,
-        console: app_commands.Choice[str] = None,  # required
+        console: app_commands.Choice[str] = None,  # dropdown (optional)
+        consol: str | None = None,                 # text alias (optional; legacy)
         interval_sec: int = 10,
         map_choice: app_commands.Choice[str] | None = None,
     ):
         """
-        Save API/FTP config. 'console' determines:
+        Save API/FTP config.
+
+        Console selection is authoritative and determines:
           - FTP adm_dir: /dayzxb/config (Xbox) or /dayzps/config (PlayStation)
-          - API prefix (stored as nitrado_log_folder_prefix): /games/{username}/noftp/{console}/config
+          - API prefix (stored as nitrado_log_folder_prefix): /games/{username}/noftp/{dayzxb|dayzps}/config
         """
         gid = interaction.guild_id
         if not gid:
             return await interaction.response.send_message("❌ Guild-only command.", ephemeral=True)
 
-        # Decide ADM dir from console
-        console_val = (console.value if console else "").lower()
-        if console_val not in ("xbox", "playstation"):
-            return await interaction.response.send_message("❌ Choose a console: Xbox or PlayStation.", ephemeral=True)
+        # Resolve console via dropdown OR text alias.
+        folder_from_dropdown = _norm_console_folder(console.value) if console else None
+        folder_from_text = _norm_console_folder(consol)
+        folder_segment = folder_from_dropdown or folder_from_text
+        if not folder_segment:
+            return await interaction.response.send_message(
+                "❌ Choose a console (dropdown) or provide `consol=xbox` / `consol=ps`.",
+                ephemeral=True,
+            )
 
-        adm_dir = "/dayzxb/config" if console_val == "xbox" else "/dayzps/config"
+        # Derive dependent paths
+        adm_dir = f"/{folder_segment}/config"
 
-        # Build extras and auto-generate prefix from username + console
+        # Collect extras and auto-build API listing prefix from username + console
         extras = {}
         if nitrado_api_token:
             extras["nitrado_api_token"] = nitrado_api_token.strip()
@@ -121,7 +148,8 @@ class AdminFTP(commands.Cog):
             extras["nitrado_service_id"] = str(nitrado_service_id).strip()
 
         user_seg = _sanitize_segment(username)
-        extras["nitrado_log_folder_prefix"] = f"/games/{user_seg}/noftp/{console_val}/config"
+        # IMPORTANT FIX: Use dayzxb/dayzps (folder_segment), not 'xbox'/'playstation'
+        extras["nitrado_log_folder_prefix"] = f"/games/{user_seg}/noftp/{folder_segment}/config"
 
         # Save FTP core (+ extras if supported)
         saved_extras = bool(extras)
@@ -166,10 +194,12 @@ class AdminFTP(commands.Cog):
             )
 
         # Friendly header summarizing derived bits
+        # Display human-friendly console name
+        human_name = "Xbox" if folder_segment == "dayzxb" else "PlayStation"
         summary = (
-            f"Console: **{console.name}**\n"
+            f"Console: **{human_name}**\n"
             f"ADM dir: `{adm_dir}`\n"
-            f"API prefix: `{'/games/'+user_seg+'/noftp/'+console_val+'/config'}`"
+            f"API prefix: `{'/games/'+user_seg+'/noftp/'+folder_segment+'/config'}`"
         )
 
         await interaction.response.send_message(
