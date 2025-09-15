@@ -239,7 +239,7 @@ def _extract_coords(line: str) -> Tuple[Optional[float], Optional[float]]:
 def _read_text_candidates(gid: int | None, guild_settings: dict) -> str:
     """Read ADM mirror. Prefer per-guild mirror, then global."""
     paths: List[str] = []
-    if gid:  # **per-guild mirror written by your fetcher**
+    if gid:  # per-guild mirror written by the fetcher
         paths.append(f"data/latest_adm_{gid}.log")
 
     # optional override from settings
@@ -254,7 +254,6 @@ def _read_text_candidates(gid: int | None, guild_settings: dict) -> str:
 
     # Try storageClient first, then local disk
     for p in paths:
-        # storageClient
         if load_file is not None:
             try:
                 blob = load_file(p)
@@ -265,7 +264,6 @@ def _read_text_candidates(gid: int | None, guild_settings: dict) -> str:
             except Exception as e:
                 _log(gid, "storageClient load failed", {"path": p, "error": repr(e)})
 
-        # local disk
         try:
             fp = Path(p)
             if fp.exists() and fp.is_file():
@@ -296,8 +294,7 @@ def _fallback_load_actions(
         _log(gid, "no ADM text available for fallback scan")
         return []
 
-    # Build tolerant name matcher:
-    # matches: Player "Majoreq2208" ...  OR  Player Majoreq2208 ...
+    # Player "Name" ... OR Player Name ...
     esc = re.escape(gamertag)
     name_pat = re.compile(rf'Player\s+(?:"{esc}"|{esc})(?!\w)', re.I)
 
@@ -572,7 +569,9 @@ class TraceCog(commands.Cog):
                 ephemeral=True
             )
 
-        map_file = discord.File(img_buf, filename=f"trace_{doc.get('gamertag','player')}.png")
+        # Prefer resolved_tag if doc lacks gamertag (prevents "unknown")
+        player_name = (doc.get("gamertag") or resolved_tag or "player")
+        map_file = discord.File(img_buf, filename=f"trace_{player_name}.png")
 
         # ------- caption and link to last point ---------------
         last = points[-1]
@@ -595,7 +594,7 @@ class TraceCog(commands.Cog):
 
         count = len(points)
         caption = (
-            f"**{doc.get('gamertag','?')}** — {count} points\n"
+            f"**{player_name}** — {count} points\n"
             f"Last: [({lx:.1f}, {lz:.1f})]({izu_last}) {when_last}"
         )
         if dt_start:
@@ -604,28 +603,52 @@ class TraceCog(commands.Cog):
             caption += f"\nRange: last {window_hours}h"
 
         # --------- Embeds: Points and Actions ----------------
-        def _chunk_add(embed: discord.Embed, title_prefix: str, lines: List[str]):
+        def _chunk_add(embed: discord.Embed, title_prefix: str, lines: List[str], *, max_total: int = 5800, max_field: int = 900):
+            """
+            Add lines to an embed split across fields while respecting Discord limits:
+              - ~6000 characters per embed (use 5800 for headroom)
+              - ~1024 per field value (use 900 for headroom)
+              - max 25 fields per embed (stop at 24 and add a truncation note)
+            """
+            def current_total(e: discord.Embed) -> int:
+                total = len(e.title or "") + len(e.description or "")
+                for f in e.fields:
+                    total += len(f.name or "") + len(f.value or "")
+                return total
+
             chunk: List[str] = []
-            size = 0
+            chunk_size = 0
             part = 1
-            for ln in lines:
-                if size + len(ln) + 1 > 1000 and chunk:
-                    if len(embed.fields) >= 24:
-                        embed.add_field(name="(truncated)", value="…too many lines to display.", inline=False)
+            i = 0
+            n = len(lines)
+
+            while i < n:
+                ln = lines[i]
+                if chunk_size + len(ln) + 1 > max_field and chunk:
+                    name = f"{title_prefix} {part}"
+                    value = "\n".join(chunk)
+                    if current_total(embed) + len(name) + len(value) > max_total or len(embed.fields) >= 24:
+                        remaining = n - i
+                        embed.add_field(name="(truncated)", value=f"…{remaining} more lines — see adm_snapshot.txt", inline=False)
                         return
-                    embed.add_field(name=f"{title_prefix} {part}", value="\n".join(chunk), inline=False)
-                    chunk, size, part = [], 0, part + 1
+                    embed.add_field(name=name, value=value, inline=False)
+                    chunk, chunk_size, part = [], 0, part + 1
+                    continue
+
                 chunk.append(ln)
-                size += len(ln) + 1
+                chunk_size += len(ln) + 1
+                i += 1
+
             if chunk:
-                if len(embed.fields) >= 24:
-                    embed.add_field(name="(truncated)", value="…too many lines to display.", inline=False)
-                    return
-                embed.add_field(name=f"{title_prefix} {part}", value="\n".join(chunk), inline=False)
+                name = f"{title_prefix} {part}"
+                value = "\n".join(chunk)
+                if current_total(embed) + len(name) + len(value) > max_total or len(embed.fields) >= 24:
+                    embed.add_field(name="(truncated)", value="…more lines — see adm_snapshot.txt", inline=False)
+                else:
+                    embed.add_field(name=name, value=value, inline=False)
 
         # points list
         points_embed = discord.Embed(title="Trace points (click to open in iZurvive)")
-        map_name = _active_map_name(gid)
         point_lines: List[str] = []
         n = len(points)
         for idx, p in enumerate(points, start=1):
@@ -720,7 +743,7 @@ class TraceCog(commands.Cog):
             hdr += f"Range: {dt_start.isoformat()} .. {dt_end.isoformat()}\n"
         else:
             hdr += f"Range: last {window_hours}h\n"
-        hdr += f"Player: {doc.get('gamertag','player')}\n"
+        hdr += f"Player: {player_name}\n"
         hdr += "----------------------------------------------\n"
         snapshot_text = hdr + "\n".join(snapshot_lines) + "\n"
 
