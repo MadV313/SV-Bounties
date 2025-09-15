@@ -60,8 +60,8 @@ def _sanitize_segment(s: str) -> str:
 def _norm_console_folder(value: str | None) -> str | None:
     """
     Normalize console input to the Nitrado folder segment:
-      Xbox      -> 'dayzxb'
-      PlayStation -> 'dayzps'
+      Xbox       -> 'dayzxb'
+      PlayStation-> 'dayzps'
     Accepts: 'xbox', 'x', 'xb', 'dayzxb', 'playstation', 'ps', 'ps4', 'ps5', 'dayzps'
     """
     if not value:
@@ -91,7 +91,6 @@ class AdminFTP(commands.Cog):
         password="FTP password (use a dedicated account)",
         port="FTP port (default 21)",
         console="Console platform (dropdown). Chooses ADM folder + API prefix automatically",
-        consol="Console platform (text alias). Use 'xbox' or 'ps' if you prefer",
         interval_sec="Polling interval seconds (default 10)",
         map_choice="(Optional) Set the active map",
     )
@@ -111,15 +110,14 @@ class AdminFTP(commands.Cog):
         username: str = "",
         password: str = "",
         port: int = 21,
-        console: app_commands.Choice[str] = None,  # dropdown (optional)
-        consol: str | None = None,                 # text alias (optional; legacy)
+        console: app_commands.Choice[str] = None,  # required via UI
         interval_sec: int = 10,
         map_choice: app_commands.Choice[str] | None = None,
     ):
         """
         Save API/FTP config.
 
-        Console selection is authoritative and determines:
+        Console selection determines:
           - FTP adm_dir: /dayzxb/config (Xbox) or /dayzps/config (PlayStation)
           - API prefix (stored as nitrado_log_folder_prefix): /games/{username}/noftp/{dayzxb|dayzps}/config
         """
@@ -127,14 +125,14 @@ class AdminFTP(commands.Cog):
         if not gid:
             return await interaction.response.send_message("❌ Guild-only command.", ephemeral=True)
 
-        # Resolve console via dropdown OR text alias.
-        folder_from_dropdown = _norm_console_folder(console.value) if console else None
-        folder_from_text = _norm_console_folder(consol)
-        folder_segment = folder_from_dropdown or folder_from_text
+        if not console:
+            return await interaction.response.send_message("❌ Choose a console (Xbox or PlayStation).", ephemeral=True)
+
+        # Resolve folder segment from dropdown value
+        folder_segment = _norm_console_folder(console.value)
         if not folder_segment:
             return await interaction.response.send_message(
-                "❌ Choose a console (dropdown) or provide `consol=xbox` / `consol=ps`.",
-                ephemeral=True,
+                "❌ Invalid console selection.", ephemeral=True
             )
 
         # Derive dependent paths
@@ -148,7 +146,6 @@ class AdminFTP(commands.Cog):
             extras["nitrado_service_id"] = str(nitrado_service_id).strip()
 
         user_seg = _sanitize_segment(username)
-        # IMPORTANT FIX: Use dayzxb/dayzps (folder_segment), not 'xbox'/'playstation'
         extras["nitrado_log_folder_prefix"] = f"/games/{user_seg}/noftp/{folder_segment}/config"
 
         # Save FTP core (+ extras if supported)
@@ -194,7 +191,6 @@ class AdminFTP(commands.Cog):
             )
 
         # Friendly header summarizing derived bits
-        # Display human-friendly console name
         human_name = "Xbox" if folder_segment == "dayzxb" else "PlayStation"
         summary = (
             f"Console: **{human_name}**\n"
