@@ -198,7 +198,7 @@ ADM_CANDIDATES = [
     "logs/latest_adm.log",
 ]
 
-_TIME_RE = re.compile(r"^\s*(\d{2}:\d{2}:\d{2})\s*\|\s*", re.I)
+_TIME_RE = re.compile(r"^\s*(?:\d+\s+)?(\d{2}:\d{2}:\d{2})\s*\|\s*", re.I)
 _POS_RE = re.compile(
     r'pos\s*=\s*<\s*(?P<x>-?\d+(?:\.\d+)?)[,\s]+(?P<z>-?\d+(?:\.\d+)?)[,\s]+(?P<y>-?\d+(?:\.\d+)?)\s*>',
     re.I,
@@ -237,34 +237,45 @@ def _extract_coords(line: str) -> Tuple[Optional[float], Optional[float]]:
         return None, None
 
 def _read_text_candidates(gid: int | None, guild_settings: dict) -> str:
-    """Try multiple sources to read the latest ADM content."""
-    # Admin may override via settings in the future
-    custom = (guild_settings or {}).get("adm_latest_path")
-    paths = ADM_CANDIDATES.copy()
-    if custom and custom not in paths:
-        paths.insert(0, custom)
+    """Read ADM mirror. Prefer per-guild mirror, then global."""
+    paths: List[str] = []
+    if gid:  # **per-guild mirror written by your fetcher**
+        paths.append(f"data/latest_adm_{gid}.log")
 
-    # Try storageClient first (respects your external base), then local files
+    # optional override from settings
+    custom = (guild_settings or {}).get("adm_latest_path")
+    if custom:
+        paths.append(custom)
+
+    # global mirrors (fallbacks)
+    for p in ADM_CANDIDATES:
+        if p not in paths:
+            paths.append(p)
+
+    # Try storageClient first, then local disk
     for p in paths:
         # storageClient
         if load_file is not None:
             try:
                 blob = load_file(p)
                 if blob:
-                    if isinstance(blob, (bytes, bytearray)):
-                        return blob.decode("utf-8", errors="ignore")
-                    return str(blob)
+                    text = blob.decode("utf-8", "ignore") if isinstance(blob, (bytes, bytearray)) else str(blob)
+                    _log(gid, "ADM source chosen (storageClient)", {"path": p, "bytes": len(text)})
+                    return text
             except Exception as e:
                 _log(gid, "storageClient load failed", {"path": p, "error": repr(e)})
 
-        # local disk fallback
+        # local disk
         try:
             fp = Path(p)
             if fp.exists() and fp.is_file():
-                return fp.read_text(encoding="utf-8", errors="ignore")
+                text = fp.read_text(encoding="utf-8", errors="ignore")
+                _log(gid, "ADM source chosen (local)", {"path": p, "bytes": len(text)})
+                return text
         except Exception as e:
             _log(gid, "local read failed", {"path": p, "error": repr(e)})
 
+    _log(gid, "no ADM text available for fallback scan", None)
     return ""
 
 def _fallback_load_actions(
