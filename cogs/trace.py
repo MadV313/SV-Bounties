@@ -239,15 +239,13 @@ def _extract_coords(line: str) -> Tuple[Optional[float], Optional[float]]:
 def _read_text_candidates(gid: int | None, guild_settings: dict) -> str:
     """Read ADM mirror. Prefer per-guild mirror, then global."""
     paths: List[str] = []
-    if gid:  # per-guild mirror written by the fetcher
-        paths.append(f"data/latest_adm_{gid}.log")
+    if gid:
+        paths.append(f"data/latest_adm_{gid}.log")  # per-guild mirror from fetcher
 
-    # optional override from settings
     custom = (guild_settings or {}).get("adm_latest_path")
     if custom:
         paths.append(custom)
 
-    # global mirrors (fallbacks)
     for p in ADM_CANDIDATES:
         if p not in paths:
             paths.append(p)
@@ -413,6 +411,73 @@ def _render_trace_png(
     base.save(buf, format="PNG")
     buf.seek(0)
     return buf
+# -----------------------------------------------------------------------------
+
+
+# ---------------- Discord embed-safe helpers (byte-aware) --------------------
+def _utf8_len(s: str) -> int:
+    return len(s.encode("utf-8", "ignore"))
+
+def _embed_bytes(e: discord.Embed) -> int:
+    total = _utf8_len(e.title or "") + _utf8_len(e.description or "") + _utf8_len(e.url or "")
+    for f in e.fields:
+        total += _utf8_len(f.name or "") + _utf8_len(f.value or "")
+    return total
+
+def _add_chunked_bytes(
+    embed: discord.Embed,
+    title_prefix: str,
+    lines: List[str],
+    *,
+    max_total_bytes: int = 4800,   # ~80% of Discord 6k limit for headroom
+    max_field_bytes: int = 720,    # conservative per-field cap (<= 1024 hard limit)
+    max_fields: int = 24
+) -> None:
+    """
+    Split `lines` across multiple fields without exceeding Discord limits.
+    If we run out of space, append a '(truncated)' notice.
+    """
+    def can_add(name: str, value: str) -> bool:
+        return _embed_bytes(embed) + _utf8_len(name) + _utf8_len(value) <= max_total_bytes
+
+    part = 1
+    chunk: List[str] = []
+    chunk_bytes = 0
+
+    def flush_chunk() -> bool:
+        nonlocal part, chunk, chunk_bytes
+        if not chunk:
+            return True
+        name = f"{title_prefix} {part}"
+        value = "\n".join(chunk)
+        if len(embed.fields) >= max_fields or not can_add(name, value):
+            remaining = len(lines_iter)
+            embed.add_field(
+                name="(truncated)",
+                value=f"…{remaining} more lines — see adm_snapshot.txt",
+                inline=False
+            )
+            return False
+        embed.add_field(name=name, value=value, inline=False)
+        part += 1
+        chunk, chunk_bytes = [], 0
+        return True
+
+    # iterate with an indexable view for “remaining” count on truncation
+    lines_iter = list(lines)
+    i = 0
+    while i < len(lines_iter):
+        ln = lines_iter[i]
+        ln_b = _utf8_len(ln) + 1  # + newline
+        if chunk and (chunk_bytes + ln_b > max_field_bytes):
+            if not flush_chunk():
+                return
+            continue
+        chunk.append(ln)
+        chunk_bytes += ln_b
+        i += 1
+
+    flush_chunk()
 # -----------------------------------------------------------------------------
 
 
@@ -602,52 +667,7 @@ class TraceCog(commands.Cog):
         else:
             caption += f"\nRange: last {window_hours}h"
 
-        # --------- Embeds: Points and Actions ----------------
-        def _chunk_add(embed: discord.Embed, title_prefix: str, lines: List[str], *, max_total: int = 5800, max_field: int = 900):
-            """
-            Add lines to an embed split across fields while respecting Discord limits:
-              - ~6000 characters per embed (use 5800 for headroom)
-              - ~1024 per field value (use 900 for headroom)
-              - max 25 fields per embed (stop at 24 and add a truncation note)
-            """
-            def current_total(e: discord.Embed) -> int:
-                total = len(e.title or "") + len(e.description or "")
-                for f in e.fields:
-                    total += len(f.name or "") + len(f.value or "")
-                return total
-
-            chunk: List[str] = []
-            chunk_size = 0
-            part = 1
-            i = 0
-            n = len(lines)
-
-            while i < n:
-                ln = lines[i]
-                if chunk_size + len(ln) + 1 > max_field and chunk:
-                    name = f"{title_prefix} {part}"
-                    value = "\n".join(chunk)
-                    if current_total(embed) + len(name) + len(value) > max_total or len(embed.fields) >= 24:
-                        remaining = n - i
-                        embed.add_field(name="(truncated)", value=f"…{remaining} more lines — see adm_snapshot.txt", inline=False)
-                        return
-                    embed.add_field(name=name, value=value, inline=False)
-                    chunk, chunk_size, part = [], 0, part + 1
-                    continue
-
-                chunk.append(ln)
-                chunk_size += len(ln) + 1
-                i += 1
-
-            if chunk:
-                name = f"{title_prefix} {part}"
-                value = "\n".join(chunk)
-                if current_total(embed) + len(name) + len(value) > max_total or len(embed.fields) >= 24:
-                    embed.add_field(name="(truncated)", value="…more lines — see adm_snapshot.txt", inline=False)
-                else:
-                    embed.add_field(name=name, value=value, inline=False)
-
-        # points list
+        # --------- Embeds: Points and Actions (byte-safe) ---------------
         points_embed = discord.Embed(title="Trace points (click to open in iZurvive)")
         point_lines: List[str] = []
         n = len(points)
@@ -667,11 +687,12 @@ class TraceCog(commands.Cog):
                 pass
             url = _izurvive_url(map_name, x, z)
             point_lines.append(f"{idx}. [{x:.1f}, {z:.1f}]({url}) — {tag} {ts_s}")
-        _chunk_add(points_embed, "Points", point_lines)
+
+        _add_chunked_bytes(points_embed, "Points", point_lines)
 
         embeds: List[discord.Embed] = [points_embed]
 
-        # actions list + snapshot
+        # actions list + snapshot (prefer raw ADM lines)
         snapshot_lines: List[str] = []
         if actions:
             action_lines: List[str] = []
@@ -699,7 +720,8 @@ class TraceCog(commands.Cog):
                     pass
 
                 pretty = kind.capitalize()
-                action_lines.append(f"• {pretty}: {link}{use_desc} {tss}".strip())
+                # Use ASCII dash instead of bullet to save bytes
+                action_lines.append(f"- {pretty}: {link}{use_desc} {tss}".strip())
 
                 # Snapshot prefers verbatim ADM line
                 hhmmss = tss.split(" ")[0] if tss else "--:--:--"
@@ -714,8 +736,8 @@ class TraceCog(commands.Cog):
                         coord_txt = ""
                     snapshot_lines.append(f"{hhmmss} | {pretty:<12} | {use_desc or '-'}{coord_txt}")
 
-            actions_embed = discord.Embed(title=f"Actions snapshot ({len(actions)})")
-            _chunk_add(actions_embed, "Actions", action_lines)
+            actions_embed = discord.Embed(title=f"Actions snapshot ({len(actions)}) — full details in file")
+            _add_chunked_bytes(actions_embed, "Actions", action_lines)
             embeds.append(actions_embed)
 
         # If still nothing actionable, fall back to POS
@@ -737,6 +759,7 @@ class TraceCog(commands.Cog):
                 hhmmss = tss.split(" ")[0] if tss else "--:--:--"
                 snapshot_lines.append(f"{hhmmss} | {'POS':<12} | position update{coord_txt}")
 
+        # Build the txt attachment content (always complete)
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         hdr = f"***** ADM Snapshot — {now_utc} *****\n"
         if dt_start:
