@@ -1,3 +1,5 @@
+like this?? 
+
 # cogs/bounty.py — /svbounty end-to-end (set + auto-updater + award on kill)
 from __future__ import annotations
 
@@ -333,7 +335,13 @@ def _coords_link_text(map_key: str, x: float, z: float) -> str:
 
 # ----------------------------- DB helpers ------------------------------------
 def _db() -> dict:
-    return load_file(BOUNTIES_DB) or {"open": [], "closed": []}
+    data = load_file(BOUNTIES_DB)
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            data = None
+    return data if isinstance(data, dict) else {"open": [], "closed": []}
 
 def _save_db(doc: dict):
     save_file(BOUNTIES_DB, doc)
@@ -740,6 +748,33 @@ class BountyUpdater:
                         b["pl_absent"] = int(b.get("pl_absent", 0)) + 1
                     _log("PL tick", gid=gid, target=tgt, in_pl=bool(coords_from_pl), misses=b["pl_absent"])
 
+                # If we've seen consecutive PlayerList snapshots and target keeps missing, infer offline once.
+                if (
+                    b.get("online", True)
+                    and not coords_from_pl
+                    and int(b.get("pl_absent", 0)) >= PL_ABSENCE_THRESHOLD
+                    and b.get("last_state_announce") != "offline"
+                ):
+                    lx = lz = None
+                    lc = b.get("last_coords") or {}
+                    try:
+                        lx, lz = float(lc.get("x")), float(lc.get("z"))
+                    except Exception:
+                        lx = lz = None
+                    if lx is None or lz is None:
+                        _, track = load_track(tgt, window_hours=48, max_points=1)
+                        if track and track.get("points"):
+                            pt = track["points"][-1]
+                            try: lx, lz = float(pt["x"]), float(pt["z"])
+                            except Exception: lx = lz = None
+                    try: await _announce_offline(self.bot, gid, tgt, lx, lz)
+                    except Exception: pass
+                    b["online"] = False
+                    b["last_state_announce"] = "offline"
+                    _save_db(doc)
+                    _log("presence: OFFLINE by PL absence", gid=gid, target=tgt, misses=b["pl_absent"])
+                    continue
+
                 # ---------- PRESENCE PRECEDENCE ----------
                 if latest_state == "disconnected":
                     if b.get("last_state_announce") != "offline":
@@ -937,7 +972,7 @@ async def _announce_online(bot: commands.Bot, gid: int, name: str):
         return
     try:
         await ch.send(
-            f"🟢 **{name}** is back **online** — tracking resumed. "
+            f"<a:on:1388954436738617565> **{name}** is back **online** — tracking resumed. "
             f"Next update will appear on the next PlayerList refresh."
         )
     except Exception:
@@ -972,7 +1007,7 @@ async def _announce_offline(bot: commands.Bot, gid: int, name: str, x: Optional[
             buf.seek(0)
             fname = _safe_png_name(f"{name}_offline_last_known")
             embed = discord.Embed(
-                title=f"🔴 {name} disconnected",
+                title=f"<a:off:1388954013885530333> {name} disconnected",
                 description=f"Last known location: {coords_md}",
                 color=discord.Color.red(),
                 timestamp=datetime.now(timezone.utc),
@@ -980,7 +1015,7 @@ async def _announce_offline(bot: commands.Bot, gid: int, name: str, x: Optional[
             embed.set_image(url=f"attachment://{fname}")
             await ch.send(file=discord.File(fp=buf, filename=fname), embed=embed)
         else:
-            await ch.send(f"🔴 **{name}** has **disconnected**. Last known location: {coords_md}.")
+            await ch.send(f"<a:off:1388954013885530333> **{name}** has **disconnected**. Last known location: {coords_md}.")
     except Exception:
         pass
 
@@ -1090,8 +1125,10 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
             for b in list(open_bounties):
                 if _norm(b.get("target_gamertag", "")) != _norm(victim):
                     continue
-                floor = b.get("kill_floor_ts") or "00:00:00"
-                if not ts or ts < floor:
+                floor_ts = b.get("kill_floor_ts") or "00:00:00"
+                floor_idx = int(b.get("kill_floor_line", 0))
+                # Ignore retro kills: before the bounty line AND (conservatively) before the time floor
+                if (idx < floor_idx) or (ts and ts < floor_ts):
                     # Retroactive kill (before the bounty was created) — ignore
                     continue
 
@@ -1106,7 +1143,9 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
                 if not did:
                     did, _ = resolve_from_any(guild_id, discord_id=killer)
                 if did:
-                    _adjust_tickets(guild_id, str(did), +tickets)
+                    ok, nb = _adjust_tickets(guild_id, str(did), +tickets)
+                    if not ok:
+                        _log("award failed (wallet entry missing?)", gid=guild_id, killer_discord_id=str(did), tickets=tickets)
 
                 try:
                     doc["open"].remove(b)
@@ -1115,10 +1154,10 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
                 changed = True
 
                 # Announce with map (if we have coords)
-                x = y = None
+                x = z = None
                 if xy:
-                    x, y = xy
-                await _announce_claim_with_map(bot, guild_id, victim, killer, tickets, x, y)
+                    x, z = xy
+                await _announce_claim_with_map(bot, guild_id, victim, killer, tickets, x, z)
 
         if changed:
             _save_db(doc)
@@ -1340,6 +1379,7 @@ class BountyCog(commands.Cog):
         # Capture ADM "clock floor" so retroactive kills don't claim this bounty
         lines_now = _read_adm_lines(gid_hint=gid)
         floor_ts = _max_clock(lines_now) or "00:00:00"
+        floor_idx = len(lines_now)
 
         # Create/open bounty record
         rec = {
@@ -1364,7 +1404,8 @@ class BountyCog(commands.Cog):
             "bootstrapped_status": False,
             # New bits:
             "needs_first_snapshot": True,    # force one combined post including this target
-            "kill_floor_ts": floor_ts,       # kills must be at/after this HH:MM:SS
+            "kill_floor_ts": floor_ts,       # kills must be at/after this HH:MM:SS (best-effort)
+            "kill_floor_line": floor_idx,    # ...and at/after this line index (midnight-safe)
         }
         bdoc = _db()
         for b in bdoc["open"]:
@@ -1390,11 +1431,11 @@ class BountyCog(commands.Cog):
             try:
                 pretty_reason = rec["reason"] or "_no reason provided_"
                 await ch.send(
-                    "📢 **Attention survivors!**\n"
+                    "<a:1364368670322851933:1381409288160936116> **Attention survivors!**\n"
                     f"A new bounty has been set for **{target_gt}** by <@{inv_id}> for **{tickets} SV tickets**.\n"
                     f"**Reason:** {pretty_reason}\n"
-                    "Live updates will appear below. First post shows last known location; "
-                    "subsequent updates will appear when the PlayerList refreshes.\n"
+                    "Live updates will appear below. Every post shows the last known location; "
+                    "subsequent updates will appear every 10 minutes.\n"
                     "**Stay Frosty!**"
                 )
             except Exception as e:
@@ -1405,13 +1446,26 @@ class BountyCog(commands.Cog):
         except Exception as e:
             _log("immediate update failed", guild_id=gid, err=repr(e))
 
-    @app_commands.command(name="svbounty_remove", description="Remove an active bounty by user or gamertag.")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.command(name="svbounty_remove", description="(Admin) Remove an active bounty by user or gamertag.")
     async def svbounty_remove(
         self,
         interaction: discord.Interaction,
         user: Optional[discord.Member] = None,
-        gamertag: Optional[str] = None
+        gamertag: Optional[str] = None,
     ):
+        # hard gate even if Discord hasn’t propagated default perms yet
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    
+        # (optional but recommended) keep it to the bounty channel
+        settings = _guild_settings(interaction.guild_id)
+        bounty_channel_id = int(settings.get("bounty_channel_id") or 0)
+        if interaction.channel_id != bounty_channel_id:
+            where = f"<#{bounty_channel_id}>" if bounty_channel_id else "`the configured bounty channel`"
+            return await interaction.response.send_message(f"⚠️ This command only works in {where}.", ephemeral=True)
+    
         await interaction.response.defer(ephemeral=True)
         if user:
             n = remove_bounty_by_discord_id(str(user.id))
@@ -1420,6 +1474,136 @@ class BountyCog(commands.Cog):
             n = remove_bounty_by_gamertag(gamertag)
             return await interaction.followup.send(f"Removed **{n}** bounty(ies) for `{gamertag}`.", ephemeral=True)
         await interaction.followup.send("Provide `user` or `gamertag`.", ephemeral=True)
+    
+    
+    @app_commands.guild_only()
+    @app_commands.command(name="bounty_pay", description="Pay off a bounty (cost: 2× current bounty).")
+    @app_commands.describe(
+        user="Pick the Discord user (if linked)",
+        gamertag="Or type the exact in-game gamertag (digits immediately after the name, no space)",
+    )
+    async def bounty_pay(
+        self,
+        interaction: discord.Interaction,
+        user: Optional[discord.Member] = None,
+        gamertag: Optional[str] = None,
+    ):
+        gid = interaction.guild_id
+        if not gid:
+            return await interaction.response.send_message("❌ Guild-only command.", ephemeral=True)
+    
+        # Enforce channel gating BEFORE deferring the interaction
+        settings = _guild_settings(gid)
+        bounty_channel_id = int(settings.get("bounty_channel_id") or 0)
+        if not bounty_channel_id:
+            return await interaction.response.send_message(
+                "⚠️ No bounty channel is configured yet. Ask an admin to run `/setchannels`.",
+                ephemeral=True,
+            )
+        if interaction.channel_id != bounty_channel_id:
+            where = f"<#{bounty_channel_id}>"
+            return await interaction.response.send_message(
+                f"⚠️ This command can only be used in {where}. Please rerun it there.",
+                ephemeral=True,
+            )
+    
+        await interaction.response.defer(ephemeral=True)
+    
+        # Resolve the target
+        target_gt: Optional[str] = None
+        target_discord_id: Optional[str] = None
+        if user:
+            did, gt = resolve_from_any(gid, discord_id=str(user.id))
+            if not gt:
+                return await interaction.followup.send("❌ That Discord user isn’t linked.", ephemeral=True)
+            target_discord_id, target_gt = (str(did) if did else None), gt
+        elif gamertag:
+            did, gt = resolve_from_any(gid, gamertag=gamertag)
+            target_discord_id, target_gt = (str(did) if did else None), (gt or gamertag)
+        else:
+            return await interaction.followup.send("❌ Provide `user` or `gamertag`.", ephemeral=True)
+    
+        # Find the open bounty
+        doc = _db()
+        ob = None
+        for b in doc.get("open", []):
+            if int(b.get("guild_id", 0)) != gid:
+                continue
+            if _norm(b.get("target_gamertag", "")) == _norm(target_gt or ""):
+                ob = b
+                break
+        if not ob:
+            return await interaction.followup.send(f"❌ No active bounty found for `{target_gt}`.", ephemeral=True)
+    
+        # Cost is 2× the current bounty
+        base = int(ob.get("tickets", 0))
+        cost = base * 2
+    
+        payer_id = str(interaction.user.id)
+        ok, bal_after = _adjust_tickets(gid, payer_id, -cost)
+        if not ok:
+            cur, *_ = _get_user_balance(gid, payer_id)
+            return await interaction.followup.send(
+                f"❌ Not enough SV tickets. Cost is **{cost}** (2× bounty {base}); your balance is **{cur}**.",
+                ephemeral=True,
+            )
+    
+        # Remove bounty and save
+        try:
+            doc["open"].remove(ob)
+        except Exception:
+            pass
+        _save_db(doc)
+    
+        # Private confirmation
+        await interaction.followup.send(
+            f"✅ You paid **{cost}** SV tickets and cleared the bounty on **{target_gt}**. "
+            f"Your new balance: **{bal_after}**.",
+            ephemeral=True,
+        )
+    
+        # Public announcement in bounty channel
+        ch = self.bot.get_channel(bounty_channel_id)
+        if isinstance(ch, (discord.TextChannel, discord.Thread)):
+            try:
+                await ch.send(
+                    "📢 **Bounty paid off!**\n"
+                    f"The bounty on **{target_gt}** was cleared by <@{payer_id}> for **{cost}** SV tickets "
+                    f"(2× the posted **{base}**). The slate is clean."
+                )
+            except Exception:
+                pass
+    
+    
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.command(name="clear", description="(Admin) Clear the last 20 messages in the bounty channel.")
+    async def clear(self, interaction: discord.Interaction):
+        gid = interaction.guild_id
+        if not gid:
+            return await interaction.response.send_message("❌ Guild-only command.", ephemeral=True)
+    
+        # Hard gate (covers cases where Discord hasn't refreshed default perms yet)
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    
+        settings = _guild_settings(gid)
+        bounty_channel_id = int(settings.get("bounty_channel_id") or 0)
+        if interaction.channel_id != bounty_channel_id:
+            where = f"<#{bounty_channel_id}>" if bounty_channel_id else "`the configured bounty channel`"
+            return await interaction.response.send_message(f"⚠️ This command only works in {where}.", ephemeral=True)
+    
+        ch = interaction.channel
+        if not isinstance(ch, discord.TextChannel):
+            return await interaction.response.send_message("❌ Not a text channel.", ephemeral=True)
+    
+        try:
+            await interaction.response.send_message("🧹 Clearing the last 20 messages…", ephemeral=True)
+            deleted = await ch.purge(limit=20)
+            await ch.send(f"🧹 Cleared **{len(deleted)}** messages.", delete_after=5)
+        except Exception as e:
+            _log("clear failed", gid=gid, err=repr(e))
+            await interaction.followup.send("❌ I couldn't clear messages (permissions?).", ephemeral=True)
 
     # ------------------ Background loops owned by the Cog ------------------
     @tasks.loop(minutes=10.0)
