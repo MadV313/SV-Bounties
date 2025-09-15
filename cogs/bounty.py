@@ -339,7 +339,13 @@ def _db() -> dict:
             data = json.loads(data)
         except Exception:
             data = None
-    return data if isinstance(data, dict) else {"open": [], "closed": []}
+    doc = data if isinstance(data, dict) else {}
+    # Ensure both keys always exist
+    if "open" not in doc or not isinstance(doc["open"], list):
+        doc["open"] = []
+    if "closed" not in doc or not isinstance(doc["closed"], list):
+        doc["closed"] = []
+    return doc
 
 def _save_db(doc: dict):
     save_file(BOUNTIES_DB, doc)
