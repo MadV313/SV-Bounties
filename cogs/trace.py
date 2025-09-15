@@ -94,8 +94,7 @@ def _resolve_asset(rel_path: str) -> Path | None:
         except Exception:
             continue
     return None
-
-
+    
 def _active_map_name(guild_id: int | None) -> str:
     s = load_settings(guild_id) if guild_id else {}
     return (s.get("active_map") or "Livonia").strip()
@@ -137,7 +136,8 @@ def _load_map_image(gid: int | None, map_name: str, size_px: int = 1400) -> Imag
                     canvas.paste(img, (ox, oy))
                     img = canvas
                 _log(gid, "map image loaded", {"map": map_name, "path": str(abs_path)})
-                return img.resize((size_px, size_px), Image.BICUBIC)
+                RESAMPLE = getattr(getattr(Image, "Resampling", Image), "BICUBIC")
+                return img.resize((size_px, size_px), RESAMPLE)
             except Exception as e:
                 _log(gid, "map open failed; using fallback", {"map": map_name, "path": str(abs_path), "error": repr(e)})
         else:
@@ -264,9 +264,10 @@ def _render_trace_png(
 
 
 class TraceCog(commands.Cog):
-    def __init__(self, bot):
+    def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    @app_commands.guild_only()
     @app_commands.command(name="trace", description="Render a player's movement path")
     @app_commands.describe(
         user="Discord user (optional if you provide gamertag)",
@@ -284,6 +285,15 @@ class TraceCog(commands.Cog):
         end: str | None = None,
         window_hours: int | None = 24
     ):
+        # Enforce admin channel if configured (do this BEFORE deferring)
+        gid = interaction.guild_id
+        st = load_settings(gid) if gid else {}
+        admin_ch_id = int(st.get("admin_channel_id") or 0)
+        if admin_ch_id and interaction.channel_id != admin_ch_id:
+            where = f"<#{admin_ch_id}>"
+            return await interaction.response.send_message(
+                f"⚠️ Please run this in {where}.", ephemeral=True
+            )
         await interaction.response.defer(thinking=True, ephemeral=True)
 
         guild_id = interaction.guild_id
@@ -490,11 +500,17 @@ class TraceCog(commands.Cog):
             part = 1
             for ln in lines:
                 if size + len(ln) + 1 > 1000 and chunk:
+                    if len(embed.fields) >= 24:
+                        embed.add_field(name="(truncated)", value="…too many lines to display.", inline=False)
+                        return
                     embed.add_field(name=f"{title_prefix} {part}", value="\n".join(chunk), inline=False)
                     chunk, size, part = [], 0, part + 1
                 chunk.append(ln)
                 size += len(ln) + 1
             if chunk:
+                if len(embed.fields) >= 24:
+                    embed.add_field(name="(truncated)", value="…too many lines to display.", inline=False)
+                    return
                 embed.add_field(name=f"{title_prefix} {part}", value="\n".join(chunk), inline=False)
 
         _add_chunked(points_embed, "Points", point_lines)
@@ -594,7 +610,7 @@ class TraceCog(commands.Cog):
                     _log(guild_id, "failed posting to admin channel", {"error": repr(e)})
 
         # Fallback to replying in the invoking channel
-        await interaction.followup.send(caption, files=[map_file, snapshot_file], embeds=embeds)
+        await interaction.followup.send(caption, files=[map_file, snapshot_file], embeds=embeds, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
