@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import re
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple, Optional
@@ -20,6 +21,12 @@ try:
     from tracer.tracker import load_actions  # type: ignore
 except Exception:  # pragma: no cover
     load_actions = None  # we'll just skip if unavailable
+
+# We’ll use storageClient to read a local/remote copy of the latest ADM if present.
+try:
+    from utils.storageClient import load_file  # type: ignore
+except Exception:
+    load_file = None  # handled gracefully below
 
 
 # ----------------------- tiny logger -----------------------
@@ -94,7 +101,8 @@ def _resolve_asset(rel_path: str) -> Path | None:
         except Exception:
             continue
     return None
-    
+
+
 def _active_map_name(guild_id: int | None) -> str:
     s = load_settings(guild_id) if guild_id else {}
     return (s.get("active_map") or "Livonia").strip()
@@ -121,7 +129,7 @@ def _world_to_image(x: float, z: float, world_size: int, img_size: int) -> Tuple
         return 0, 0
 
 
-def _load_map_image(gid: int | None, map_name: str, size_px: int = 1400) -> Image.Image:
+def _load_map_image(gid: int | None, map_name: str, size_px: int = 1200) -> Image.Image:
     rel = MAP_PATHS.get(map_name.lower())
     if rel:
         abs_path = _resolve_asset(rel)
@@ -150,7 +158,7 @@ def _load_map_image(gid: int | None, map_name: str, size_px: int = 1400) -> Imag
     step = side // 10
     for k in range(0, side + 1, step):
         drw.line([(k, 0), (k, side)], fill=(40, 40, 46, 255), width=1)
-        drw.line([(0, k), (side, k)], fill=(40, 40, 46, 255), width=1)
+        drw.line([(0, k), (0 + side, k)], fill=(40, 40, 46, 255), width=1)
     try:
         font = ImageFont.truetype("arial.ttf", 24)
     except Exception:
@@ -181,6 +189,135 @@ def _action_color(kind: str) -> Tuple[int, int, int, int]:
     if "connect" in k or "disconnect" in k:
         return (160, 160, 160, 255)     # gray
     return (255, 165, 0, 255)           # orange fallback
+
+
+# ------------------- Fallback ADM scanner -------------------
+# Parses data/latest_adm.log (or remote mapped to that path by storageClient)
+# and returns actions for the specific player & window. Each action includes:
+#   - ts (datetime ISO)
+#   - type (simple category)
+#   - desc (verbatim message)
+#   - x, z (if parseable)
+#   - raw (full original line)
+ADM_DEFAULT_PATH = "data/latest_adm.log"
+
+_TIME_RE = re.compile(r"^\s*(\d{2}:\d{2}:\d{2})\s*\|\s*", re.I)
+_NAME_RE = r'Player\s+"(?P<name>[^"]+)"'
+_POS_RE = re.compile(r'pos\s*=\s*<\s*(?P<x>-?\d+(?:\.\d+)?)[,\s]+(?P<z>-?\d+(?:\.\d+)?)[,\s]+(?P<y>-?\d+(?:\.\d+)?)\s*>', re.I)
+
+def _classify(line: str) -> str:
+    l = line.lower()
+    if "is connected" in l:
+        return "connect"
+    if "has been disconnected" in l:
+        return "disconnect"
+    if "placed" in l:
+        return "placed"
+    if "teleported" in l:
+        return "teleport"
+    if "hit by" in l or "is unconscious" in l or "regained consciousness" in l or "was killed by" in l:
+        return "combat"
+    if "performed" in l or "emote" in l:
+        return "emote"
+    return "event"
+
+def _extract_time(utc_date: datetime, line: str) -> Optional[datetime]:
+    m = _TIME_RE.search(line)
+    if not m:
+        return None
+    hh, mm, ss = m.group(1).split(":")
+    dt = utc_date.replace(hour=int(hh), minute=int(mm), second=int(ss), microsecond=0)
+    return dt
+
+def _extract_coords(line: str) -> Tuple[Optional[float], Optional[float]]:
+    m = _POS_RE.search(line)
+    if not m:
+        return None, None
+    try:
+        x = float(m.group("x"))
+        z = float(m.group("z"))
+        return x, z
+    except Exception:
+        return None, None
+
+def _fallback_load_actions(
+    gid: int | None,
+    gamertag: str,
+    start: Optional[datetime],
+    end: Optional[datetime],
+    window_hours: Optional[int],
+    max_lines: int = 25000
+) -> List[Dict[str, Any]]:
+    """
+    Read latest ADM and extract raw action lines for a single player.
+    Notes:
+    - We assume ADM timestamps are UTC (as per Nitrado UI). We align date to 'today' UTC.
+    - If start/end provided we filter; else we use window_hours from now.
+    """
+    if load_file is None:
+        _log(gid, "storageClient unavailable; cannot fallback-scan ADM")
+        return []
+
+    # Load text (handles local/remote based on your existing storageClient setup)
+    try:
+        txt = load_file(ADM_DEFAULT_PATH) or ""
+        if isinstance(txt, (bytes, bytearray)):
+            txt = txt.decode("utf-8", errors="ignore")
+    except Exception as e:
+        _log(gid, "failed to read latest_adm.log", {"error": repr(e)})
+        return []
+
+    if not txt:
+        return []
+
+    # Time window
+    now = datetime.now(timezone.utc)
+    if start and end:
+        win_start, win_end = start, end
+    else:
+        hours = window_hours or 24
+        win_end = now
+        win_start = now - timedelta(hours=hours)
+
+    # Best-effort date pairing for HH:MM:SS in ADM
+    # If ADM spans multiple days, we won't try to infer day flips; good enough for 24–48h windows.
+    date_for_ts = now.astimezone(timezone.utc)
+
+    # Name match (quoted)
+    name_pat = re.compile(rf'{_NAME_RE}'.replace("(?P<name>[^\"]+)", re.escape(gamertag)), re.I)
+
+    actions: List[Dict[str, Any]] = []
+    lines = txt.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+
+    for ln in lines:
+        if "Player " not in ln:
+            continue
+        if not name_pat.search(ln):
+            continue
+
+        ts = _extract_time(date_for_ts, ln)
+        if ts:
+            if not (win_start <= ts <= win_end):
+                continue
+        # If time can’t be parsed, keep it (rare); we’ll include with no ts filter.
+
+        kind = _classify(ln)
+        x, z = _extract_coords(ln)
+
+        actions.append({
+            "ts": ts.isoformat() if ts else None,
+            "type": kind,
+            "desc": ln.split("|", 1)[-1].strip(),  # everything after the first pipe
+            "x": x,
+            "z": z,
+            "raw": ln.strip(),
+        })
+
+    _log(gid, "fallback actions parsed", {"count": len(actions)})
+    return actions
+# -----------------------------------------------------------
 
 
 def _render_trace_png(
@@ -251,6 +388,8 @@ def _render_trace_png(
             try:
                 x, z = float(a.get("x")), float(a.get("z"))
             except Exception:
+                continue
+            if x is None or z is None:
                 continue
             px, py = _world_to_image(x, z, world_size, W)
             color = _action_color(str(a.get("type") or a.get("kind") or "event"))
@@ -430,6 +569,16 @@ class TraceCog(commands.Cog):
             except Exception as e:
                 _log(guild_id, "load_actions raised", {"error": repr(e)})
 
+        # Fallback to direct ADM scan if none found
+        if not actions:
+            actions = _fallback_load_actions(
+                gid=guild_id,
+                gamertag=resolved_tag,
+                start=dt_start,
+                end=dt_end if dt_start else None,
+                window_hours=window_hours if not dt_start else None,
+            )
+
         # ------------------- render image --------------------
         try:
             img_buf = _render_trace_png(doc, guild_id=guild_id, actions=actions)
@@ -523,7 +672,11 @@ class TraceCog(commands.Cog):
             action_lines: List[str] = []
             for a in actions:
                 kind = str(a.get("type") or a.get("kind") or "event")
+                # Prefer raw ADM line for description in the snapshot
+                raw = str(a.get("raw") or "").strip()
                 desc = str(a.get("desc") or a.get("message") or a.get("detail") or "").strip()
+                use_desc = desc if desc else raw
+
                 x = a.get("x")
                 z = a.get("z")
                 link = ""
@@ -542,18 +695,22 @@ class TraceCog(commands.Cog):
                     pass
 
                 pretty = kind.capitalize()
-                text = f"• {pretty}: {link}{desc} {tss}".strip()
+                # Embed list line
+                text = f"• {pretty}: {link}{use_desc} {tss}".strip()
                 action_lines.append(text)
 
-                # Snapshot (monospace-ish) line
+                # Snapshot (monospace-ish) line — include verbatim ADM when we have it
                 hhmmss = tss.split(" ")[0] if tss else "--:--:--"
-                coord_txt = ""
-                try:
-                    if x is not None and z is not None:
-                        coord_txt = f" ({float(x):.1f},{float(z):.1f})"
-                except Exception:
+                if raw:
+                    snapshot_lines.append(f"{hhmmss} | {raw}")
+                else:
                     coord_txt = ""
-                snapshot_lines.append(f"{hhmmss} | {pretty:<12} | {desc or '-'}{coord_txt}")
+                    try:
+                        if x is not None and z is not None:
+                            coord_txt = f" ({float(x):.1f},{float(z):.1f})"
+                    except Exception:
+                        coord_txt = ""
+                    snapshot_lines.append(f"{hhmmss} | {pretty:<12} | {use_desc or '-'}{coord_txt}")
 
             actions_embed = discord.Embed(title=f"Actions snapshot ({len(actions)})")
             _add_chunked(actions_embed, "Actions", action_lines)
