@@ -20,13 +20,13 @@ from tracer.tracker import load_track
 try:
     from tracer.tracker import load_actions  # type: ignore
 except Exception:  # pragma: no cover
-    load_actions = None  # we'll just skip if unavailable
+    load_actions = None
 
-# We’ll use storageClient to read a local/remote copy of the latest ADM if present.
+# Optional storage client (supports local/remote)
 try:
     from utils.storageClient import load_file  # type: ignore
 except Exception:
-    load_file = None  # handled gracefully below
+    load_file = None
 
 
 # ----------------------- tiny logger -----------------------
@@ -158,7 +158,7 @@ def _load_map_image(gid: int | None, map_name: str, size_px: int = 1200) -> Imag
     step = side // 10
     for k in range(0, side + 1, step):
         drw.line([(k, 0), (k, side)], fill=(40, 40, 46, 255), width=1)
-        drw.line([(0, k), (0 + side, k)], fill=(40, 40, 46, 255), width=1)
+        drw.line([(0, k), (side, k)], fill=(40, 40, 46, 255), width=1)
     try:
         font = ImageFont.truetype("arial.ttf", 24)
     except Exception:
@@ -192,18 +192,17 @@ def _action_color(kind: str) -> Tuple[int, int, int, int]:
 
 
 # ------------------- Fallback ADM scanner -------------------
-# Parses data/latest_adm.log (or remote mapped to that path by storageClient)
-# and returns actions for the specific player & window. Each action includes:
-#   - ts (datetime ISO)
-#   - type (simple category)
-#   - desc (verbatim message)
-#   - x, z (if parseable)
-#   - raw (full original line)
-ADM_DEFAULT_PATH = "data/latest_adm.log"
+ADM_CANDIDATES = [
+    "data/latest_adm.log",
+    "latest_adm.log",
+    "logs/latest_adm.log",
+]
 
 _TIME_RE = re.compile(r"^\s*(\d{2}:\d{2}:\d{2})\s*\|\s*", re.I)
-_NAME_RE = r'Player\s+"(?P<name>[^"]+)"'
-_POS_RE = re.compile(r'pos\s*=\s*<\s*(?P<x>-?\d+(?:\.\d+)?)[,\s]+(?P<z>-?\d+(?:\.\d+)?)[,\s]+(?P<y>-?\d+(?:\.\d+)?)\s*>', re.I)
+_POS_RE = re.compile(
+    r'pos\s*=\s*<\s*(?P<x>-?\d+(?:\.\d+)?)[,\s]+(?P<z>-?\d+(?:\.\d+)?)[,\s]+(?P<y>-?\d+(?:\.\d+)?)\s*>',
+    re.I,
+)
 
 def _classify(line: str) -> str:
     l = line.lower()
@@ -226,19 +225,47 @@ def _extract_time(utc_date: datetime, line: str) -> Optional[datetime]:
     if not m:
         return None
     hh, mm, ss = m.group(1).split(":")
-    dt = utc_date.replace(hour=int(hh), minute=int(mm), second=int(ss), microsecond=0)
-    return dt
+    return utc_date.replace(hour=int(hh), minute=int(mm), second=int(ss), microsecond=0)
 
 def _extract_coords(line: str) -> Tuple[Optional[float], Optional[float]]:
     m = _POS_RE.search(line)
     if not m:
         return None, None
     try:
-        x = float(m.group("x"))
-        z = float(m.group("z"))
-        return x, z
+        return float(m.group("x")), float(m.group("z"))
     except Exception:
         return None, None
+
+def _read_text_candidates(gid: int | None, guild_settings: dict) -> str:
+    """Try multiple sources to read the latest ADM content."""
+    # Admin may override via settings in the future
+    custom = (guild_settings or {}).get("adm_latest_path")
+    paths = ADM_CANDIDATES.copy()
+    if custom and custom not in paths:
+        paths.insert(0, custom)
+
+    # Try storageClient first (respects your external base), then local files
+    for p in paths:
+        # storageClient
+        if load_file is not None:
+            try:
+                blob = load_file(p)
+                if blob:
+                    if isinstance(blob, (bytes, bytearray)):
+                        return blob.decode("utf-8", errors="ignore")
+                    return str(blob)
+            except Exception as e:
+                _log(gid, "storageClient load failed", {"path": p, "error": repr(e)})
+
+        # local disk fallback
+        try:
+            fp = Path(p)
+            if fp.exists() and fp.is_file():
+                return fp.read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            _log(gid, "local read failed", {"path": p, "error": repr(e)})
+
+    return ""
 
 def _fallback_load_actions(
     gid: int | None,
@@ -246,45 +273,34 @@ def _fallback_load_actions(
     start: Optional[datetime],
     end: Optional[datetime],
     window_hours: Optional[int],
+    guild_settings: dict,
     max_lines: int = 25000
 ) -> List[Dict[str, Any]]:
     """
     Read latest ADM and extract raw action lines for a single player.
-    Notes:
-    - We assume ADM timestamps are UTC (as per Nitrado UI). We align date to 'today' UTC.
-    - If start/end provided we filter; else we use window_hours from now.
+    Accepts both quoted and unquoted name forms.
     """
-    if load_file is None:
-        _log(gid, "storageClient unavailable; cannot fallback-scan ADM")
-        return []
-
-    # Load text (handles local/remote based on your existing storageClient setup)
-    try:
-        txt = load_file(ADM_DEFAULT_PATH) or ""
-        if isinstance(txt, (bytes, bytearray)):
-            txt = txt.decode("utf-8", errors="ignore")
-    except Exception as e:
-        _log(gid, "failed to read latest_adm.log", {"error": repr(e)})
-        return []
-
+    txt = _read_text_candidates(gid, guild_settings)
     if not txt:
+        _log(gid, "no ADM text available for fallback scan")
         return []
 
-    # Time window
+    # Build tolerant name matcher:
+    # matches: Player "Majoreq2208" ...  OR  Player Majoreq2208 ...
+    name_pat = re.compile(
+        rf'Player\s+(?:"{re.escape(gamertag)}"|{re.escape(gamertag)})\b',
+        re.I,
+    )
+
     now = datetime.now(timezone.utc)
     if start and end:
         win_start, win_end = start, end
     else:
-        hours = window_hours or 24
+        hrs = window_hours or 24
         win_end = now
-        win_start = now - timedelta(hours=hours)
+        win_start = now - timedelta(hours=hrs)
 
-    # Best-effort date pairing for HH:MM:SS in ADM
-    # If ADM spans multiple days, we won't try to infer day flips; good enough for 24–48h windows.
     date_for_ts = now.astimezone(timezone.utc)
-
-    # Name match (quoted)
-    name_pat = re.compile(rf'{_NAME_RE}'.replace("(?P<name>[^\"]+)", re.escape(gamertag)), re.I)
 
     actions: List[Dict[str, Any]] = []
     lines = txt.splitlines()
@@ -292,16 +308,14 @@ def _fallback_load_actions(
         lines = lines[-max_lines:]
 
     for ln in lines:
-        if "Player " not in ln:
+        if "Player" not in ln:
             continue
         if not name_pat.search(ln):
             continue
 
         ts = _extract_time(date_for_ts, ln)
-        if ts:
-            if not (win_start <= ts <= win_end):
-                continue
-        # If time can’t be parsed, keep it (rare); we’ll include with no ts filter.
+        if ts and not (win_start <= ts <= win_end):
+            continue
 
         kind = _classify(ln)
         x, z = _extract_coords(ln)
@@ -309,7 +323,7 @@ def _fallback_load_actions(
         actions.append({
             "ts": ts.isoformat() if ts else None,
             "type": kind,
-            "desc": ln.split("|", 1)[-1].strip(),  # everything after the first pipe
+            "desc": ln.split("|", 1)[-1].strip(),
             "x": x,
             "z": z,
             "raw": ln.strip(),
@@ -326,9 +340,7 @@ def _render_trace_png(
     actions: Optional[List[Dict[str, Any]]] = None
 ) -> io.BytesIO:
     """
-    Self-contained renderer:
-      - draws path (start=green, middle=yellow, end=red)
-      - overlays action diamonds (colored by type) when actions supplied
+    Draws path and overlays action diamonds.
     """
     map_name = _active_map_name(guild_id)
     world_size = _world_size_for(map_name)
@@ -350,13 +362,11 @@ def _render_trace_png(
             x, z = float(p.get("x")), float(p.get("z"))
         except Exception:
             continue
-        # Skip near-duplicates for a cleaner path
         if last_xz and (round(x, 1), round(z, 1)) == (round(last_xz[0], 1), round(last_xz[1], 1)):
             continue
         pix.append(_world_to_image(x, z, world_size, W))
         last_xz = (x, z)
 
-    # polyline with subtle outline
     if len(pix) >= 2:
         try:
             drw.line(pix, fill=(0, 0, 0, 140), width=6)
@@ -364,7 +374,6 @@ def _render_trace_png(
             pass
         drw.line(pix, fill=(255, 90, 90, 255), width=3)
 
-    # pins
     if pix:
         _draw_pin(drw, pix[0], (82, 200, 120, 255), r=9)     # start
         for p in pix[1:-1]:
@@ -382,7 +391,6 @@ def _render_trace_png(
                 stroke_fill=(0, 0, 0, 255),
             )
 
-    # actions overlay
     if actions:
         for a in actions:
             try:
@@ -424,21 +432,16 @@ class TraceCog(commands.Cog):
         end: str | None = None,
         window_hours: int | None = 24
     ):
-        # Enforce admin channel if configured (do this BEFORE deferring)
         gid = interaction.guild_id
         st = load_settings(gid) if gid else {}
         admin_ch_id = int(st.get("admin_channel_id") or 0)
         if admin_ch_id and interaction.channel_id != admin_ch_id:
-            where = f"<#{admin_ch_id}>"
             return await interaction.response.send_message(
-                f"⚠️ Please run this in {where}.", ephemeral=True
+                f"⚠️ Please run this in <#{admin_ch_id}>.", ephemeral=True
             )
         await interaction.response.defer(thinking=True, ephemeral=True)
 
-        guild_id = interaction.guild_id
-        invoker_id = getattr(interaction.user, "id", None)
-        _log(guild_id, "command invoked", {
-            "invoker": invoker_id,
+        _log(gid, "command invoked", {
             "channel": interaction.channel_id,
             "args": {
                 "user": getattr(user, "id", None),
@@ -459,29 +462,22 @@ class TraceCog(commands.Cog):
         if gamertag and _clean_tag(gamertag):
             resolved_tag = _clean_tag(gamertag)
             resolved_did = str(user.id) if user else None
-            _log(guild_id, "using provided gamertag (bypassing link lookup)", {"gamertag": resolved_tag})
+            _log(gid, "using provided gamertag", {"gamertag": resolved_tag})
         else:
             did = str(user.id) if user else str(interaction.user.id)
-            _log(guild_id, "resolving via link table", {"discord_id": did})
+            _log(gid, "resolving via link table", {"discord_id": did})
             try:
-                resolved_did, resolved_tag = resolve_from_any(
-                    guild_id, discord_id=did, gamertag=None
-                )
+                resolved_did, resolved_tag = resolve_from_any(gid, discord_id=did, gamertag=None)
             except Exception as e:
-                _log(guild_id, "resolve_from_any raised", {"error": repr(e)})
+                _log(gid, "resolve_from_any raised", {"error": repr(e)})
                 return await interaction.followup.send(
-                    "❌ Internal error while resolving player identity. Check logs.", ephemeral=True
+                    "❌ Internal error while resolving player identity. Check logs.",
+                    ephemeral=True
                 )
-
-        _log(guild_id, "identity result", {
-            "resolved_discord_id": resolved_did,
-            "resolved_gamertag": resolved_tag
-        })
 
         if not resolved_tag:
             return await interaction.followup.send(
-                "❌ Couldn’t resolve that player. "
-                "Provide a **gamertag** in the command or `/link` your Discord first.",
+                "❌ Couldn’t resolve that player. Provide a **gamertag** or `/link` first.",
                 ephemeral=True
             )
 
@@ -492,60 +488,39 @@ class TraceCog(commands.Cog):
         if dt_start:
             if not dt_end or dt_end <= dt_start:
                 dt_end = dt_start + timedelta(hours=1)
-            _log(guild_id, "explicit time range parsed", {
-                "start": dt_start.isoformat(),
-                "end": dt_end.isoformat()
-            })
             window_hours = None
+            _log(gid, "explicit time range", {"start": dt_start.isoformat(), "end": dt_end.isoformat()})
         else:
             if not window_hours:
                 window_hours = 24
-            _log(guild_id, "window mode", {"window_hours": window_hours})
+            _log(gid, "window mode", {"window_hours": window_hours})
 
         # ---------------- load track points ------------------
         try:
             pid, doc = load_track(resolved_tag, window_hours=window_hours, max_points=1000)
         except Exception as e:
-            _log(guild_id, "load_track raised", {"gamertag": resolved_tag, "error": repr(e)})
+            _log(gid, "load_track raised", {"gamertag": resolved_tag, "error": repr(e)})
             return await interaction.followup.send(
                 f"❌ Failed to load track for `{resolved_tag}`. See logs.",
                 ephemeral=True
             )
 
         points = (doc or {}).get("points") if doc else None
-        count = len(points) if points else 0
-        sample = points[:5] if points else []
-        _log(guild_id, "track loaded", {
-            "gamertag": resolved_tag,
-            "player_id": pid,
-            "doc_keys": list(doc.keys()) if isinstance(doc, dict) else None,
-            "point_count": count,
-            "sample": sample
-        })
-
         if not doc or not points:
             return await interaction.followup.send(
                 f"ℹ️ No track points found for `{resolved_tag}` in that window.",
                 ephemeral=True
             )
 
-        # --------------- filter by explicit range ------------
         if dt_start:
             pts: List[Dict[str, Any]] = []
-            dropped = 0
             for p in points:
                 try:
                     ts = datetime.fromisoformat(p["ts"].replace("Z", "+00:00"))
                 except Exception:
-                    dropped += 1
                     continue
                 if dt_start <= ts <= dt_end:
                     pts.append(p)
-            _log(guild_id, "post filter (explicit range)", {
-                "kept": len(pts),
-                "dropped": dropped,
-                "range": {"start": dt_start.isoformat(), "end": dt_end.isoformat()},
-            })
             if not pts:
                 return await interaction.followup.send(
                     f"ℹ️ No points for `{resolved_tag}` in that time range.",
@@ -553,13 +528,11 @@ class TraceCog(commands.Cog):
                 )
             doc = {**doc, "points": pts}
             points = pts
-            count = len(points)
 
         # -------------------- load actions --------------------
         actions: List[Dict[str, Any]] = []
         if load_actions is not None:
             try:
-                # Your tracker can choose to respect start/end or window_hours.
                 actions = load_actions(
                     resolved_tag,
                     start=dt_start,
@@ -567,40 +540,39 @@ class TraceCog(commands.Cog):
                     window_hours=window_hours if not dt_start else None,
                 ) or []
             except Exception as e:
-                _log(guild_id, "load_actions raised", {"error": repr(e)})
+                _log(gid, "load_actions raised", {"error": repr(e)})
 
         # Fallback to direct ADM scan if none found
         if not actions:
             actions = _fallback_load_actions(
-                gid=guild_id,
+                gid=gid,
                 gamertag=resolved_tag,
                 start=dt_start,
                 end=dt_end if dt_start else None,
                 window_hours=window_hours if not dt_start else None,
+                guild_settings=st or {},
             )
 
         # ------------------- render image --------------------
         try:
-            img_buf = _render_trace_png(doc, guild_id=guild_id, actions=actions)
+            img_buf = _render_trace_png(doc, guild_id=gid, actions=actions)
         except Exception as e:
-            _log(guild_id, "internal renderer failed", {"error": repr(e)})
+            _log(gid, "internal renderer failed", {"error": repr(e)})
             return await interaction.followup.send(
                 "❌ Failed to render map image. See logs for details.",
                 ephemeral=True
             )
 
-        _log(guild_id, "render complete", {"points_rendered": count, "actions": len(actions)})
-
         map_file = discord.File(img_buf, filename=f"trace_{doc.get('gamertag','player')}.png")
 
-        # ------- Caption + per-point clickable links ----------
+        # ------- caption and link to last point ---------------
         last = points[-1]
         try:
             lx, lz = float(last.get("x", 0.0)), float(last.get("z", 0.0))
         except Exception:
             lx, lz = 0.0, 0.0
 
-        map_name = _active_map_name(guild_id)
+        map_name = _active_map_name(gid)
         izu_last = _izurvive_url(map_name, lx, lz)
 
         when_last = ""
@@ -608,10 +580,11 @@ class TraceCog(commands.Cog):
             ts_raw = last.get("ts")
             if ts_raw:
                 when_last = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
-                               .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+                    .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
         except Exception:
             pass
 
+        count = len(points)
         caption = (
             f"**{doc.get('gamertag','?')}** — {count} points\n"
             f"Last: [({lx:.1f}, {lz:.1f})]({izu_last}) {when_last}"
@@ -621,29 +594,8 @@ class TraceCog(commands.Cog):
         else:
             caption += f"\nRange: last {window_hours}h"
 
-        # --------- Embeds: Points and (optional) Actions -------
-        point_lines: List[str] = []
-        n = len(points)
-        for idx, p in enumerate(points, start=1):
-            try:
-                x, z = float(p.get("x", 0.0)), float(p.get("z", 0.0))
-            except Exception:
-                x, z = 0.0, 0.0
-            tag = "🟢 start" if idx == 1 else ("🔴 end" if idx == n else "🟡")
-            ts_s = ""
-            try:
-                ts_raw = p.get("ts")
-                if ts_raw:
-                    ts_s = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
-                                   .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
-            except Exception:
-                pass
-            url = _izurvive_url(map_name, x, z)
-            point_lines.append(f"{idx}. [{x:.1f}, {z:.1f}]({url}) — {tag} {ts_s}")
-
-        points_embed = discord.Embed(title="Trace points (click to open in iZurvive)")
-        # Split across multiple fields to fit Discord limits
-        def _add_chunked(embed: discord.Embed, title_prefix: str, lines: List[str]):
+        # --------- Embeds: Points and Actions ----------------
+        def _chunk_add(embed: discord.Embed, title_prefix: str, lines: List[str]):
             chunk: List[str] = []
             size = 0
             part = 1
@@ -662,20 +614,40 @@ class TraceCog(commands.Cog):
                     return
                 embed.add_field(name=f"{title_prefix} {part}", value="\n".join(chunk), inline=False)
 
-        _add_chunked(points_embed, "Points", point_lines)
+        # points list
+        points_embed = discord.Embed(title="Trace points (click to open in iZurvive)")
+        map_name = _active_map_name(gid)
+        point_lines: List[str] = []
+        n = len(points)
+        for idx, p in enumerate(points, start=1):
+            try:
+                x, z = float(p.get("x", 0.0)), float(p.get("z", 0.0))
+            except Exception:
+                x, z = 0.0, 0.0
+            tag = "🟢 start" if idx == 1 else ("🔴 end" if idx == n else "🟡")
+            ts_s = ""
+            try:
+                ts_raw = p.get("ts")
+                if ts_raw:
+                    ts_s = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
+                        .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+            except Exception:
+                pass
+            url = _izurvive_url(map_name, x, z)
+            point_lines.append(f"{idx}. [{x:.1f}, {z:.1f}]({url}) — {tag} {ts_s}")
+        _chunk_add(points_embed, "Points", point_lines)
 
         embeds: List[discord.Embed] = [points_embed]
 
-        # Build actions embed + snapshot text file (G Plot–style)
+        # actions list + snapshot
         snapshot_lines: List[str] = []
         if actions:
             action_lines: List[str] = []
             for a in actions:
                 kind = str(a.get("type") or a.get("kind") or "event")
-                # Prefer raw ADM line for description in the snapshot
                 raw = str(a.get("raw") or "").strip()
                 desc = str(a.get("desc") or a.get("message") or a.get("detail") or "").strip()
-                use_desc = desc if desc else raw
+                use_desc = raw if raw else desc
 
                 x = a.get("x")
                 z = a.get("z")
@@ -690,16 +662,14 @@ class TraceCog(commands.Cog):
                     ts_raw = a.get("ts")
                     if ts_raw:
                         tss = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
-                                      .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+                            .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
                 except Exception:
                     pass
 
                 pretty = kind.capitalize()
-                # Embed list line
-                text = f"• {pretty}: {link}{use_desc} {tss}".strip()
-                action_lines.append(text)
+                action_lines.append(f"• {pretty}: {link}{use_desc} {tss}".strip())
 
-                # Snapshot (monospace-ish) line — include verbatim ADM when we have it
+                # Snapshot prefers verbatim ADM line
                 hhmmss = tss.split(" ")[0] if tss else "--:--:--"
                 if raw:
                     snapshot_lines.append(f"{hhmmss} | {raw}")
@@ -713,10 +683,10 @@ class TraceCog(commands.Cog):
                     snapshot_lines.append(f"{hhmmss} | {pretty:<12} | {use_desc or '-'}{coord_txt}")
 
             actions_embed = discord.Embed(title=f"Actions snapshot ({len(actions)})")
-            _add_chunked(actions_embed, "Actions", action_lines)
+            _chunk_add(actions_embed, "Actions", action_lines)
             embeds.append(actions_embed)
 
-        # Fallback snapshot if no actions available: list positions as POS
+        # If still nothing actionable, fall back to POS
         if not snapshot_lines:
             for p in points:
                 tss = ""
@@ -724,7 +694,7 @@ class TraceCog(commands.Cog):
                     ts_raw = p.get("ts")
                     if ts_raw:
                         tss = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")) \
-                                      .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+                            .astimezone(timezone.utc).strftime("%H:%M:%S UTC")
                 except Exception:
                     pass
                 try:
@@ -735,7 +705,6 @@ class TraceCog(commands.Cog):
                 hhmmss = tss.split(" ")[0] if tss else "--:--:--"
                 snapshot_lines.append(f"{hhmmss} | {'POS':<12} | position update{coord_txt}")
 
-        # Build the txt attachment content
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         hdr = f"***** ADM Snapshot — {now_utc} *****\n"
         if dt_start:
@@ -750,23 +719,21 @@ class TraceCog(commands.Cog):
         snapshot_file = discord.File(snapshot_buf, filename="adm_snapshot.txt")
 
         # ----------- post to admin channel if set ------------
-        settings = load_settings(guild_id) or {}
-        admin_ch_id = settings.get("admin_channel_id")
-        _log(guild_id, "post target resolution", {"admin_channel_id": admin_ch_id})
+        admin_ch_id = (st or {}).get("admin_channel_id")
+        _log(gid, "post target resolution", {"admin_channel_id": admin_ch_id})
 
         if admin_ch_id:
             ch = interaction.client.get_channel(int(admin_ch_id))
             if isinstance(ch, discord.TextChannel):
                 try:
                     await ch.send(content=caption, files=[map_file, snapshot_file], embeds=embeds)
-                    _log(guild_id, "posted to admin channel", {"channel": admin_ch_id})
+                    _log(gid, "posted to admin channel", {"channel": admin_ch_id})
                     return await interaction.followup.send(
                         f"📡 Posted trace in {ch.mention}.", ephemeral=True
                     )
                 except Exception as e:
-                    _log(guild_id, "failed posting to admin channel", {"error": repr(e)})
+                    _log(gid, "failed posting to admin channel", {"error": repr(e)})
 
-        # Fallback to replying in the invoking channel
         await interaction.followup.send(caption, files=[map_file, snapshot_file], embeds=embeds, ephemeral=True)
 
 
