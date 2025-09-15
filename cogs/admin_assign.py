@@ -5,31 +5,36 @@ from discord.ext import commands
 from typing import Optional
 
 from utils.settings import load_settings, save_settings
-from .admin_checks import admin_check   # use the imported decorator
 from tracer.config import MAPS
 
 
-# ---------- helpers to keep map values canonical ----------
+# -------- admin gate (local) ----------
+def admin_check():
+    def pred(i: discord.Interaction):
+        perms = getattr(i.user, "guild_permissions", None)
+        return bool(perms and (perms.administrator or perms.manage_guild))
+    return app_commands.check(lambda i: pred(i))
+
+
+# ---------- map helpers (canonical keys) ----------
 def _resolve_map_key(value: Optional[str]) -> Optional[str]:
     """
-    Accept a map key (any case), or a display name, and return the canonical MAPS key.
-    If it can't be resolved, return None.
+    Accept a map key (any case) or display name and return the canonical MAPS key.
     """
     if not value:
         return None
     val = value.strip()
 
-    # 1) direct key (case-insensitive)
+    # direct key (case-insensitive)
     for k in MAPS.keys():
         if k.casefold() == val.casefold():
             return k
 
-    # 2) display name match (case-insensitive)
+    # display name match (case-insensitive)
     for k, cfg in MAPS.items():
         name = str(cfg.get("name", "")).strip()
         if name and name.casefold() == val.casefold():
             return k
-
     return None
 
 
@@ -38,15 +43,13 @@ def _map_display_name(key: Optional[str]) -> str:
         return "*unknown*"
     cfg = MAPS.get(key)
     return cfg.get("name", key) if cfg else key
-
-# ----------------------------------------------------------
+# --------------------------------------------------
 
 
 class AdminAssign(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.guild_only()
     @app_commands.command(
         name="setchannels",
         description="Set the PRIVATE admin channel (trace output) and PUBLIC bounty channel."
@@ -63,9 +66,6 @@ class AdminAssign(commands.Cog):
         bounty_channel: discord.TextChannel
     ):
         gid = interaction.guild_id
-        if not gid:
-            return await interaction.response.send_message("❌ Guild-only command.", ephemeral=True)
-
         save_settings(gid, {
             "admin_channel_id": admin_channel.id,
             "bounty_channel_id": bounty_channel.id
@@ -75,22 +75,18 @@ class AdminAssign(commands.Cog):
             ephemeral=True
         )
 
-    @app_commands.guild_only()
     @app_commands.command(name="settings", description="Show current bot settings")
     @admin_check()
     async def settings(self, interaction: discord.Interaction):
         gid = interaction.guild_id
-        if not gid:
-            return await interaction.response.send_message("❌ Guild-only command.", ephemeral=True)
-
         s = load_settings(gid) or {}
 
         admin_ch = f"<#{s['admin_channel_id']}>" if s.get("admin_channel_id") else "*not set*"
         bounty_ch = f"<#{s['bounty_channel_id']}>" if s.get("bounty_channel_id") else "*not set*"
 
-        # Resolve whatever is stored to the canonical MAPS key for display
+        # Coerce stored map value to canonical key for display
         raw_map_val = s.get("active_map")
-        map_key = _resolve_map_key(raw_map_val) or (raw_map_val if isinstance(raw_map_val, str) else None)
+        map_key = _resolve_map_key(raw_map_val) or raw_map_val
         map_name = _map_display_name(map_key)
 
         await interaction.response.send_message(
