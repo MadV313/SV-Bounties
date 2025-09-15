@@ -1,5 +1,3 @@
-like this?? 
-
 # cogs/bounty.py — /svbounty end-to-end (set + auto-updater + award on kill)
 from __future__ import annotations
 
