@@ -276,12 +276,12 @@ def _fallback_load_actions(
     max_lines: int = 25000
 ) -> List[Dict[str, Any]]:
     """
-    Read latest ADM and extract *verbatim* action lines for a single player.
+    Read latest ADM and extract raw action lines for a single player.
+    Accepts quoted/unquoted names and is resilient to formatting differences.
 
-    This variant is intentionally tolerant:
-    - matches quoted or unquoted names
-    - doesn't require the literal 'Player ' prefix
-    - case-insensitive
+    Strategy:
+      1) Try time-filtered scan.
+      2) If empty, do a second scan *without* time filtering and return the most recent matches.
     """
     txt = _read_text_candidates(gid, guild_settings)
     if not txt:
@@ -289,10 +289,8 @@ def _fallback_load_actions(
         return []
 
     esc = re.escape(gamertag)
-    # Accept:
-    #   Player "Name" ...,  Player Name ...,  "Name" ...,  Name ...
-    # We only require the *end* to be a word boundary so we don't match longer suffixes.
-    name_pat = re.compile(rf'(?i)(?:player\s+)?(?:"{esc}"|{esc})\b')
+    # Match: Player "Name" ..., Player Name ..., "Name" ..., Name ...
+    name_pat = re.compile(rf'(?i)(?:\bplayer\s+)?(?:"{esc}"|{esc})\b')
 
     now = datetime.now(timezone.utc)
     if start and end:
@@ -304,31 +302,42 @@ def _fallback_load_actions(
 
     date_for_ts = now.astimezone(timezone.utc)
 
-    actions: List[Dict[str, Any]] = []
-    lines = txt.splitlines()
-    if len(lines) > max_lines:
-        lines = lines[-max_lines:]
+    def scan_lines(apply_time_filter: bool) -> List[Dict[str, Any]]:
+        actions: List[Dict[str, Any]] = []
+        lines = txt.splitlines()
+        if len(lines) > max_lines:
+            lines = lines[-max_lines:]  # keep the most recent tail
 
-    for ln in lines:
-        # Fast prefilter by name (tolerant)
-        if not name_pat.search(ln):
-            continue
+        for ln in lines:
+            if not name_pat.search(ln):
+                continue
 
-        ts = _extract_time(date_for_ts, ln)
-        if ts and not (win_start <= ts <= win_end):
-            continue
+            ts = _extract_time(date_for_ts, ln)
+            if apply_time_filter and ts is not None:
+                if not (win_start <= ts <= win_end):
+                    continue
 
-        kind = _classify(ln)
-        x, z = _extract_coords(ln)
+            kind = _classify(ln)
+            x, z = _extract_coords(ln)
+            actions.append({
+                "ts": ts.isoformat() if ts else None,
+                "type": kind,
+                "desc": ln.split("|", 1)[-1].strip(),
+                "x": x,
+                "z": z,
+                "raw": ln.strip(),  # keep the verbatim line
+            })
+        return actions
 
-        actions.append({
-            "ts": ts.isoformat() if ts else None,
-            "type": kind,
-            "desc": ln.split("|", 1)[-1].strip(),
-            "x": x,
-            "z": z,
-            "raw": ln.strip(),   # preserve the full original line for the snapshot
-        })
+    # Pass 1: time filtered
+    actions = scan_lines(apply_time_filter=True)
+
+    # Pass 2: if nothing matched (timestamp parsing/formatting quirks), try without time filter
+    if not actions:
+        actions = scan_lines(apply_time_filter=False)
+        # keep only the most recent 400 matches to avoid giant files
+        if len(actions) > 400:
+            actions = actions[-400:]
 
     _log(gid, "fallback actions parsed", {"count": len(actions)})
     return actions
