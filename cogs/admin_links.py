@@ -237,33 +237,51 @@ class AdminLinks(commands.Cog):
             ephemeral=True
         )
 
-    @app_commands.command(
-        name="preferexternallinks",
-        description="Prefer external linked_players over local (this guild)"
-    )
-    @admin_check()
-    @app_commands.describe(enabled="true/false")
-    async def preferexternallinks(self, interaction: discord.Interaction, enabled: bool):
-        gid = interaction.guild_id
-        save_settings(gid, {"prefer_external_links": bool(enabled)})
-        await interaction.response.send_message(
-            f"✅ `prefer_external_links` set to **{enabled}**.",
-            ephemeral=True
-        )
+    # ---- NEW: combined external settings command ----------------------------
 
-    @app_commands.command(
-        name="disablelocallink",
-        description="Disable this bot's /link in this guild (use Rewards bot instead)"
+    external = app_commands.Group(name="external", description="Configure external vs local link handling")
+
+    @external.command(
+        name="settings",
+        description="Set or view external-link preferences (prefer external; disable local /link)."
     )
     @admin_check()
-    @app_commands.describe(enabled="true/false")
-    async def disablelocallink(self, interaction: discord.Interaction, enabled: bool):
+    @app_commands.describe(
+        prefer_external="Prefer external linked_players over local (true/false)",
+        disable_local="Disable this bot's local /link (use external only) (true/false)"
+    )
+    async def external_settings(
+        self,
+        interaction: discord.Interaction,
+        prefer_external: bool | None = None,
+        disable_local: bool | None = None,
+    ):
         gid = interaction.guild_id
-        save_settings(gid, {"disable_local_link": bool(enabled)})
-        await interaction.response.send_message(
-            f"✅ `disable_local_link` set to **{enabled}**.",
-            ephemeral=True
+        st = load_settings(gid) or {}
+        current_prefer = bool(st.get("prefer_external_links", True))
+        current_disable = bool(st.get("disable_local_link", False))
+
+        updates: dict[str, Any] = {}
+        if prefer_external is not None:
+            updates["prefer_external_links"] = bool(prefer_external)
+        if disable_local is not None:
+            updates["disable_local_link"] = bool(disable_local)
+
+        if updates:
+            save_settings(gid, updates)
+            st = load_settings(gid) or {}
+            current_prefer = bool(st.get("prefer_external_links", True))
+            current_disable = bool(st.get("disable_local_link", False))
+
+        emb = discord.Embed(
+            title="External link settings",
+            color=0x3BA55C,
+            description="View or update how this guild resolves `linked_players`."
         )
+        emb.add_field(name="prefer_external_links", value=str(current_prefer))
+        emb.add_field(name="disable_local_link", value=str(current_disable))
+        emb.set_footer(text="Tip: use /showlinks to see which source is actually used.")
+        await interaction.response.send_message(embed=emb, ephemeral=True)
 
     # ---- Diagnostics ---------------------------------------------------------
 
