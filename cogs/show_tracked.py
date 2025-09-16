@@ -232,7 +232,7 @@ class ShowTracked(commands.Cog):
         self.bot = bot
 
     @app_commands.command(
-        name="showtracked",
+        name="tracked",
         description="Show last-known locations for all currently tracked players (list + map image).",
     )
     @admin_check()
