@@ -163,7 +163,7 @@ class AdminFTP(commands.Cog):
             )
         except TypeError:
             # Older helper that doesn't accept extras:
-            set_ftp_config(gid, host, username, password, port, adm_dir, interval_sec)
+            set_ftp_config(gid, hostname, username, password, port, adm_dir, interval_sec)
             if extras:
                 saved_extras = False
 
