@@ -99,7 +99,7 @@ class HelpCog(commands.Cog):
             inline=False,
         )
         e_bounty.add_field(
-            name="🔒 /svbounty_remove",
+            name="/svbounty_remove",
             value=(
                 "(Admin) Remove an active bounty by user or gamertag.\n"
                 "• Args: `user?`, `gamertag?`\n"
