@@ -203,7 +203,7 @@ class AdminFTP(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="showftp", description="Show the current FTP/API config (secrets redacted)")
+    @app_commands.command(name="show_creds", description="Show the current FTP/API config (secrets redacted)")
     @admin_check()
     async def showftp(self, interaction: discord.Interaction):
         cfg = get_ftp_config(interaction.guild_id)
@@ -214,7 +214,7 @@ class AdminFTP(commands.Cog):
             f"```json\n{json.dumps(redacted, indent=2)}\n```", ephemeral=True
         )
 
-    @app_commands.command(name="clearftp", description="Clear saved FTP/API configuration for this guild")
+    @app_commands.command(name="clear_creds", description="Clear saved FTP/API configuration for this guild")
     @admin_check()
     async def clearftp(self, interaction: discord.Interaction):
         clear_ftp_config(interaction.guild_id)
