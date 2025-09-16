@@ -49,7 +49,7 @@ class HelpCog(commands.Cog):
             color=0xF39C12,
         )
         e_trace.add_field(
-            name="/trace",
+            name="🔒 /trace",
             value=(
                 "Render a player’s movement path on the current map, with action markers and an ADM snapshot text file.\n"
                 "• Args: `user?`, `gamertag?`, `window_hours?` (default **24**)\n"
