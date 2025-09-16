@@ -42,6 +42,26 @@ class HelpCog(commands.Cog):
             inline=False,
         )
 
+        # ---------- Embed: Trace / Forensics ----------
+        e_trace = discord.Embed(
+            title="Trace & Forensics",
+            description="Render movement paths and review recent actions.",
+            color=0xF39C12,
+        )
+        e_trace.add_field(
+            name="/trace",
+            value=(
+                "Render a player’s movement path on the current map, with action markers and an ADM snapshot text file.\n"
+                "• Args: `user?`, `gamertag?`, `window_hours?` (default **24**)\n"
+                "• **Channel:** Must be run in the configured **admin channel** (if one is set).\n"
+                "• Examples:\n"
+                "  • `/trace user: @Player window_hours: 12`\n"
+                "  • `/trace gamertag: KingSlayer99 window_hours: 24`"
+            ),
+            inline=False,
+        )
+
+        # ---------- Embed: Bounties ----------
         e_bounty = discord.Embed(
             title="Bounties",
             description="Create, pay, and manage bounties. Some actions require the bounty channel.",
@@ -184,7 +204,7 @@ class HelpCog(commands.Cog):
             e_admin.set_footer(text=lock_note)
 
         # Send all embeds (ephemeral)
-        await interaction.response.send_message(embeds=[e_user, e_bounty, e_admin], ephemeral=True)
+        await interaction.response.send_message(embeds=[e_user, e_trace, e_bounty, e_admin], ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
