@@ -61,6 +61,15 @@ class HelpCog(commands.Cog):
             inline=False,
         )
 
+        e_trace.add_field(
+            name="🔒 /tracked",
+            value=(
+                "Show last-known locations for tracked players (**must be run in the configured admin channel**).\n"
+                "Outputs a map image with pins and a paginated list."
+            ),
+            inline=False,
+        )
+
         # ---------- Embed: Bounties ----------
         e_bounty = discord.Embed(
             title="Bounties",
@@ -184,15 +193,6 @@ class HelpCog(commands.Cog):
         e_admin.add_field(
             name="🔒 /clear_creds",
             value="Clear the saved FTP/API configuration for this guild.",
-            inline=False,
-        )
-
-        e_admin.add_field(
-            name="🔒 /tracked",
-            value=(
-                "Show last-known locations for tracked players (**must be run in the configured admin channel**).\n"
-                "Outputs a map image with pins and a paginated list."
-            ),
             inline=False,
         )
 
