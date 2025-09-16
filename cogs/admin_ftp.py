@@ -86,7 +86,7 @@ class AdminFTP(commands.Cog):
     @app_commands.describe(
         nitrado_api_token="Nitrado HTTP API token (for active ADM follow)",
         nitrado_service_id="Nitrado service ID (numeric string)",
-        host="FTP hostname or IP",
+        hostname="FTP hostname or IP",
         username="FTP username",
         password="FTP password (use a dedicated account)",
         port="FTP port (default 21)",
@@ -106,7 +106,7 @@ class AdminFTP(commands.Cog):
         interaction: discord.Interaction,
         nitrado_api_token: str | None = None,
         nitrado_service_id: str | None = None,
-        host: str = "",
+        hostname: str = "",
         username: str = "",
         password: str = "",
         port: int = 21,
@@ -153,7 +153,7 @@ class AdminFTP(commands.Cog):
         try:
             set_ftp_config(
                 gid,
-                host,
+                hostname,
                 username,
                 password,
                 port,
