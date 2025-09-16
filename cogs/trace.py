@@ -276,17 +276,23 @@ def _fallback_load_actions(
     max_lines: int = 25000
 ) -> List[Dict[str, Any]]:
     """
-    Read latest ADM and extract raw action lines for a single player.
-    Accepts both quoted and unquoted name forms.
+    Read latest ADM and extract *verbatim* action lines for a single player.
+
+    This variant is intentionally tolerant:
+    - matches quoted or unquoted names
+    - doesn't require the literal 'Player ' prefix
+    - case-insensitive
     """
     txt = _read_text_candidates(gid, guild_settings)
     if not txt:
         _log(gid, "no ADM text available for fallback scan")
         return []
 
-    # matches: Player "Majoreq2208" ...  OR  Player Majoreq2208 ...
     esc = re.escape(gamertag)
-    name_pat = re.compile(rf'Player\s+(?:"{esc}"|{esc})(?!\w)', re.I)
+    # Accept:
+    #   Player "Name" ...,  Player Name ...,  "Name" ...,  Name ...
+    # We only require the *end* to be a word boundary so we don't match longer suffixes.
+    name_pat = re.compile(rf'(?i)(?:player\s+)?(?:"{esc}"|{esc})\b')
 
     now = datetime.now(timezone.utc)
     if start and end:
@@ -304,8 +310,7 @@ def _fallback_load_actions(
         lines = lines[-max_lines:]
 
     for ln in lines:
-        if "Player" not in ln:
-            continue
+        # Fast prefilter by name (tolerant)
         if not name_pat.search(ln):
             continue
 
@@ -322,7 +327,7 @@ def _fallback_load_actions(
             "desc": ln.split("|", 1)[-1].strip(),
             "x": x,
             "z": z,
-            "raw": ln.strip(),
+            "raw": ln.strip(),   # preserve the full original line for the snapshot
         })
 
     _log(gid, "fallback actions parsed", {"count": len(actions)})
