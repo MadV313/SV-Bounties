@@ -1096,6 +1096,16 @@ async def _announce_claim_with_map(
         except Exception:
             pass
 
+# -------- helpers for retro-kill guard (midnight/rotation safe) --------------
+def _hhmmss_to_secs(hhmmss: Optional[str]) -> Optional[int]:
+    try:
+        if not hhmmss:
+            return None
+        h, m, s = [int(x) for x in hhmmss.split(":")]
+        return h * 3600 + m * 60 + s
+    except Exception:
+        return None
+
 # ---------------------------- Kill + status watcher --------------------------
 async def check_kills_and_status(bot: commands.Bot, guild_id: int):
     """
@@ -1129,10 +1139,28 @@ async def check_kills_and_status(bot: commands.Bot, guild_id: int):
             for b in list(open_bounties):
                 if _norm(b.get("target_gamertag", "")) != _norm(victim):
                     continue
+
+                # Retro-kill guard:
+                #  - line-index guard is ignored if the file rotated (floor_idx > len(lines))
+                #  - time guard allows next-day wrap (if floor - ts > 12h, accept)
                 floor_ts = b.get("kill_floor_ts") or "00:00:00"
                 floor_idx = int(b.get("kill_floor_line", 0))
-                # Ignore retro kills: before the bounty line AND (conservatively) before the time floor
-                if (idx < floor_idx) or (ts and ts < floor_ts):
+
+                rotated = floor_idx > len(lines)
+                retro_by_line = (idx < floor_idx) and (not rotated)
+
+                retro_by_time = False
+                if ts:
+                    t = _hhmmss_to_secs(ts)
+                    f = _hhmmss_to_secs(floor_ts)
+                    if t is not None and f is not None:
+                        if t < f:
+                            # if gap is small (<=12h), treat as same-day retro; if big, assume day wrap → accept
+                            retro_by_time = (f - t) <= (12 * 3600)
+                        else:
+                            retro_by_time = False
+
+                if retro_by_line or retro_by_time:
                     # Retroactive kill (before the bounty was created) — ignore
                     continue
 
@@ -1626,7 +1654,8 @@ class BountyCog(commands.Cog):
         await self.bot.wait_until_ready()
         await asyncio.sleep(5)
 
-    @tasks.loop(minutes=2.0)
+    # ↓↓↓ Faster watcher: near real-time kills + status (connect/disconnect)
+    @tasks.loop(seconds=30.0)
     async def kill_watcher(self):
         doc = _db()
         gids = {int(b["guild_id"]) for b in doc.get("open", []) if b.get("guild_id")}
